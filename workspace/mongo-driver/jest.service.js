@@ -12,7 +12,7 @@ exports.setup = async () => {
   // Configure clients
   global.mongoClient = new MongoClient({
     uri: global.mongoServer.getUri(),
-    options: { useNewUrlParser: true, useUnifiedTopology: true, ignoreUndefined: false, minPoolSize: 3 },
+    options: { ignoreUndefined: false, minPoolSize: 3 },
     query: { collation: { locale: 'en', strength: 2 }, readPreference: 'primary' },
     session: { retryWrites: true, readPreference: { mode: 'primary' }, readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } },
     transaction: { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } },

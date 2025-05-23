@@ -1,4 +1,4 @@
-const { ObjectId } = require('mongodb');
+const { ObjectId } = require('@coderich/autograph-mongodb');
 
 exports.query1 = {
   model: 'Person',

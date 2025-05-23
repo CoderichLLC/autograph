@@ -1,4 +1,4 @@
-global.ObjectId = require('mongodb').ObjectId;
+global.ObjectId = require('@coderich/autograph-mongodb').ObjectId;
 const { setup, createIndexes } = require('./jest.service');
 
 let schema, context, resolver;

@@ -1,5 +1,5 @@
 const Util = require('@coderich/util');
-const { ObjectId } = require('mongodb');
+const { ObjectId } = require('@coderich/autograph-mongodb');
 const Transformer = require('../../src/data/Transformer');
 
 describe('Transformer', () => {

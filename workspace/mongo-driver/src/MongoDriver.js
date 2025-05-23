@@ -1,6 +1,6 @@
 const { inspect } = require('util');
 const Util = require('@coderich/util');
-const { MongoClient } = require('mongodb');
+const { MongoClient, ObjectId } = require('mongodb');
 
 module.exports = class MongoDriver {
   #config;
@@ -47,7 +47,7 @@ module.exports = class MongoDriver {
   updateOne(query) {
     query.options.returnDocument = 'after';
     const $update = { $set: query.input };
-    return this.collection(query.model).findOneAndUpdate(query.where, $update, query.options).then(({ value }) => value);
+    return this.collection(query.model).findOneAndUpdate(query.where, $update, query.options);
   }
 
   deleteOne(query) {
@@ -95,6 +95,8 @@ module.exports = class MongoDriver {
       });
     });
   }
+
+  static ObjectId = ObjectId;
 
   static normalizeWhereClause(where) {
     return Object.entries(Util.flatten(where, { safe: true })).reduce((prev, [key, value]) => {
