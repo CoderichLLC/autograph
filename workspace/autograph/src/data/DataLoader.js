@@ -32,7 +32,7 @@ module.exports = class Loader {
       const $query = query.toDriver().toObject();
       const key = $query.batch ?? '__default__';
       let [values] = key === '__default__' ? [] : Object.values(Util.flatten($query.where, { safe: true }));
-      values = Array.from(new Set(Util.ensureArray(values)));
+      values = Loader.#dedup(Util.ensureArray(values));
       prev[key] = prev[key] || [];
       prev[key].push({ query, $query, values, i });
       return prev;
@@ -45,7 +45,7 @@ module.exports = class Loader {
         }
         default: {
           // Collect all the values for the where clause
-          const values = Array.from(new Set(batches.map(batch => batch.values).flat()));
+          const values = Loader.#dedup(batches.map(batch => batch.values).flat());
           const $query = { ...batches[0].$query, op: 'findMany', where: { [key]: values } };
 
           if (values.length < 3) {
@@ -100,6 +100,16 @@ module.exports = class Loader {
     //     return this.#resolver.toResultSet(this.#model, data);
     //   });
     // }));
+  }
+
+  // Deduplicate an array of values that may contain RegExp objects.
+  // new Set() compares by reference, so two RegExp literals with identical patterns
+  // are treated as distinct. Using toString() as the Map key handles this correctly
+  // while preserving the actual RegExp instance as the value.
+  static #dedup(arr) {
+    const seen = new Map();
+    arr.forEach(v => seen.set(v instanceof RegExp ? v.toString() : v, v));
+    return Array.from(seen.values());
   }
 
   static #paginateResults(rs, query) {
