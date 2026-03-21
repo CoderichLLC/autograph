@@ -4,17 +4,22 @@ Release 0.13:
   * Atlas Search Support
     - How to modify the query?
   * Do we support input meta?
-  * Must finalize absolute definition for emitter "event" (See BREAKING CHANGES below)
-    - args, query, input, sort, crud, key, doc, merged, result, context, resolver, etc
-    - Legacy unflattened args during QueryBuilder; you no longer do that. Should you?
-      * You actually unflatten input for legacy system event
 
-Release 0.14:
-  * Remove deprecations
+Release 0.14 (in progress):
+  * Emitter event shape finalized: { schema, context, resolver, query }
+    - query IS the single source of truth (no more merged, no more top-level aliases)
+    - event.query.input (post-cast/transform Proxy) replaces event.merged
+    - event.query.result replaces event.result shortcut
   * Schema.merge - what is the order of priority and do we need to specify it as a param (passive?)
   * Break up Schema monolith (schema.parse() usage)
   * $field.linkBy & $field.fkField are pointing to the same value; can they be consolidated?
   * Why do you have Query.transform(asClone?????)
+  * docTransform: compiled plain function replaces Transformer-based doc transformer (read path)
+    - ~60% faster findMany (no Proxy overhead per result document)
+    - Result objects are plain JS objects; safe to mutate freely
+    - For mutations: cache is cleared before toResultSet(), so result is fresh
+    - For reads: DataLoader caches the raw driver result, NOT the docTransform output
+      * Each call to docTransform produces a new plain object so mutation is safe
 
 Known Issues:
   * Transactions (currently removed)
@@ -67,20 +72,23 @@ Improvement Considerations:
     - autograph.legacyMode (move to config)
 
 BREAKING CHANGELOG:
-  * You MUST NOT mutate the response from resolver without understanding that it's also cached!
   * PageInfo and cursor no longer required schema (only defined when cursorPaginating...)
   * Revamped how transactions work
   * Revamped how initial setup works (config.js)
     - makeExecutableSchema
   * Revamped Pipeline { schema, context, resolver, query, model, field, value, path, startValue }
-    - No more pipeline on database result! (check transform/normalize, deserialize)
     - Pipeline "toId" is completely removed (use custom "toObjectId" Pipeline etc)
-    - Removed Pipelines [transform, deserialize, destruct]
+    - Removed Pipelines [transform, destruct]
       - transform -> normalize
-  * Revamped Emitter { schema, context, resolver, query { args, id, model, crud, key, doc, input, sort, result } }
+    - deserialize pipeline still supported but runs on read path via compiled docTransform
+      (NOT via the Transformer class; zero overhead when empty)
+  * Revamped Emitter { schema, context, resolver, query }
+    - query IS the single source of truth
     - "Basic" functions are hoisted to the top for execution; RETURNING a value will bypass thunk()
     - "Next" functions are run next, next() must ALWAYS be called; passing a value to next() will bypass thunk()
-    - Event arguments refactored (no more merged! use query.input)
+    - Event shape refactored:
+      * event.query.input  (replaces event.merged and old event.input)
+      * event.query.result (replaces event.result shortcut)
   * Emitter.on('setup') is passed the "parsedSchema" object
   * No more gqlScope, dalScope, fieldScope (use crud + scope)
   * resolver.resolve() now takes 1 argument (info) and requires you to use .args() etc if need be
@@ -99,13 +107,18 @@ BREAKING CHANGELOG:
 
 ---------
 
-[
-  '$default', [input, doc] - Assign default value when undefined
-  '$cast', [input, where] - Cast value to schema defined type
-  '$normalize', [input] - Normalize the input
-  '$instruct', [input, where] - Instruct value (will define attribute even if undefined)
-  '$construct', [input] - On Create
-  '$restruct', [input] - On Update
-  '$serialize', [input, where] - transformations to db driver
-  '$validate', [input] - After preMutation Before postMutation (validate fields)
-]
+Pipeline stages:
+
+Write path (Transformer class, Proxy-based, supports async $thunks):
+  '$default',     [input]         - Assign default value when undefined
+  '$cast',        [input, where]  - Cast value to schema defined type
+  '$normalize',   [input]         - Normalize the input
+  '$instruct',    [input, where]  - Instruct value (will define attribute even if undefined)
+  '$construct',   [input]         - On Create
+  '$restruct',    [input]         - On Update
+  '$serialize',   [input, where]  - Transformations to db driver
+  '$validate',    [input]         - After preMutation, before postMutation (validate fields)
+
+Read path (compiled plain function, synchronous, zero Proxy overhead):
+  '$deserialize', [doc]           - Transform value coming back from db driver
+                                    Zero cost when pipeline is empty (guarded check)

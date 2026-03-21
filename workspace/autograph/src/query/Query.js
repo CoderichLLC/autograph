@@ -44,7 +44,6 @@ module.exports = class Query {
       select: this.#query.select,
       where: this.#query.where,
       sort: this.#query.sort,
-      joins: this.#query.joins,
       skip: this.#query.skip,
       limit: this.#query.limit,
       before: this.#query.before,

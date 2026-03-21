@@ -22,7 +22,8 @@ module.exports = class MongoDriver {
   }
 
   findOne(query) {
-    return this.findMany(Object.assign(query, { first: 1 }), query.options).then(([doc]) => doc);
+    const $aggregate = MongoDriver.aggregateQuery(query);
+    return this.collection(query.model).aggregate($aggregate, query.options).then(cursor => cursor.next());
   }
 
   findMany(query) {

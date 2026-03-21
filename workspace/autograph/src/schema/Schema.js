@@ -16,7 +16,7 @@ const scalarKinds = [Kind.SCALAR_TYPE_DEFINITION, Kind.SCALAR_TYPE_EXTENSION];
 const fieldKinds = [Kind.FIELD_DEFINITION];
 const modelKinds = [Kind.OBJECT_TYPE_DEFINITION, Kind.OBJECT_TYPE_EXTENSION].concat(interfaceKinds);
 const allowedKinds = modelKinds.concat(fieldKinds).concat(Kind.DOCUMENT, Kind.NON_NULL_TYPE, Kind.NAMED_TYPE, Kind.LIST_TYPE, Kind.DIRECTIVE).concat(scalarKinds).concat(enumKinds);
-const pipelines = ['validate', 'construct', 'restruct', 'instruct', 'normalize', 'serialize', 'deserialize'];
+const pipelines = ['validate', 'construct', 'restruct', 'instruct', 'normalize', 'serialize'];
 const createPipelines = ['validate', 'construct', 'instruct', 'normalize', 'serialize'];
 const updatePipelines = ['validate', 'restruct', 'instruct', 'normalize', 'serialize'];
 // const validatePipelines = ['validate', 'instruct', 'normalize', 'serialize'];
@@ -153,7 +153,6 @@ module.exports = class Schema {
               create: new Transformer({ args: { schema: this.#schema, path: [] } }),
               update: new Transformer({ args: { schema: this.#schema, path: [] } }),
               where: new Transformer({ args: { schema: this.#schema, path: [] } }),
-              doc: new Transformer({ args: { schema: this.#schema, path: [] } }),
             },
             directives: {},
             ignorePaths: [],
@@ -452,32 +451,19 @@ module.exports = class Schema {
 
             $model.transformers.sort = $model.transformers.where.clone({ defaults: {} });
 
-            $model.transformers.doc.config({
-              shape: Object.values($model.fields).reduce((prev, curr) => {
-                const args = { model: $model, field: curr };
-
-                const rules = [
-                  curr.name, // Rename key
-                  a => Pipeline.$deserialize({ ...a, ...args, path: a.path.concat(curr.name) }),
-                ];
-
-                if (curr.isArray) rules.unshift(({ value }) => (value == null ? value : Util.ensureArray(value)));
-
-                if (curr.isEmbedded) {
-                  rules.unshift(a => Util.map(a.value, (value, i) => {
-                    const path = a.path.concat(curr.name);
-                    if (curr.isArray) path.push(i);
-                    return curr.model.transformers.doc.transform(value, { ...args, query: a.query, context: a.context, path });
-                  }));
-                }
-
-                return Object.assign(prev, { [curr.key]: rules });
-              }, {}),
-              defaults: Object.values($model.fields).reduce((prev, curr) => {
-                if (curr.defaultValue === undefined) return prev;
-                return Object.assign(prev, { [curr.key]: curr.defaultValue });
-              }, {}),
-            });
+            const docFields = Object.values($model.fields);
+            $model.docTransform = (doc) => {
+              if (doc == null) return doc;
+              const out = {};
+              for (const field of docFields) {
+                let value = field.key in doc ? doc[field.key] : field.defaultValue;
+                if (value === undefined) continue;
+                if (field.isArray) value = value == null ? value : Util.ensureArray(value);
+                if (field.isEmbedded) value = Util.map(value, v => field.model.docTransform(v));
+                out[field.name] = value;
+              }
+              return out;
+            };
 
             $model.transformers.validate.config({
               strictSchema: true,
@@ -720,7 +706,6 @@ module.exports = class Schema {
         construct: [AutoGraphPipelineEnum!]
         restruct: [AutoGraphPipelineEnum!]
         serialize: [AutoGraphPipelineEnum!]
-        deserialize: [AutoGraphPipelineEnum!]
         validate: [AutoGraphPipelineEnum!]
 
         # TEMP TO APPEASE TRANSITION

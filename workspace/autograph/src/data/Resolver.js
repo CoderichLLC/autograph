@@ -245,7 +245,7 @@ module.exports = class Resolver {
     model = this.#schema.models[model];
 
     return Object.defineProperties(Util.map(result, (doc) => {
-      const $doc = model.transformers.doc.transform(doc, { resolver: this, context: this.#context });
+      const $doc = model.docTransform(doc);
 
       // Assign useful/needed meta data
       return Object.defineProperties($doc, {
