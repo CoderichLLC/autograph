@@ -33,9 +33,8 @@ module.exports = class Loader {
       const key = $query.batch ?? '__default__';
       let [values] = key === '__default__' ? [] : Object.values(Util.flatten($query.where, { safe: true }));
       values = Array.from(new Set(Util.ensureArray(values)));
-      const $values = values.map(value => (value instanceof RegExp ? value : new RegExp(`${value}`, 'i')));
       prev[key] = prev[key] || [];
-      prev[key].push({ query, $query, values, $values, i });
+      prev[key].push({ query, $query, values, i });
       return prev;
     }, {});
 
@@ -49,33 +48,34 @@ module.exports = class Loader {
           const values = Array.from(new Set(batches.map(batch => batch.values).flat()));
           const $query = { ...batches[0].$query, op: 'findMany', where: { [key]: values } };
 
-          //
           if (values.length < 3) {
             return batches.map(batch => this.#model.source.client.resolve(batch.$query).then(data => ({ data, ...batch })));
           }
 
-          // Collect all the $values (Regular Expressions) to match doc (result) data by
-          const $values = Array.from(new Set(batches.map(batch => batch.$values).flat()));
-          const docsByRegExpKey = $values.reduce((map, re) => map.set(re, []), new Map());
-
           // Now we perform 1 query, instead of many smaller ones
           return this.#model.source.client.resolve($query).then((docs) => {
-            // This one-time transformation keys all the docs by $value (regex) match
+            const docsByKey = new Map();
+
             docs.forEach((doc) => {
               Util.pathmap(key, doc, (value) => {
-                docsByRegExpKey.forEach((set, re) => {
-                  Util.map(value, (v) => {
-                    if (`${v}`.match(re)) {
-                      set.push(doc);
-                    }
-                  });
+                Util.ensureArray(value).forEach((v) => {
+                  const k = `${v}`;
+                  if (!docsByKey.has(k)) docsByKey.set(k, []);
+                  docsByKey.get(k).push(doc);
                 });
                 return value;
               });
             });
 
             return batches.map((batch) => {
-              const matches = Array.from(new Set(batch.$values.map(re => docsByRegExpKey.get(re)).flat().filter(v => v !== undefined)));
+              const matches = Array.from(new Set(batch.values.flatMap((v) => {
+                if (v instanceof RegExp) {
+                  const result = [];
+                  docsByKey.forEach((d, k) => { if (v.test(k)) result.push(...d); });
+                  return result;
+                }
+                return docsByKey.get(`${v}`) || [];
+              })));
               const data = batch.$query.op === 'findOne' ? matches[0] : matches;
               return { data, ...batch };
             });
