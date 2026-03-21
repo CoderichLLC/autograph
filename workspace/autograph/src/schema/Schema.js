@@ -478,7 +478,7 @@ module.exports = class Schema {
               const out = {};
               for (const docField of docFields) {
                 let value = docField.key in doc ? doc[docField.key] : docField.defaultValue;
-                if (value === undefined) continue;
+                if (value === undefined) continue; // eslint-disable-line
                 if (docField.isArray) value = value == null ? value : Util.ensureArray(value);
                 if (docField.isEmbedded) value = Util.map(value, v => docField.model.docTransform(v));
                 out[docField.name] = value;

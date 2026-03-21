@@ -9,28 +9,36 @@ const { AbortEarlyError } = require('../service/ErrorService');
  * If it expects more than 1 we block and wait for it to finish.
  */
 class Emitter extends EventEmitter {
-  emit(event, data) {
-    // Here we pull out functions with "next" vs those without
-    const [basicFuncs, nextFuncs] = this.rawListeners(event).reduce((prev, wrapper) => {
-      const { listener = wrapper } = wrapper;
-      const isBasic = listener.length < 2;
-      wrapper.priority = listener.priority ?? 0;
-      return prev[isBasic ? 0 : 1].push(wrapper) && prev;
-    }, [[], []]);
+  #cache = new Map();
 
-    // // Basic functions are not designed to be bound to the query execution so we need an isolated resolver from any transactions
-    // const resolver = data?.resolver?.clone();
-    // const basicData = { ...data, resolver };
+  #invalidate(event) {
+    this.#cache.delete(event);
+  }
+
+  #getListeners(event) {
+    if (!this.#cache.has(event)) {
+      const [basicFuncs, nextFuncs] = this.rawListeners(event).reduce((prev, wrapper) => {
+        const { listener = wrapper } = wrapper;
+        wrapper.priority = listener.priority ?? 0;
+        return prev[listener.length < 2 ? 0 : 1].push(wrapper) && prev;
+      }, [[], []]);
+      this.#cache.set(event, { basicFuncs: basicFuncs.sort(Emitter.sort), nextFuncs: nextFuncs.sort(Emitter.sort) });
+    }
+    return this.#cache.get(event);
+  }
+
+  emit(event, data) {
+    const { basicFuncs, nextFuncs } = this.#getListeners(event);
 
     return new Promise((resolve, reject) => {
       // Basic functions run first; if they return a value they abort the flow of execution
-      basicFuncs.sort(Emitter.sort).forEach((fn) => {
+      basicFuncs.forEach((fn) => {
         const value = fn(data);
         if (value !== undefined && !(value instanceof Promise)) throw new AbortEarlyError(value);
       });
 
       // Next functions are async and control the timing of the next phase
-      Promise.all(nextFuncs.sort(Emitter.sort).map((fn) => {
+      Promise.all(nextFuncs.map((fn) => {
         return new Promise((next, err) => {
           Promise.resolve().then(() => fn(data, next)).catch(err);
         }).then((result) => {
@@ -45,12 +53,45 @@ class Emitter extends EventEmitter {
 
   on(event, listener, priority = 0) {
     listener.priority = priority;
+    this.#invalidate(event);
     return super.on(event, listener);
+  }
+
+  addListener(event, listener, priority = 0) {
+    return this.on(event, listener, priority);
+  }
+
+  once(event, listener, priority = 0) {
+    listener.priority = priority;
+    this.#invalidate(event);
+    return super.once(event, listener);
   }
 
   prependListener(event, listener, priority = 0) {
     listener.priority = priority;
+    this.#invalidate(event);
     return super.prependListener(event, listener);
+  }
+
+  prependOnceListener(event, listener, priority = 0) {
+    listener.priority = priority;
+    this.#invalidate(event);
+    return super.prependOnceListener(event, listener);
+  }
+
+  removeListener(event, listener) {
+    this.#invalidate(event);
+    return super.removeListener(event, listener);
+  }
+
+  off(event, listener) {
+    return this.removeListener(event, listener);
+  }
+
+  removeAllListeners(event) {
+    if (event) this.#invalidate(event);
+    else this.#cache.clear();
+    return super.removeAllListeners(event);
   }
 
   /**
