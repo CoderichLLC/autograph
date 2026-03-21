@@ -307,42 +307,24 @@ module.exports = class Resolver {
     const tquery = $query.transform(false);
     const query = tquery.toObject();
     const type = query.isMutation ? 'Mutation' : 'Query';
-    const event = this.#createEvent(query);
+    const event = { schema: this.#schema, context: this.#context, resolver: this, query };
 
     return Emitter.emit(`pre${type}`, event).then(async (resultEarly) => {
-      if (resultEarly !== undefined) return resultEarly; // Nothing to validate/transform
-      // if (query.crud === 'update' && Util.isEqual({ added: {}, updated: {}, deleted: {} }, Util.changeset(query.doc, query.input))) return query.doc;
+      if (resultEarly !== undefined) return resultEarly;
 
       if (['create', 'update'].includes(query.crud)) {
-        tquery.validate(); // Transformation sets $thunks
+        tquery.validate(); // sets async $thunks (e.g. ensureFK)
         await Promise.all([...query.input.$thunks]);
         await Emitter.emit('validate', event);
       }
 
       return thunk(tquery);
     }).then((result) => {
-      event.result = result; // backwards compat
       query.result = result;
       return Emitter.emit(`post${type}`, event);
     }).then((result = query.result) => result).catch((e) => {
       throw Boom.boomify(e);
-      // const { data = {} } = e;
-      // throw Boom.boomify(e, { data: { ...event, ...data } });
     });
-  }
-
-  #createEvent(query) {
-    const event = { schema: this.#schema, context: this.#context, resolver: this, query };
-
-    // Backwards compat
-    Object.assign(event, query);
-    query.match = event.args.where;
-    query.toObject = () => query;
-    event.merged = event.input;
-    event.input = Util.unflatten(event.args?.input, { safe: true });
-    event.doc ??= {};
-
-    return event;
   }
 
   static $loader(name, resolver, config) {

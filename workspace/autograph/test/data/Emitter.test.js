@@ -103,14 +103,13 @@ describe('Emitter', () => {
   describe('Event mutations', () => {
     test('preMutation', (done) => {
       Emitter.onceModels('preMutation', ['Person'], (event, next) => {
-        event.merged.name = 'rich';
-        // event.query.input.name = 'rich';
+        event.query.input.name = 'rich';
         event.query.input.emailAddress = 'rich@rich.com';
         next();
       });
 
       Emitter.onceModels('postMutation', ['Person'], (event) => {
-        expect(event.result).toMatchObject({ name: 'rich' });
+        expect(event.query.result).toMatchObject({ name: 'rich' });
         done();
       });
 
@@ -126,7 +125,7 @@ describe('Emitter', () => {
       });
 
       Emitter.onceModels('postMutation', ['Person'], (event) => {
-        expect(event.result).toMatchObject({
+        expect(event.query.result).toMatchObject({
           age: 40,
           name: 'rich2',
           emailAddress: 'rich@rich.com',
