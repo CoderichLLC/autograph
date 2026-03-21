@@ -16,7 +16,7 @@
     "clinic": "clinic flame -- node ./test/server"
   },
   "dependencies": {
-    "@coderich/util": "1.2.1",
+    "@coderich/util": "2.2.0",
     "@graphql-tools/merge": "9.0.0",
     "@graphql-tools/resolvers-composition": "7.0.0",
     "@hapi/boom": "10.0.1",
