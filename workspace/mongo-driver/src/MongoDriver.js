@@ -1,4 +1,4 @@
-const { inspect } = require('util');
+const { inspect } = require('node:util');
 const Util = require('@coderich/util');
 const { MongoClient, ObjectId } = require('mongodb');
 

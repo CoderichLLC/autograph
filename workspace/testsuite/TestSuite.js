@@ -71,7 +71,7 @@ module.exports = () => describe('TestSuite', () => {
       richard = await resolver.match('Person').save(input);
       expect(Object.keys(input).includes('id')).toBe(false);
       expect(richard.id).toBeDefined();
-      expect(richard._id).not.toBeDefined(); // eslint-disable-line
+      expect(richard._id).not.toBeDefined();
       expect(richard.age).toBe(40);
       expect(richard.name).toBe('richard');
       expect(richard.gender).toBe('male');

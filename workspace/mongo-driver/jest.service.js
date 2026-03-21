@@ -26,7 +26,7 @@ exports.setup = async () => {
       try {
         const id = new global.ObjectId(value);
         return id;
-      } catch (e) {
+      } catch {
         return value;
       }
     },

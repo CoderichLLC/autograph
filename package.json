@@ -8,6 +8,6 @@
     "lint": "eslint ./"
   },
   "devDependencies": {
-    "@coderich/dev": "0.3.3"
+    "@coderich/dev": "0.6.2"
   }
 }

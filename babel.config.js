@@ -1,11 +1,3 @@
-/* Copyright (c) 2023 Coderich LLC. All Rights Reserved. */
+const { getBabelConfig } = require('@coderich/dev');
 
-module.exports = {
-  presets: [
-    ['@babel/preset-env', {
-      targets: {
-        node: 'current',
-      },
-    }],
-  ],
-};
+module.exports = getBabelConfig();

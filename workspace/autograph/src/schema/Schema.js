@@ -97,7 +97,7 @@ module.exports = class Schema {
         try {
           const $td = typeof td === 'string' ? parse(td) : td;
           return $td;
-        } catch (e) {
+        } catch {
           console.log(`Unable to parse typeDef (being ignored):\n${td}`); // eslint-disable-line
           return null;
         }
@@ -451,20 +451,6 @@ module.exports = class Schema {
 
             $model.transformers.sort = $model.transformers.where.clone({ defaults: {} });
 
-            const docFields = Object.values($model.fields);
-            $model.docTransform = (doc) => {
-              if (doc == null) return doc;
-              const out = {};
-              for (const field of docFields) {
-                let value = field.key in doc ? doc[field.key] : field.defaultValue;
-                if (value === undefined) continue;
-                if (field.isArray) value = value == null ? value : Util.ensureArray(value);
-                if (field.isEmbedded) value = Util.map(value, v => field.model.docTransform(v));
-                out[field.name] = value;
-              }
-              return out;
-            };
-
             $model.transformers.validate.config({
               strictSchema: true,
               shape: Object.values($model.fields).reduce((prev, curr) => {
@@ -484,6 +470,21 @@ module.exports = class Schema {
                 return Object.assign(prev, { [curr.name]: rules });
               }, {}),
             });
+
+            // Deserialize/docs special case handling for performance
+            const docFields = Object.values($model.fields);
+            $model.docTransform = (doc) => {
+              if (doc == null) return doc;
+              const out = {};
+              for (const docField of docFields) {
+                let value = docField.key in doc ? doc[docField.key] : docField.defaultValue;
+                if (value === undefined) continue;
+                if (docField.isArray) value = value == null ? value : Util.ensureArray(value);
+                if (docField.isEmbedded) value = Util.map(value, v => docField.model.docTransform(v));
+                out[docField.name] = value;
+              }
+              return out;
+            };
 
             Util.traverse(Object.values($model.fields), (f, info) => {
               const path = info.path.concat(f.name);
@@ -888,7 +889,7 @@ module.exports = class Schema {
       `,
       resolvers: {
         Node: {
-          __resolveType: (doc, args, context, info) => doc.__typename, // eslint-disable-line no-underscore-dangle
+          __resolveType: (doc, args, context, info) => doc.__typename,
         },
         ...queryModels.reduce((prev, model) => {
           return Object.assign(prev, {
@@ -911,7 +912,7 @@ module.exports = class Schema {
             const model = schema.models[modelName];
             return context[schema.namespace].resolver.match(model).id(id).info(info).one().then((result) => {
               if (result == null) return result;
-              result.__typename = modelName; // eslint-disable-line no-underscore-dangle
+              result.__typename = modelName;
               return result;
             });
           },

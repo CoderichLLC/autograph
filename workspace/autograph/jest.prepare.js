@@ -1,4 +1,4 @@
-const Path = require('path');
+const Path = require('node:path');
 const { autoMock } = require('@coderich/dev');
 
 module.exports = () => {

@@ -1,4 +1,4 @@
-const EventEmitter = require('events');
+const EventEmitter = require('node:events');
 const Util = require('@coderich/util');
 const { AbortEarlyError } = require('../service/ErrorService');
 

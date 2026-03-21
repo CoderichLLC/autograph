@@ -22,7 +22,7 @@ exports.setup = async (mergeConfig) => {
       try {
         const id = new MongoClient.ObjectId(value);
         return id;
-      } catch (e) {
+      } catch {
         return value;
       }
     },

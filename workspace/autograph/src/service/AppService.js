@@ -40,7 +40,7 @@ exports.JSONParse = (mixed) => {
   try {
     const json = JSON.parse(mixed);
     return json;
-  } catch (e) {
+  } catch {
     return undefined;
   }
 };
