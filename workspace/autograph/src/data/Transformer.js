@@ -9,6 +9,8 @@ module.exports = class Transformer {
     keepUndefined: false, // If true, will preserve undefined values
   };
 
+  #callArgs = {}; // Ephemeral per-call merge of #config.args + transform() args; never persisted
+
   #operation = {
     set: (target, prop, startValue, proxy) => {
       if (this.#config.shape[prop]) {
@@ -16,7 +18,7 @@ module.exports = class Transformer {
 
         const result = this.#config.shape[prop].reduce((value, t) => {
           previousValue = value;
-          if (typeof t === 'function') return Util.uvl(t({ startValue, value, ...this.#config.args }), value);
+          if (typeof t === 'function') return Util.uvl(t({ startValue, value, ...this.#callArgs }), value);
           prop = t; // rename key
           return value;
         }, startValue);
@@ -64,7 +66,7 @@ module.exports = class Transformer {
 
   transform(mixed, args = {}) {
     args.thunks ??= [];
-    this.args(args);
+    this.#callArgs = { ...this.#config.args, ...args };
 
     const transformed = Util.map(mixed, (data) => {
       const thunks = Object.defineProperty({}, '$thunks', { value: args.thunks });

@@ -51,6 +51,75 @@ describe('Transformer', () => {
     expect(data).toEqual({ b: 'bye' });
   });
 
+  /**
+   * These two tests expose the shared #config.args mutation bug in Transformer.
+   *
+   * transform() calls this.args(args) which does Object.assign(this.#config.args, args).
+   * Because Object.assign only ADDS/OVERWRITES keys — it never removes them — any arg key
+   * set in a previous call persists into subsequent calls that omit that key.
+   *
+   * This directly mirrors the risk in Schema.js:382 where the embedded child transformer
+   * is called with { model, field, query, resolver, context, path } from the parent rule.
+   * If the child transformer is ever called later without those keys (e.g. from a different
+   * parent or a standalone context), the stale values silently bleed through.
+   */
+  describe('shared args mutation', () => {
+    test('stale args bleed into subsequent calls that omit that key', () => {
+      const received = [];
+
+      const transformer = new Transformer({
+        shape: {
+          name: [({ value, extra }) => {
+            received.push(extra);
+            return value;
+          }],
+        },
+      });
+
+      transformer.transform({ name: 'first' }, { extra: 'present' });
+      transformer.transform({ name: 'second' }); // extra intentionally omitted
+
+      // Call 1 should have received 'present'
+      expect(received[0]).toBe('present');
+      // Call 2 should receive undefined — extra was not passed
+      // FAILS: receives 'present' because Object.assign leaves it in #config.args
+      expect(received[1]).toBeUndefined();
+    });
+
+    test('child transformer retains parent args after embedded call (mirrors Schema.js:382)', () => {
+      const queriesSeenByChild = [];
+
+      const child = new Transformer({
+        shape: {
+          name: [({ value, query, path }) => {
+            queriesSeenByChild.push({ query, path });
+            return value;
+          }],
+        },
+      });
+
+      // Simulate the embedded rule in Schema.js:382:
+      // parent calls child.transform with { query, path } from parent context
+      const parent = new Transformer({
+        shape: {
+          items: [({ value, query }) => Util.map(value, (v, i) => child.transform(v, { query, path: ['items', i] }))],
+        },
+      });
+
+      parent.transform({ items: [{ name: 'item1' }] }, { query: 'parentQuery' });
+
+      // Child was called with query='parentQuery' and path=['items',0] — correct
+      expect(queriesSeenByChild[0]).toEqual({ query: 'parentQuery', path: ['items', 0] });
+
+      // Now call the child directly, simulating a top-level call (no query, no path)
+      child.transform({ name: 'item2' });
+
+      // Should see { query: undefined, path: undefined } — nothing was passed
+      // FAILS: sees { query: 'parentQuery', path: ['items', 0] } — stale from parent call
+      expect(queriesSeenByChild[1]).toEqual({ query: undefined, path: undefined });
+    });
+  });
+
   test('performance', () => {
     const section = new Transformer({
       shape: { id: [({ value }) => new ObjectId(value)], name: [({ value }) => value.toLowerCase()] },
