@@ -602,6 +602,17 @@ module.exports = () => describe('TestSuite', () => {
       expect(await resolver.match('Book').where({ chapters: [{ name: 'HongKong' }, chapter1.id] }).many()).toMatchObject([{ id: healthBook.id }]);
     });
 
+    // Sibling FK joins: two independent FK paths on Book filtered simultaneously.
+    // mobyDick  → author=richard, chapter=Newchapter
+    // healthBook → author=christie, chapters=Chapter1/Chapter2
+    // Both constraints are on separate FK fields (author → Person, chapters → Chapter via virtual link).
+    // Bug: the second join gets nested inside the first join's $lookup pipeline instead of running
+    // as a sibling at the outer level, so it searches for Chapter.book = Person._id (impossible match)
+    // and returns [].
+    test('Book (sibling joins)', async () => {
+      expect(await resolver.match('Book').where({ author: { name: 'richard' }, chapters: { name: 'Newchapter' } }).many()).toMatchObject([{ id: mobyDick.id }]);
+    });
+
     test('Art', async () => {
       expect(await resolver.match('Art').where({ 'sections.name': 'section1' }).one()).toMatchObject({ name: 'My Find Art' });
       expect(await resolver.match('Art').where({ 'sections.name': 'section1' }).many()).toMatchObject([{ name: 'My Find Art' }]);

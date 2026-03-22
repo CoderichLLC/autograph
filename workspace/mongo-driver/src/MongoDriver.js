@@ -106,15 +106,13 @@ module.exports = class MongoDriver {
     }, {});
   }
 
-  static aggregateJoin(query, join, id) {
+  static aggregateJoin(query, join) {
     const { as, to: from, on: foreignField, from: localField, where: $match } = join;
     const varName = `${as}_${join.from.replaceAll('.', '_')}`;
     const $let = { [varName]: `$${localField}` };
     const op = join.isArray ? '$in' : '$eq';
     $match.$expr = { [op]: [`$${foreignField}`, `$$${varName}`] };
     const pipeline = [{ $match }];
-    // const $addFields = MongoDriver.convertFieldsForRegex(query.$schema, from, $match, true);
-    // if (Object.keys($addFields).length) pipeline.unshift({ $addFields });
     return [
       {
         $lookup: {
@@ -131,36 +129,22 @@ module.exports = class MongoDriver {
   }
 
   static aggregateJoins(query, joins = []) {
-    const [join, ...pipeline] = joins;
-    const { as } = join;
-    const $aggregate = MongoDriver.aggregateJoin(query, join, 0);
-    let pointer = $aggregate[0].$lookup.pipeline;
-
-    pipeline.forEach((j, i) => {
-      const $agg = MongoDriver.aggregateJoin(query, j, i + 1);
-      pointer.push(...$agg);
-      pointer = $agg[0].$lookup.pipeline;
-    });
-
-    return $aggregate.concat(
-      {
-        $group: {
-          _id: '$_id',
-          data: { $first: '$$ROOT' },
-          [as]: { $addToSet: `$${as}` },
-        },
-      },
-      {
-        $replaceRoot: {
-          newRoot: {
-            $mergeObjects: ['$data', { [as]: `$${as}` }],
-          },
-        },
-      },
-    );
+    return [
+      ...MongoDriver.#buildJoinPipeline(query, joins),
+      { $group: { _id: '$_id', data: { $first: '$$ROOT' } } },
+      { $replaceRoot: { newRoot: '$data' } },
+    ];
   }
 
-  static convertFieldsForSort($schema, model, sort) {
+  static #buildJoinPipeline(query, joins) {
+    return joins.flatMap((join) => {
+      const $agg = MongoDriver.aggregateJoin(query, join);
+      if (join.children?.length) $agg[0].$lookup.pipeline.push(...MongoDriver.#buildJoinPipeline(query, join.children));
+      return $agg;
+    });
+  }
+
+  static convertFieldsForSort(sort) {
     return Object.entries(Util.flatten(sort, false)).reduce((prev, [key, value]) => {
       return Object.assign(prev, { [key]: value === 'asc' ? 1 : -1 });
     }, {});
@@ -178,27 +162,13 @@ module.exports = class MongoDriver {
 
       return prev;
     }, {});
-
-    // return Util.unflatten(Object.entries(Util.flatten(where, false)).reduce((prev, [key, value]) => {
-    //   const $key = key.split('.').reverse().find(k => !k.startsWith('$')).replace(/[[\]']/g, '');
-    //   const field = Object.values(model.fields).find(el => el.key === $key);
-
-    //   if (!field) console.log($key, value);
-
-    //   if (Util.ensureArray(value).some(el => el instanceof RegExp)) {
-    //     const conversion = field.isArray ? { $map: { input: `$${$key}`, as: 'el', in: { $toString: '$$el' } } } : { $toString: `$${$key}` };
-    //     Object.assign(prev, { [$key]: conversion });
-    //   }
-
-    //   return prev;
-    // }, {}), false);
   }
 
   static aggregateQuery(query, count = false) {
     const { model, select, where, sort = {}, skip, limit, joins, after, before, first, isNative } = query;
     const $aggregate = [{ $match: where }];
     const $addFields = isNative ? {} : MongoDriver.convertFieldsForRegex(query.$schema, model, where);
-    const $sort = MongoDriver.convertFieldsForSort(query.$schema, model, sort);
+    const $sort = MongoDriver.convertFieldsForSort(sort);
 
     // Regex addFields
     if (Object.keys($addFields).length) $aggregate.unshift({ $addFields });
@@ -209,16 +179,6 @@ module.exports = class MongoDriver {
     if (count) {
       $aggregate.push({ $count: 'count' });
     } else {
-      // // This is needed to return FK references as an array in the correct order
-      // // http://www.kamsky.org/stupid-tricks-with-mongodb/using-34-aggregation-to-return-documents-in-same-order-as-in-expression
-      // // https://jira.mongodb.org/browse/SERVER-7528
-      // const idKey = MongoDriver.idKey();
-      // const idMatch = $match[idKey];
-      // if (typeof idMatch === 'object' && idMatch.$in) {
-      //   $aggregate.push({ $addFields: { __order: { $indexOfArray: [idMatch.$in, `$${idKey}`] } } });
-      //   $aggregate.push({ $sort: { __order: 1 } });
-      // }
-
       // Sort, Skip, Limit documents
       if ($sort && Object.keys($sort).length) $aggregate.push({ $sort });
       if (skip) $aggregate.push({ $skip: skip });

@@ -133,14 +133,25 @@ module.exports = class Query {
     query.batch = (op === 'findOne' || op === 'findMany') && Object.keys(query.where).length === 1 ? Object.keys(query.where)[0] : '__default__';
 
     // Construct joins
+    const joinsByPath = {};
     query.joins = [];
+
+    // Recursively search a join tree for the first join matching a target model key
+    const findJoin = (joins, modelKey) => {
+      for (const j of joins) {
+        if (j.to === modelKey) return j;
+        const found = findJoin(j.children, modelKey);
+        if (found) return found;
+      }
+      return null;
+    };
 
     this.#model.walk(joinData, (node) => {
       const { model, field, key, value, isLeaf, path, run } = node;
 
       if (field.join) {
         let isArray;
-        const join = { ...field.join, where: {} };
+        const join = { ...field.join, where: {}, children: [] };
 
         if (run.length > 1) {
           join.from = path.reduce((prev, curr, i) => {
@@ -152,12 +163,21 @@ module.exports = class Query {
 
         join.isArray = isArray || model.resolvePath(join.from).isArray;
 
-        query.joins.push(join);
+        // Find the nearest ancestor FK join by scanning ancestor paths from closest to farthest.
+        // Joins reached through embedded fields have no FK ancestor and stay at the root level.
+        const parentJoin = path.slice(0, -1).reduceRight((found, _, i) => found || joinsByPath[path.slice(0, i + 1).join('.')], null);
+
+        if (parentJoin) {
+          parentJoin.children.push(join);
+        } else {
+          query.joins.push(join);
+        }
+        joinsByPath[path.join('.')] = join;
       }
 
       if (isLeaf) {
         const $model = field.model || model;
-        const join = query.joins.find(j => j.to === $model.key);
+        const join = findJoin(query.joins, $model.key);
         const $value = Util.map(value, el => (isGlob(el) ? globToRegex(el) : el));
         const $$value = Array.isArray($value) ? { $in: $value } : $value;
         const from = field.model ? join.from : key;
