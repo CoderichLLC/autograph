@@ -927,7 +927,7 @@ module.exports = class Schema {
         } : {}),
         ...readModels.reduce((prev, model) => {
           return Object.assign(prev, {
-            [model]: Object.values(model.fields).filter(field => field.model?.isEntity).reduce((prev2, field) => {
+            [model]: Object.values(model.fields).filter(field => field.model?.isEntity && field.crud?.includes('r')).reduce((prev2, field) => {
               return Object.assign(prev2, {
                 [field]: (doc, args, context, info) => {
                   if (!doc.$) doc = context[schema.namespace].resolver.toResultSet(model, doc); // Ensure resultSet
