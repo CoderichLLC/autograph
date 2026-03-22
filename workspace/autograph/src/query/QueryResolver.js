@@ -40,8 +40,12 @@ module.exports = class QueryResolver extends QueryBuilder {
       }
       case 'updateOne': {
         return this.#get(query).then((doc) => {
-          const merged = mergeDeep({}, doc, Util.unflatten(input, { safe: true })); // This is for backwards compat
-          return this.#resolver.resolve(query.clone({ doc, input: merged }));
+          const cloned = query.clone({ doc });
+          Object.defineProperty(cloned.toObject(), 'merged', {
+            get() { return mergeDeep({}, doc, Util.unflatten(this.input, { safe: true })); },
+            enumerable: true,
+          });
+          return this.#resolver.resolve(cloned);
         });
       }
       case 'updateMany': {
