@@ -16,7 +16,7 @@ const scalarKinds = [Kind.SCALAR_TYPE_DEFINITION, Kind.SCALAR_TYPE_EXTENSION];
 const fieldKinds = [Kind.FIELD_DEFINITION];
 const modelKinds = [Kind.OBJECT_TYPE_DEFINITION, Kind.OBJECT_TYPE_EXTENSION].concat(interfaceKinds);
 const allowedKinds = modelKinds.concat(fieldKinds).concat(Kind.DOCUMENT, Kind.NON_NULL_TYPE, Kind.NAMED_TYPE, Kind.LIST_TYPE, Kind.DIRECTIVE).concat(scalarKinds).concat(enumKinds);
-const pipelines = ['validate', 'construct', 'restruct', 'instruct', 'normalize', 'serialize'];
+const pipelines = ['validate', 'construct', 'restruct', 'instruct', 'normalize', 'serialize', 'deserialize'];
 const createPipelines = ['validate', 'construct', 'instruct', 'normalize', 'serialize'];
 const updatePipelines = ['validate', 'restruct', 'instruct', 'normalize', 'serialize'];
 // const validatePipelines = ['validate', 'instruct', 'normalize', 'serialize'];
@@ -481,6 +481,7 @@ module.exports = class Schema {
                 if (value === undefined) continue; // eslint-disable-line
                 if (docField.isArray) value = value == null ? value : Util.ensureArray(value);
                 if (docField.isEmbedded) value = Util.map(value, v => docField.model.docTransform(v));
+                if (docField.pipelines.deserialize.length) value = Pipeline.resolve({ model: $model, field: docField, value }, 'deserialize');
                 out[docField.name] = value;
               }
               return out;
@@ -707,6 +708,7 @@ module.exports = class Schema {
         construct: [AutoGraphPipelineEnum!]
         restruct: [AutoGraphPipelineEnum!]
         serialize: [AutoGraphPipelineEnum!]
+        deserialize: [AutoGraphPipelineEnum!]
         validate: [AutoGraphPipelineEnum!]
 
         # TEMP TO APPEASE TRANSITION
