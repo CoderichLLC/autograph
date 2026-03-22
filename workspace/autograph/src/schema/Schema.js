@@ -473,15 +473,15 @@ module.exports = class Schema {
 
             // Deserialize/docs special case handling for performance
             const docFields = Object.values($model.fields);
-            $model.docTransform = (doc) => {
+            $model.docTransform = (doc, args = {}) => {
               if (doc == null) return doc;
               const out = {};
               for (const docField of docFields) {
                 let value = docField.key in doc ? doc[docField.key] : docField.defaultValue;
                 if (value === undefined) continue; // eslint-disable-line
                 if (docField.isArray) value = value == null ? value : Util.ensureArray(value);
-                if (docField.isEmbedded) value = Util.map(value, v => docField.model.docTransform(v));
-                if (docField.pipelines.deserialize.length) value = Pipeline.resolve({ model: $model, field: docField, value }, 'deserialize');
+                if (docField.isEmbedded) value = Util.map(value, v => docField.model.docTransform(v, args));
+                if (docField.pipelines.deserialize.length) value = Pipeline.resolve({ ...args, model: $model, field: docField, value }, 'deserialize');
                 out[docField.name] = value;
               }
               return out;
