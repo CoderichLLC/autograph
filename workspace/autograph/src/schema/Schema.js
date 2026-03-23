@@ -474,7 +474,7 @@ module.exports = class Schema {
             // Deserialize/docs special case handling for performance
             const docFields = Object.values($model.fields);
             $model.docTransform = (doc, args = {}) => {
-              if (doc == null) return doc;
+              if (doc == null || typeof doc !== 'object') return doc;
               const out = {};
               for (const docField of docFields) {
                 let value = docField.key in doc ? doc[docField.key] : docField.defaultValue;

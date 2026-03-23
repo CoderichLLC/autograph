@@ -35,7 +35,13 @@ module.exports = class Query {
   }
 
   toObject() {
-    return this.#query;
+    const { doc = {}, input = {} } = this.#query;
+
+    return Object.defineProperty(this.#query, 'merged', {
+      get() { return mergeDeep({}, doc, Util.unflatten(input, { safe: true })); },
+      enumerable: true,
+      configurable: true,
+    });
   }
 
   toCacheKey() {

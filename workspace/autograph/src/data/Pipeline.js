@@ -22,9 +22,8 @@ module.exports = class Pipeline {
         if (ignoreNull && itemize) return Util.map(args.value, value => Util.uvl(factory({ ...args, value }), value));
         return Util.uvl(factory(args), args.value);
       } catch (e) {
-        throw Boom.boomify(e);
-        // const { data = {} } = e;
-        // throw Boom.boomify(e, { data: { ...args, ...data } });
+        const { data = {} } = e;
+        throw Boom.boomify(e, { data: { ...args, ...data } });
       }
     }, 'name', { value: name });
 
