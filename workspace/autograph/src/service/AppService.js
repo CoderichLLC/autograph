@@ -7,7 +7,7 @@ const ObjectId = require('bson-objectid');
 const DeepMerge = require('deepmerge');
 const { parseResolveInfo, simplifyParsedResolveInfoFragmentWithType } = require('graphql-parse-resolve-info');
 
-exports.isGlob = str => str?.startsWith?.('!') || PicoMatch.scan(str).isGlob;
+exports.isGlob = str => typeof str === 'string' && (str.startsWith('!') || PicoMatch.scan(str).isGlob);
 exports.globToRegex = (glob, options = {}) => PicoMatch.makeRe(glob, { nocase: true, ...options, expandRange: (a, b) => `(${FillRange(a, b, { toRegex: true })})` });
 
 const smartMerge = (target, source, options) => source;

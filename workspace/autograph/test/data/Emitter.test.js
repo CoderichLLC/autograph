@@ -103,6 +103,13 @@ describe('Emitter', () => {
   describe('Event mutations', () => {
     test('preMutation', (done) => {
       Emitter.onceModels('preMutation', ['Person'], (event, next) => {
+        // Proving that embedded/mixed values make it to event.query.input...
+        expect(event.query.input.sections).toEqual([expect.objectContaining({
+          name: 'section', // Lowercase
+          mixed: { name: { en: 'Richard' } },
+        })]);
+
+        // Mutations
         event.query.input.name = 'rich';
         event.query.input.emailAddress = 'rich@rich.com';
         next();
@@ -113,7 +120,9 @@ describe('Emitter', () => {
         done();
       });
 
-      resolver.match('Person').save().catch((e) => {
+      resolver.match('Person').save({
+        sections: { name: 'Section', 'mixed.name.en': 'Richard' },
+      }).catch((e) => {
         done(e);
       });
     });

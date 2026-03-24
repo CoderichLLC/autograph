@@ -120,6 +120,7 @@ module.exports = `
     frozen: String! @field(default: "frozen", restruct: immutable)
     type: BuildingType
     description: String
+    mixed: AutoGraphMixed
     person: Person @field(onDelete: nullify)
     persons: [Person!] @field(onDelete: cascade)
   }
