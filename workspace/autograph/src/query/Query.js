@@ -35,10 +35,26 @@ module.exports = class Query {
   }
 
   toObject() {
-    const { doc = {}, input = {} } = this.#query;
+    const { crud } = this.#query;
+    if (crud !== 'create' && crud !== 'update' && crud !== 'delete') return this.#query;
+
+    const { doc = {} } = this.#query;
+    let target;
+    if (crud === 'delete') {
+      target = {};
+    } else {
+      this.#query.input ??= {};
+      target = this.#query.input;
+    }
 
     return Object.defineProperty(this.#query, 'merged', {
-      get() { return mergeDeep({}, doc, Util.unflatten(input, { safe: true })); },
+      value: new Proxy(target, {
+        get(t, prop) {
+          if (typeof prop === 'symbol') return Reflect.get(t, prop);
+          const v = t[prop];
+          return v === undefined ? doc[prop] : v;
+        },
+      }),
       enumerable: true,
       configurable: true,
     });

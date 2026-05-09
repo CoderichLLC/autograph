@@ -8,7 +8,7 @@
     "dev": "coderich-dev"
   },
   "dependencies": {
-    "@coderich/autograph": "^0.13.0",
+    "@coderich/autograph": "*",
     "validator": "13.9.0"
   },
   "devDependencies": {}
