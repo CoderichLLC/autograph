@@ -26,7 +26,7 @@ module.exports = class Transformer {
         if (result instanceof Promise) {
           target[prop] = previousValue;
           proxy.$thunks.push(result);
-        } else if (result !== undefined || this.#config.keepUndefined) {
+        } else if (result !== undefined || target.$userProvided?.has(prop) || this.#config.keepUndefined) {
           target[prop] = result;
         }
       } else if (!this.#config.strictSchema) {
@@ -69,7 +69,10 @@ module.exports = class Transformer {
     this.#callArgs = { ...this.#config.args, ...args };
 
     const transformed = Util.map(mixed, (data) => {
-      const thunks = Object.defineProperty({}, '$thunks', { value: args.thunks });
+      const thunks = Object.defineProperties({}, {
+        $thunks: { value: args.thunks },
+        $userProvided: { value: new Set(Object.keys(data || {})) },
+      });
       const $data = Object.assign({}, this.#config.defaults, data); // eslint-disable-line
       return Object.assign(new Proxy(thunks, this.#operation), $data);
     });

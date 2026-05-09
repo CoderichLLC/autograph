@@ -1,6 +1,38 @@
 const Util = require('@coderich/util');
 const { isGlob, globToRegex, mergeDeep, JSONParse, withResolvers } = require('../service/AppService');
 
+// Deep "merged" view: input first, falls through to doc — recursively for plain objects.
+// Reads only. Arrays / ObjectIds / Dates / class instances are returned as-is (positional
+// alignment with doc isn't safe to assume). Spread, Object.keys, Object.entries, JSON.stringify,
+// `in`, and property access all see the deep-merged view.
+const createMergedProxy = (input, doc) => new Proxy(input, {
+  get(t, prop) {
+    if (typeof prop === 'symbol') return Reflect.get(t, prop);
+    const inputVal = t[prop];
+    const docVal = doc?.[prop];
+    if (Util.isPlainObject(inputVal) && Util.isPlainObject(docVal)) return createMergedProxy(inputVal, docVal);
+    return inputVal === undefined ? docVal : inputVal;
+  },
+  has(t, prop) {
+    if (typeof prop === 'symbol') return Reflect.has(t, prop);
+    return prop in t || (doc != null && prop in doc);
+  },
+  ownKeys(t) {
+    if (doc == null) return Reflect.ownKeys(t);
+    return Array.from(new Set([...Reflect.ownKeys(t), ...Reflect.ownKeys(doc)]));
+  },
+  getOwnPropertyDescriptor(t, prop) {
+    const targetDesc = Reflect.getOwnPropertyDescriptor(t, prop);
+    if (targetDesc) return targetDesc;
+    if (doc != null) {
+      const docDesc = Reflect.getOwnPropertyDescriptor(doc, prop);
+      // configurable: true is required to honor proxy invariants for keys not on the target.
+      if (docDesc) return { ...docDesc, configurable: true };
+    }
+    return undefined;
+  },
+});
+
 module.exports = class Query {
   #config;
   #resolver;
@@ -48,13 +80,7 @@ module.exports = class Query {
     }
 
     return Object.defineProperty(this.#query, 'merged', {
-      value: new Proxy(target, {
-        get(t, prop) {
-          if (typeof prop === 'symbol') return Reflect.get(t, prop);
-          const v = t[prop];
-          return v === undefined ? doc[prop] : v;
-        },
-      }),
+      value: createMergedProxy(target, doc),
       enumerable: true,
       configurable: true,
     });

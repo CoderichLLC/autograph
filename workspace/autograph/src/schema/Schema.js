@@ -363,7 +363,6 @@ module.exports = class Schema {
 
             $model.transformers.create.config({
               strictSchema: true,
-              keepUndefined: true,
               shape: Object.values($model.fields).reduce((prev, curr) => {
                 const args = { model: $model, field: curr };
 
@@ -394,7 +393,6 @@ module.exports = class Schema {
 
             $model.transformers.update.config({
               strictSchema: true,
-              keepUndefined: true,
               shape: Object.values($model.fields).reduce((prev, curr) => {
                 const args = { model: $model, field: curr };
 
@@ -468,6 +466,12 @@ module.exports = class Schema {
                 rules.push(a => Pipeline.$validate({ ...a, ...args, path: a.path.concat(curr.name) }));
 
                 return Object.assign(prev, { [curr.name]: rules });
+              }, {}),
+              // Seed defaults so validate iterates every field with validate-pipeline rules
+              // (covers required-field checks for fields the user didn't provide).
+              defaults: Object.values($model.fields).reduce((prev, curr) => {
+                if (curr.pipelines.validate.length || curr.isEmbedded) return Object.assign(prev, { [curr.name]: undefined });
+                return prev;
               }, {}),
             });
 
