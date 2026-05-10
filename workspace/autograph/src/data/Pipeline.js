@@ -68,7 +68,19 @@ module.exports = class Pipeline {
     //
     Pipeline.define('$pk', (params) => {
       const { pkField } = params.model;
-      const v = get(params.query.doc, params.path) || params.value?.[pkField] || params.value; // I "think" the get() is for embedded documents
+      const userValue = params.value?.[pkField] || params.value;
+      const docValue = get(params.query.doc, params.path);
+      // Three cases:
+      //   (1) Top-level + single embedded: doc-first preserves ids on partial updates and avoids
+      //       id churn; also handles where-batch-update where input.id is shared/raced.
+      //   (2) Array element where the user explicitly supplied an id (startValue is truthy):
+      //       user wins — they're targeting that specific element.
+      //   (3) Array element with no user-supplied id (startValue is undefined): positional fallback
+      //       to doc preserves array-element ids so downstream smart-merge logic can locate the
+      //       intended doc element to merge into.
+      const isArrayElement = params.path.some(p => typeof p === 'number');
+      const userExplicit = isArrayElement && params.startValue !== undefined;
+      const v = userExplicit ? (userValue || docValue) : (docValue || userValue);
       if (v == null) return params.field.generator({ ...params, value: v });
       return Util.map(v, value => params.field.generator({ ...params, value }));
     }, { ignoreNull: false });

@@ -85,7 +85,17 @@ module.exports = class Schema {
   }
 
   /**
-   * Merge typeDefs and resolvers
+   * Merge typeDefs and resolvers.
+   *
+   * On field-type conflict the incoming source wins by default — EXCEPT for input-type fields,
+   * where the existing definition wins. The asymmetry covers `.api()`'s scaffolding:
+   *   - Object-type extensions like `extend type X implements Node { id: ID! }` need to
+   *     upgrade the decorator's nullable id to non-null so entities satisfy the Node interface.
+   *   - Input-type fields generated as `input XInputCreate { cards: [ID] }` should defer to a
+   *     user-supplied `extend input X { cards: [...] }` override.
+   *
+   * Connection wrapping (`authored: [Book] @field(connection: true)`) is no longer a merge
+   * conflict — it's an in-place AST transform on the user's typeDefs (see `#rewriteConnections`).
    */
   merge(schema = {}) {
     // Normalize schema input
@@ -103,7 +113,14 @@ module.exports = class Schema {
         }
       }).filter(Boolean);
 
-      this.#typeDefs = mergeTypeDefs([typeDefs, this.#typeDefs], { noLocation: true, reverseDirectives: true, onFieldTypeConflict: a => a });
+      this.#typeDefs = mergeTypeDefs([typeDefs, this.#typeDefs], {
+        noLocation: true,
+        reverseDirectives: true,
+        onFieldTypeConflict: (a, b, type) => {
+          if (type?.kind === Kind.INPUT_OBJECT_TYPE_DEFINITION || type?.kind === Kind.INPUT_OBJECT_TYPE_EXTENSION) return b;
+          return a;
+        },
+      });
     }
 
     if (schema.resolvers) {
@@ -475,10 +492,15 @@ module.exports = class Schema {
               }, {}),
             });
 
-            // Deserialize/docs special case handling for performance
+            // Deserialize/docs special case handling for performance. docTransform expects raw
+            // DB-shape input and produces GraphQL-shape output. It must be idempotent because
+            // the default field resolver re-wraps embedded sub-docs via toResultSet — and those
+            // children were already transformed during the parent's read. The non-enumerable
+            // $transformed marker lets a second call short-circuit without altering semantics.
             const docFields = Object.values($model.fields);
             $model.docTransform = (doc, args = {}) => {
               if (doc == null || typeof doc !== 'object') return doc;
+              if (doc.$transformed) return doc;
               const out = {};
               for (const docField of docFields) {
                 let value = docField.key in doc ? doc[docField.key] : docField.defaultValue;
@@ -488,6 +510,7 @@ module.exports = class Schema {
                 if (docField.pipelines.deserialize.length) value = Pipeline.resolve({ ...args, model: $model, field: docField, value }, 'deserialize');
                 out[docField.name] = value;
               }
+              Object.defineProperty(out, '$transformed', { value: true });
               return out;
             };
 
@@ -544,7 +567,10 @@ module.exports = class Schema {
 
             if ($field.isRequired && $field.isPersistable && !$field.isVirtual) $field.pipelines.validate.push('required');
 
-            if ($field.isFKReference) {
+            // FK plumbing (join construction + ensureFK) only applies to persisted FK fields.
+            // A persist:false field has no data on the parent doc, so the join is unreachable
+            // and ensureFK has nothing to validate against — it's a custom-resolver field.
+            if ($field.isFKReference && $field.isPersistable !== false) {
               const to = $field.model.key;
               const on = $field.linkTo.fields[$field.linkBy].key;
               const from = $field.linkField.key;
@@ -608,7 +634,45 @@ module.exports = class Schema {
   }
 
   api() {
-    return this.merge(Schema.#api(this.parse()));
+    // Parse first so model metadata is built from the original field shapes (e.g. `authored: [Book]`),
+    // then rewrite the AST in place so the GraphQL schema sees `authored(args): BookConnection`.
+    // Doing this as an explicit transform instead of a competing `extend type X { ... }` typeDef
+    // removes one of the two reasons api() needed object-type incoming-wins; the other (Node
+    // interface id upgrade) keeps the asymmetric merge resolver in place.
+    const parsed = this.parse();
+    this.#rewriteConnections();
+    return this.merge(Schema.#api(parsed));
+  }
+
+  /**
+   * Walk this.#typeDefs and rewrite fields marked `@field(connection: true)` so their type
+   * becomes `XConnection` with the standard connection arguments, replacing the original
+   * `[X]` array type. The Schema model already captured the original metadata during parse(),
+   * so generated resolvers still know the field's underlying entity model.
+   */
+  #rewriteConnections() {
+    const { directives: { field: fieldDir } } = this.#config;
+
+    this.#typeDefs = visit(this.#typeDefs, {
+      [Kind.FIELD_DEFINITION]: {
+        enter: (node) => {
+          const fdir = node.directives?.find(({ name }) => name.value === fieldDir);
+          const connArg = fdir?.arguments?.find(({ name }) => name.value === 'connection');
+          if (!connArg || Schema.#resolveNodeValue(connArg.value) !== true) return undefined;
+
+          // Walk past NON_NULL_TYPE / LIST_TYPE wrappers to find the named element type.
+          let inner = node.type;
+          while (inner && inner.kind !== Kind.NAMED_TYPE) inner = inner.type;
+          const typeName = inner?.name?.value;
+          if (!typeName) return undefined;
+
+          const argString = Schema.#getConnectionArguments(typeName);
+          const stub = parse(`type _ { ${node.name.value}(${argString}): ${typeName}Connection }`, { noLocation: true });
+          const replacement = stub.definitions[0].fields[0];
+          return { ...node, type: replacement.type, arguments: replacement.arguments };
+        },
+      },
+    });
   }
 
   framework() {
@@ -774,8 +838,10 @@ module.exports = class Schema {
 
         ${readModels.map((model) => {
           const fields = Object.values(model.fields).filter(field => field.crud?.includes('r'));
-          const connectionFields = fields.filter(field => field.isConnection);
 
+          // Note: connection fields (`@field(connection: true)`) are rewritten in place on the
+          // user's existing type by Schema#rewriteConnections, called from .api() before this
+          // generator runs — so we don't emit a competing `extend type X { ... }` here.
           return `
             input ${model}InputWhere {
               ${fields.map(field => `${field}: ${field.model ? `${field.model}InputWhere` : 'AutoGraphMixed'}`)}
@@ -792,11 +858,6 @@ module.exports = class Schema {
               node: ${model}
               cursor: String
             }
-            ${connectionFields.length ? `
-              extend type ${model} {
-                ${connectionFields.map(field => `${field}(${Schema.#getConnectionArguments(field.model)}): ${field.model}Connection`)}
-              }
-            ` : ''}
           `;
         })}
 
