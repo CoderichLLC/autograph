@@ -356,6 +356,7 @@ emitter.on('preMutation', (event, next) => {
 - `event.query.merged` is only defined for `create` / `update` / `delete` events — not for read/count.
 - On `delete`, `event.query.merged` is functionally a read-only view of `doc` (the proxy target is a throwaway `{}`). Prefer reading `event.query.doc` directly when the intent is "the record being deleted."
 - To explicitly clear a field on update, pass `null`. `undefined` means "not provided" — the proxy will fall through to the doc value, which is rarely what you want for a clear.
+- **Transient GraphQL-only input fields are stripped from `event.query.input`.** The create/update transformer runs with `strictSchema: true`, so any field declared on a GraphQL input type (`XCreateInput`, `XUpdateInput`) but *not* on the model `X` is silently dropped during transform. Common case: a `UserCreateInput` has `role: String!` but `User` only has `roles: [Role!]!`; after transform, `event.query.input.role` is gone. Read it from `event.query.args.input.role` instead — `args.input` is the raw GraphQL input, never touched by the transformer. preMutation hooks that map transient inputs onto the persisted shape (or pass them to authorization rules) should always source from `args.input`, not `input`.
 
 ### 6c. `event.result` → `event.query.result`
 

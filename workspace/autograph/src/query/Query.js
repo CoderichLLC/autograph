@@ -126,12 +126,29 @@ module.exports = class Query {
   }
 
   /**
-   * Transform entire query for driver
+   * Transform entire query for driver. For updates, input is flattened to dot-notation reflecting
+   * smart-merge semantics: user-provided leaves overwrite, untouched keys are preserved. Sub-objects
+   * whose existing parent in the doc is null/undefined are kept whole (as a whole-object replacement
+   * at the parent path), since you can't set sub-fields of a null parent (true of both Mongo $set
+   * and Postgres jsonb_set).
    */
   toDriver() {
-    const { crud, input, where, sort, before, after, isNative, isCursorPaging } = this.#query;
+    const { crud, input, doc, where, sort, before, after, isNative, isCursorPaging } = this.#query;
     let $input = this.#model.transformers.toDriver.transform(input);
-    if (crud === 'update') $input = Util.flatten($input, { safe: true, ignorePaths: this.#model.ignorePaths });
+    if (crud === 'update') {
+      const ignorePaths = [...this.#model.ignorePaths];
+      (function collectNullParents($obj, path = '') {
+        if (!Util.isPlainObject($obj)) return;
+        Object.entries($obj).forEach(([key, val]) => {
+          if (!Util.isPlainObject(val)) return;
+          const subPath = path ? `${path}.${key}` : key;
+          const docVal = subPath.split('.').reduce((acc, p) => (acc == null ? acc : acc[p]), doc);
+          if (docVal == null) ignorePaths.push(subPath);
+          else collectNullParents(val, subPath);
+        });
+      }($input));
+      $input = Util.flatten($input, { safe: true, ignorePaths });
+    }
 
     const query = this.clone({
       model: this.#model.key,

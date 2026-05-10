@@ -540,6 +540,7 @@ module.exports = class Schema {
             $field.isFKReference = $field.fkField && !$field.isPrimaryKey && $field.model?.isMarkedModel && !$field.model?.isEmbedded;
             $field.isEmbedded = Boolean($field.model && !$field.isFKReference && !$field.isPrimaryKey);
             $field.isScalar = scalars.includes($field.type);
+            $field.isEnum = Boolean(this.#schema.enums[$field.type]);
             $field.generator ??= $model.generator;
 
             // Referential Integrity Setup
@@ -1010,9 +1011,9 @@ module.exports = class Schema {
 
   static #getGQLType(field, suffix) {
     let { type } = field;
-    const { isEmbedded, isRequired, isScalar, isArray, isArrayRequired, isPrimaryKey, defaultValue } = field;
+    const { isEmbedded, isRequired, isScalar, isEnum, isArray, isArrayRequired, isPrimaryKey, defaultValue } = field;
     const modelType = `${type}${suffix}`;
-    if (suffix && !isScalar) type = isEmbedded ? modelType : 'ID';
+    if (suffix && !isScalar && !isEnum) type = isEmbedded ? modelType : 'ID';
     type = isArray ? `[${type}${isArrayRequired ? '!' : ''}]` : type;
     if (!suffix && isRequired) type += '!';
     if (suffix === 'InputCreate' && !isPrimaryKey && isRequired && defaultValue == null) type += '!';
