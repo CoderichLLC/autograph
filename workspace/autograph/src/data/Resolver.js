@@ -322,9 +322,10 @@ module.exports = class Resolver {
     }).then((result) => {
       query.result = result;
       return Emitter.emit(`post${type}`, event);
-    }).then((result = query.result) => result).catch((e) => {
-      throw Boom.boomify(e);
-    });
+    }).then(early => (early !== undefined ? early : Emitter.emit('preResponse', event)))
+      .then(early => (early !== undefined ? early : Emitter.emit('postResponse', event)))
+      .then((early = query.result) => early)
+      .catch((e) => { throw Boom.boomify(e); });
   }
 
   static $loader(name, resolver, config) {
