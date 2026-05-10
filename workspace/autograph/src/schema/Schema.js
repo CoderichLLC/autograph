@@ -472,7 +472,11 @@ module.exports = class Schema {
                 const args = { model: $model, field: curr };
                 const rules = [];
 
-                if (curr.isEmbedded) {
+                // Persist:false embedded fields are transient — used for derivation in custom
+                // resolvers/setup hooks, not stored. Storage-integrity validation (ensureFK,
+                // required) on their subtree fights this pattern; skip the embedded validate
+                // transform entirely. Custom validators on the parent field still run.
+                if (curr.isEmbedded && curr.isPersistable !== false) {
                   rules.push(a => Util.map(a.value, (value, i) => {
                     const path = a.path.concat(curr.name);
                     if (curr.isArray) path.push(i);
