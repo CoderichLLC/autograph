@@ -1,4 +1,4 @@
-// const { Emitter } = require('@coderich/autograph');
+const { Emitter } = require('@coderich/autograph');
 
 let richard;
 let christie;
@@ -795,6 +795,7 @@ module.exports = () => describe('TestSuite', () => {
     });
   });
 
+
   describe('Transactions (manual)', () => {
     test('single txn (commit)', async () => {
       const txn = resolver.transaction();
@@ -861,18 +862,24 @@ module.exports = () => describe('TestSuite', () => {
   });
 
   describe('Transactions (manual-with-auto)', () => {
-    test('multi-txn (duplicate key with rollback OK)', async () => {
-      const txn1 = resolver.transaction(false);
+    test('multi-txn (rollback isolates inner writes)', async () => {
+      // With the pair/isolated model, an auto-wrap *Many inside a user txn writes into the
+      // user txn's pre-session. Reads from the root resolver (outside the txn) see snapshot-
+      // isolated state — i.e. nothing until commit.
+      const txn1 = resolver.transaction();
       const [person1$1, person2$1] = await txn1.match('Person').save([{ name: 'person10', emailAddress: 'person10@gmail.com' }, { name: 'person11', emailAddress: 'person11@gmail.com' }]);
       expect(person1$1.name).toBe('person10');
       expect(person2$1.name).toBe('person11');
-      expect(await resolver.match('Person').id(person1$1).one()).not.toBeNull();
 
-      // Rolling this back should also rollback nested create transaction
+      // Uncommitted: root cannot see in-flight writes.
+      expect(await resolver.match('Person').id(person1$1).one()).toBeNull();
+
+      // Rollback: still not visible (never were committed).
       await txn1.rollback();
       expect(await resolver.match('Person').id(person1$1).one()).toBeNull();
 
-      // Isolated transaction; all is rolled back so should be OK to create
+      // A second independent txn can create the same names — prior was rolled back, the
+      // uniqueness slot is free. Still invisible to root before commit.
       const txn2 = resolver.transaction();
       const [person1$2] = await txn2.match('Person').save([{ name: 'person10', emailAddress: 'person10@gmail.com' }, { name: 'person11', emailAddress: 'person11@gmail.com' }]);
       expect(await resolver.match('Person').id(person1$2).one()).toBeNull();
@@ -880,11 +887,11 @@ module.exports = () => describe('TestSuite', () => {
     });
 
     test('multi-txn (duplicate key with commit)', async () => {
-      const txn1 = resolver.transaction(false);
+      const txn1 = resolver.transaction();
       await txn1.match('Person').save([{ name: 'person10', emailAddress: 'person10@gmail.com' }, { name: 'person11', emailAddress: 'person11@gmail.com' }]);
       await txn1.commit();
 
-      const txn2 = resolver.transaction(false);
+      const txn2 = resolver.transaction();
       await expect(txn2.match('Person').save([{ name: 'person10', emailAddress: 'person10@gmail.com' }, { name: 'person11', emailAddress: 'person11@gmail.com' }])).rejects.toThrow(/duplicate/gi);
       await txn2.rollback();
     });
@@ -1114,6 +1121,89 @@ module.exports = () => describe('TestSuite', () => {
       expect(await $save.$.many()).toEqual([expect.objectContaining({ id: doc.id })]);
       const $$save = await $doc.$save();
       expect(await $$save.$.many()).toEqual([expect.objectContaining({ id: doc.id })]);
+    });
+  });
+
+  describe('Cascading postMutation hooks (auto-wrap re-entry)', () => {
+    // Reproduces the Spitfire-style pattern that infinite-cascades through hybridTransaction.match:
+    //
+    //   1. Multiple postMutation hooks listen to the same model. Emitter.emit dispatches them via
+    //      Promise.all → each fn runs in microtask succession on the SAME event.
+    //   2. Each hook opens a *Many write → transaction(false) pushes a new session.
+    //   3. The SECOND hook's wrap opens while the first wrap is still on this.#sessions → it
+    //      nests, creating a hybridTransaction and (in the buggy version) sharing the outer's
+    //      postCommit array.
+    //   4. With shared postCommit, the inner commit fires the queued entries, those hooks open
+    //      yet more nested wraps, which also share the same array, which re-fire the entries…
+    //      stack overflow inside hybridTransaction.match.
+    //
+    // Each session must own its own postCommit list. Placed last so afterAll can remove listeners
+    // before the next test file picks up the suite.
+    const seen = { hookA: 0, hookB: 0, colorChain: 0 };
+    let hookA;
+    let hookB;
+    let colorChain;
+
+    beforeAll(async () => {
+      // TWO hooks on Person → Emitter Promise.all dispatches both in microtask succession,
+      // each opens its own *Many wrap → second nests on first (hybridTransaction created).
+      hookA = async (event, next) => {
+        seen.hookA++;
+        await event.resolver.match('Color').where({}).save({ type: 'red' });
+        next();
+      };
+      hookB = async (event, next) => {
+        seen.hookB++;
+        await event.resolver.match('Art').where({}).save({ name: 'cascadeArt' });
+        next();
+      };
+      // Hook on the INNER-op model (Color). Each Color updateOne inside wrap1 will defer its
+      // postMutation onto the (shared, when buggy) postCommit. When the wrap commits and fires
+      // the queue, this hook opens ANOTHER *Many wrap on PlainJane — which (because the outer
+      // wrap is still in the stack chain through hybridTransaction) nests, joins the shared
+      // postCommit, pushes more entries, and on its commit re-fires the SAME entries →
+      // exponential cascade through hybridTransaction.match.
+      colorChain = async (event, next) => {
+        seen.colorChain++;
+        // Bounded counter: prevents an actual infinite loop if the wiring lets it slip through.
+        if (seen.colorChain < 20) {
+          await event.resolver.match('PlainJane').where({}).save({ name: 'cascadePJ' });
+        }
+        next();
+      };
+      Emitter.onModels('postMutation', ['Person'], hookA);
+      Emitter.onModels('postMutation', ['Person'], hookB);
+      Emitter.onModels('postMutation', ['Color'], colorChain);
+
+      // Seed targets so the *Many writes have docs to touch.
+      await resolver.match('Color').save({ type: 'blue' });
+      await resolver.match('Art').save({ name: 'cascadeArtSeed' });
+      await resolver.match('PlainJane').save({ name: 'cascadePJSeed' });
+    });
+
+    afterAll(async () => {
+      Emitter.removeListener('postMutation', hookA);
+      Emitter.removeListener('postMutation', hookB);
+      Emitter.removeListener('postMutation', colorChain);
+      await resolver.match('Color').where({}).remove();
+      await resolver.match('Art').where({}).remove();
+      await resolver.match('PlainJane').where({}).remove();
+    });
+
+    test('parallel hooks + inner-op hook chain do not infinitely cascade', async () => {
+      seen.hookA = 0;
+      seen.hookB = 0;
+      seen.colorChain = 0;
+
+      const saved = await resolver.match('Person').save({ name: 'CascadeNested', emailAddress: 'cascadenested@example.com' });
+      expect(saved.id).toBeDefined();
+      // Each Person->hook fires exactly once; the chained colorChain should fire once per
+      // distinct Color-update event, not exponentially.
+      expect(seen.hookA).toBe(1);
+      expect(seen.hookB).toBe(1);
+      expect(seen.colorChain).toBeLessThan(20); // ceiling — bug would race past this
+
+      await resolver.match('Person').id(saved.id).delete();
     });
   });
 });
