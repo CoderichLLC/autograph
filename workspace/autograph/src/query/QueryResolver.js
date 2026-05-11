@@ -25,8 +25,8 @@ module.exports = class QueryResolver extends QueryBuilder {
     return this.#resolution.promise;
   }
 
-  terminate() {
-    const query = super.terminate();
+  terminate(queryOverride) {
+    const query = super.terminate(queryOverride);
     query.promise().then(this.#resolution.resolve).catch(this.#resolution.reject);
     const { op, args: { input } } = query.toObject();
 
@@ -36,7 +36,7 @@ module.exports = class QueryResolver extends QueryBuilder {
         return this.#resolver.resolve(query);
       }
       case 'createMany': {
-        return Promise.all(input.map(el => this.#resolver.match(this.#model.name).save(el)));
+        return this.#resolver.transaction(false).run(Promise.all(input.map(el => this.#resolver.match(this.#model.name).save(el))));
       }
       case 'updateOne': {
         return this.#get(query).then((doc) => {
@@ -45,7 +45,7 @@ module.exports = class QueryResolver extends QueryBuilder {
       }
       case 'updateMany': {
         return this.#find(query).then((docs) => {
-          return Promise.all(docs.map(doc => this.#resolver.match(this.#model.name).id(doc.id).save(input)));
+          return this.#resolver.transaction(false).run(Promise.all(docs.map(doc => this.#resolver.match(this.#model.name).id(doc.id).save(input))));
         });
       }
       case 'pushOne': {
@@ -61,7 +61,7 @@ module.exports = class QueryResolver extends QueryBuilder {
       case 'pushMany': {
         const [[key, values]] = Object.entries(input);
         return this.#find(query).then((docs) => {
-          return Promise.all(docs.map(doc => this.#resolver.match(this.#model.name).id(doc.id).push(key, values)));
+          return this.#resolver.transaction(false).run(Promise.all(docs.map(doc => this.#resolver.match(this.#model.name).id(doc.id).push(key, values))));
         });
       }
       case 'pullOne': {
@@ -78,7 +78,7 @@ module.exports = class QueryResolver extends QueryBuilder {
       case 'pullMany': {
         const [[key, values]] = Object.entries(input);
         return this.#find(query).then((docs) => {
-          return Promise.all(docs.map(doc => this.#resolver.match(this.#model.name).id(doc.id).pull(key, values)));
+          return this.#resolver.transaction(false).run(Promise.all(docs.map(doc => this.#resolver.match(this.#model.name).id(doc.id).pull(key, values))));
         });
       }
       case 'spliceOne': {
@@ -97,7 +97,7 @@ module.exports = class QueryResolver extends QueryBuilder {
       case 'spliceMany': {
         const [[key, values]] = Object.entries(input);
         return this.#find(query).then((docs) => {
-          return Promise.all(docs.map(doc => this.#resolver.match(this.#model.name).id(doc.id).splice(key, ...values)));
+          return this.#resolver.transaction(false).run(Promise.all(docs.map(doc => this.#resolver.match(this.#model.name).id(doc.id).splice(key, ...values))));
         });
       }
       case 'deleteOne': {
@@ -109,7 +109,7 @@ module.exports = class QueryResolver extends QueryBuilder {
       }
       case 'deleteMany': {
         return this.#find(query).then((docs) => {
-          return Promise.all(docs.map(doc => this.#resolver.match(this.#model.name).id(doc.id).delete()));
+          return this.#resolver.transaction(false).run(Promise.all(docs.map(doc => this.#resolver.match(this.#model.name).id(doc.id).delete())));
         });
       }
       default: {

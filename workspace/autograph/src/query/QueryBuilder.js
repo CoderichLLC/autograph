@@ -36,8 +36,9 @@ module.exports = class QueryBuilder {
    * We have to clone() the Query because we mutate this.#config all while the query is being built
    * However there is a "bug" when using .resolve() (below) and the QueryBuilder is re-used to resolve each thunk
    */
-  terminate() {
-    return new Query(this.#config).clone();
+  terminate(queryOverride) {
+    const config = queryOverride ? { ...this.#config, query: queryOverride } : this.#config;
+    return new Query(config).clone();
   }
 
   /**

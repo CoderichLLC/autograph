@@ -752,6 +752,49 @@ module.exports = () => describe('TestSuite', () => {
       await resolver.match('Art').where({}).pull('bids', '69.99');
       expect(await resolver.match('Art').many()).toMatchObject([{ bids: [109.99] }, { bids: [109.99] }]);
     });
+
+    test('multi-create rolls back on partial validation failure', async () => {
+      // Two inputs; second has an invalid emailAddress. The whole call must reject AND the
+      // valid first input must NOT be persisted.
+      await expect(resolver.match('Person').save([
+        { name: 'AtomicCreate1', emailAddress: 'atomic1@example.com' },
+        { name: 'AtomicCreate2', emailAddress: 'not-an-email' }, // fails @field(validate: email)
+      ])).rejects.toThrow();
+      expect(await resolver.match('Person').where({ name: 'AtomicCreate1' }).one()).toBeNull();
+    });
+
+    test('multi-create rolls back on partial uniqueness violation', async () => {
+      // Seed one record so the second of the pair below collides on the unique name index.
+      const seed = await resolver.match('Person').save({ name: 'AtomicSeed', emailAddress: 'atomicseed@example.com' });
+      expect(seed.id).toBeDefined();
+
+      await expect(resolver.match('Person').save([
+        { name: 'AtomicCreate3', emailAddress: 'atomic3@example.com' },
+        { name: 'AtomicSeed', emailAddress: 'atomic4@example.com' }, // duplicate name → index violation
+      ])).rejects.toThrow(/duplicate/gi);
+      expect(await resolver.match('Person').where({ name: 'AtomicCreate3' }).one()).toBeNull();
+
+      // Cleanup so subsequent tests aren't affected by AtomicSeed
+      await resolver.match('Person').id(seed.id).delete();
+    });
+
+    test('multi-update rolls back on partial validation failure', async () => {
+      // Seed two records, then attempt updateMany where one would fail validation.
+      const [a, b] = await resolver.match('Person').save([
+        { name: 'AtomicUpdA', emailAddress: 'updA@example.com' },
+        { name: 'AtomicUpdB', emailAddress: 'updB@example.com' },
+      ]);
+
+      // Update both: the second will fail validation (invalid email format).
+      await expect(resolver.match('Person').where({ name: ['AtomicUpdA', 'AtomicUpdB'] }).save({ emailAddress: 'not-an-email' })).rejects.toThrow();
+
+      // Verify NEITHER record was updated — both retain their original emailAddress.
+      const after = await resolver.match('Person').where({ name: ['AtomicUpdA', 'AtomicUpdB'] }).many();
+      expect(after.map(p => p.emailAddress).sort()).toEqual(['updA@example.com', 'updB@example.com']);
+
+      // Cleanup
+      await resolver.match('Person').id([a.id, b.id]).delete();
+    });
   });
 
   describe('Transactions (manual)', () => {
