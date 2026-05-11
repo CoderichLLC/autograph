@@ -127,9 +127,12 @@ module.exports = class QueryResolver extends QueryBuilder {
   }
 
   #resolveReferentialIntegrity(doc) {
-    const txn = this.#resolver;
+    // Wrap the entire RI chain in a transaction so a `restrict` thrown mid-walk rolls back any
+    // earlier cascades/nullifies. Without this, deleting a record whose RI hits a restrict
+    // AFTER one or more cascade/nullify steps leaves partial side effects committed.
+    const txn = this.#resolver.transaction(false);
 
-    return Util.promiseChain(this.#model.referentialIntegrity.map(({ model, field, isArray, path }) => () => {
+    return txn.run(Util.promiseChain(this.#model.referentialIntegrity.map(({ model, field, isArray, path }) => () => {
       const { onDelete, fkField } = field;
       const id = doc[fkField];
       const $path = path.join('.');
@@ -141,6 +144,6 @@ module.exports = class QueryResolver extends QueryBuilder {
         case 'restrict': return txn.match(model).where(where).count().then(count => (count ? Promise.reject(new Error('Restricted')) : count));
         default: throw new Error(`Unknown onDelete operator: '${onDelete}'`);
       }
-    }));
+    })));
   }
 };

@@ -944,6 +944,34 @@ module.exports = () => describe('TestSuite', () => {
       await resolver.match('Role').id(r.id).delete();
       await resolver.match('PlainJane').id(pj.id).save({}); // Bug where deleted role would fail FK constraint when trying to update/save parent record
     });
+
+    test('delete rolls back cascades when a restrict throws mid-walk', async () => {
+      // Setup: A is a Person referenced via Person.section.persons (cascade-pull) and
+      // A also authored a Book with a Chapter (Book.author cascade → Book.remove() →
+      // Chapter.book restrict throws). Person.section.persons cascade fires BEFORE
+      // Book.author cascade in the RI walk order, so without atomicity the section.persons
+      // pull would commit, then the Book cascade restricts and A's delete fails — leaving
+      // partial state.
+      const a = await resolver.match('Person').save({ name: 'atomicAuthor', emailAddress: 'atomic-author@example.com' });
+      const c = await resolver.match('Person').save({ name: 'atomicSection', emailAddress: 'atomic-section@example.com', section: { name: 'atomicSec', persons: [a.id] } });
+      const book = await resolver.match('Book').save({ name: 'Atomic Book', price: 9.99, author: a.id });
+      const chapter = await resolver.match('Chapter').save({ name: 'AtomicChapter1', book: book.id });
+
+      // The delete must reject (restrict).
+      await expect(resolver.match('Person').id(a.id).delete()).rejects.toThrow(/restrict/gi);
+
+      // Atomicity assertions — nothing should have changed.
+      expect(await resolver.match('Person').id(a.id).one()).not.toBeNull();
+      expect(await resolver.match('Book').id(book.id).one()).not.toBeNull();
+      const cAfter = await resolver.match('Person').id(c.id).one();
+      expect(cAfter.section.persons.map(p => `${p}`)).toContain(`${a.id}`);
+
+      // Cleanup so subsequent tests see a clean state.
+      await resolver.match('Chapter').id(chapter.id).delete();
+      await resolver.match('Book').id(book.id).delete();
+      await resolver.match('Person').id(c.id).delete();
+      await resolver.match('Person').id(a.id).delete();
+    });
   });
 
   describe('Native Queries', () => {
