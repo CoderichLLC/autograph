@@ -754,8 +754,6 @@ module.exports = () => describe('TestSuite', () => {
     });
 
     test('multi-create rolls back on partial validation failure', async () => {
-      // Two inputs; second has an invalid emailAddress. The whole call must reject AND the
-      // valid first input must NOT be persisted.
       await expect(resolver.match('Person').save([
         { name: 'AtomicCreate1', emailAddress: 'atomic1@example.com' },
         { name: 'AtomicCreate2', emailAddress: 'not-an-email' }, // fails @field(validate: email)
