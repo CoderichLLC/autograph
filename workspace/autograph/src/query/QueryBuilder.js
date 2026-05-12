@@ -65,7 +65,13 @@ module.exports = class QueryBuilder {
   }
 
   args(args = {}) {
-    Object.entries(args).forEach(([key, value]) => { if (this[key]) this[key](value); }); // Call method only if exists
+    Object.entries(args).forEach(([key, value]) => {
+      // Known builder methods drive the builder. Unknown keys (e.g., schema extensions like
+      // `findNetworkPlace(search: String)`) are preserved on `args` so hooks can see them via
+      // `event.query.args.<key>`. Without this, custom GraphQL args are silently dropped.
+      if (typeof this[key] === 'function') this[key](value);
+      else this.#query.args[key] = value;
+    });
     return this;
   }
 

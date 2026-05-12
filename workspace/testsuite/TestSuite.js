@@ -1082,6 +1082,27 @@ module.exports = () => describe('TestSuite', () => {
         data: { en: 'name' },
       });
     });
+
+    // A query that joins on an array field (e.g., `Person.friends: [Person]`) builds an aggregation
+    // step that tests whether the joined document's id is IN the parent's array. When the parent
+    // doc is missing the array field entirely (e.g., never set), drivers like MongoDB will throw
+    // ("$in requires an array as a second argument, found: missing") unless the local array
+    // reference is defaulted to []. Every driver must implement the same "missing local array =
+    // doc cannot match the join" semantic — the query should complete without throwing and
+    // simply exclude the doc-with-missing-array from results.
+    test('join on array field tolerates parent docs that are missing that array', async () => {
+      // Create a Person with no `friends` field at all (input does not mention `friends`).
+      const loner = await resolver.match('Person').save({ name: 'loner', emailAddress: 'loner@gmail.com' });
+      expect(loner.friends).toBeFalsy();
+
+      // The query joins through `Person.friends` (an array reference). The aggregation step
+      // tests whether the joined doc's id is IN the parent's `friends` array. For `loner`, the
+      // array doesn't exist — drivers must treat a missing local array as "no match" (default
+      // to []) rather than letting it propagate to a $in/equivalent that throws. The query
+      // must complete without throwing AND must exclude loner from results.
+      const results = await resolver.match('Person').where({ friends: { name: 'richard' } }).many();
+      expect(results.some(p => `${p.id}` === `${loner.id}`)).toBe(false);
+    });
   });
 
   describe('Case [In]sensitive Sort', () => {
