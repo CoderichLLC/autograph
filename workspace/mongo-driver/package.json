@@ -15,7 +15,7 @@
     "dev": "coderich-dev"
   },
   "dependencies": {
-    "@coderich/util": "1.2.2",
+    "@coderich/util": "2.2.3",
     "mongodb": "6.16.0"
   },
   "devDependencies": {

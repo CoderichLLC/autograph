@@ -16,9 +16,8 @@
     "clinic": "clinic flame -- node ./test/server"
   },
   "dependencies": {
-    "@coderich/util": "2.2.0",
+    "@coderich/util": "2.2.3",
     "@graphql-tools/merge": "9.0.0",
-    "@graphql-tools/resolvers-composition": "7.0.0",
     "@hapi/boom": "10.0.1",
     "bson-objectid": "2.0.4",
     "dataloader": "2.2.2",
@@ -29,10 +28,10 @@
     "lodash.merge": "4.6.2",
     "lodash.uniqwith": "4.5.0",
     "object-hash": "3.0.0",
-    "picomatch": "4.0.1"
+    "picomatch": "4.0.4"
   },
   "devDependencies": {
-    "@apollo/server": "4.9.5",
+    "@apollo/server": "5.5.1",
     "@coderich/autograph-db-tests": "*",
     "@coderich/autograph-mongodb": "*",
     "@graphql-tools/schema": "10.0.0",
