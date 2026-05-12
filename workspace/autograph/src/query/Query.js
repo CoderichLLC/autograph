@@ -2,9 +2,13 @@ const Util = require('@coderich/util');
 const { isGlob, globToRegex, mergeDeep, JSONParse, withResolvers } = require('../service/AppService');
 
 // Deep "merged" view: input first, falls through to doc — recursively for plain objects.
-// Reads only. Arrays / ObjectIds / Dates / class instances are returned as-is (positional
-// alignment with doc isn't safe to assume). Spread, Object.keys, Object.entries, JSON.stringify,
-// `in`, and property access all see the deep-merged view.
+// READ-ONLY. Writes/deletes throw with a hint pointing at `query.input` as the correct
+// mutation target. Without this, the default proxy `set` writes through to the target
+// (input), which silently lands on `input` for top-level fields but mutates the underlying
+// `doc` for nested paths whose parent only exists on doc — a footgun.
+// Arrays / ObjectIds / Dates / class instances are returned as-is (positional alignment with
+// doc isn't safe to assume). Spread, Object.keys, Object.entries, JSON.stringify, `in`, and
+// property access all see the deep-merged view.
 const createMergedProxy = (input, doc) => new Proxy(input, {
   get(t, prop) {
     if (typeof prop === 'symbol') return Reflect.get(t, prop);
@@ -30,6 +34,12 @@ const createMergedProxy = (input, doc) => new Proxy(input, {
       if (docDesc) return { ...docDesc, configurable: true };
     }
     return undefined;
+  },
+  set(t, prop) {
+    throw new TypeError(`query.merged is a read-only computed view — assign to query.input.${String(prop)} instead`);
+  },
+  deleteProperty(t, prop) {
+    throw new TypeError(`query.merged is a read-only computed view — delete query.input.${String(prop)} instead`);
   },
 });
 
