@@ -111,7 +111,11 @@ module.exports = class MongoDriver {
     const varName = `${as}_${join.from.replaceAll('.', '_')}`;
     const $let = { [varName]: `$${localField}` };
     const op = join.isArray ? '$in' : '$eq';
-    $match.$expr = { [op]: [`$${foreignField}`, `$$${varName}`] };
+    // When the local field is an array, defend against parent docs that are missing it (or
+    // have null). Mongo's $in needs an array as the second operand; "missing"/null throws
+    // "$in requires an array as a second argument, found: missing" during aggregation.
+    const valueExpr = join.isArray ? { $ifNull: [`$$${varName}`, []] } : `$$${varName}`;
+    $match.$expr = { [op]: [`$${foreignField}`, valueExpr] };
     const pipeline = [{ $match }];
     return [
       {
