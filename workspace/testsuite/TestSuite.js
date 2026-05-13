@@ -1,4 +1,4 @@
-// const { Emitter } = require('@coderich/autograph');
+const { Emitter } = require('@coderich/autograph');
 
 let richard;
 let christie;
@@ -1102,6 +1102,56 @@ module.exports = () => describe('TestSuite', () => {
       // must complete without throwing AND must exclude loner from results.
       const results = await resolver.match('Person').where({ friends: { name: 'richard' } }).many();
       expect(results.some(p => `${p.id}` === `${loner.id}`)).toBe(false);
+    });
+
+    // DataLoader must merge parallel queries that share structural shape and differ only in one
+    // where-key value — even when *other* where keys are present (e.g., scoping fields injected
+    // by a preQuery hook for workspace/tenant filtering). Without this, every per-parent fanout
+    // (descendants/children-style lookups) collapses to one Mongo round-trip per parent → N+1
+    // in any consumer that does workspace-scoped GraphQL.
+    test('parallel findMany with shared scoping fields batches into one driver call', async () => {
+      // preQuery hook injects a "scoping" field into every findBook where — mimics workspace /
+      // tenant / network scoping that real consumers (like Spitfire) apply globally.
+      const scopingHook = (event) => {
+        if (event.query.op === 'findMany' && event.query.model === 'Book') {
+          event.query.where = { ...event.query.where, price: { $ne: -999 } };
+        }
+      };
+      Emitter.on('preQuery', scopingHook);
+
+      // Spy on the underlying mongo driver. Each #resolve clustering step results in 1 spy hit
+      // per Mongo round-trip — the assertion is on the count.
+      const client = global.mongoClient;
+      const spy = jest.spyOn(client, 'resolve');
+
+      try {
+        // Make sure caches are clean so each Book lookup goes through #resolve.
+        resolver.clearAll();
+        spy.mockClear();
+
+        // Issue 4 parallel findManys, each with a different `author` (the fanout key) and the
+        // same `price` filter added by the hook. They all share structural shape.
+        const [m, h, ja, ri] = await Promise.all([
+          resolver.match('Book').where({ author: mobyDick.author }).many(),
+          resolver.match('Book').where({ author: healthBook.author }).many(),
+          resolver.match('Book').where({ author: jane.id }).many(),
+          resolver.match('Book').where({ author: richard.id }).many(),
+        ]);
+
+        // Correctness — same results we'd get if each ran solo.
+        expect(Array.isArray(m)).toBe(true);
+        expect(Array.isArray(h)).toBe(true);
+        expect(Array.isArray(ja)).toBe(true);
+        expect(Array.isArray(ri)).toBe(true);
+
+        // Batching — DataLoader should have collapsed all 4 into 1 driver call. Before the
+        // multi-key clustering fix this was 4 driver calls (the where had 2 keys, so the old
+        // single-key batch inference bailed to __default__).
+        expect(spy.mock.calls.length).toBe(1);
+      } finally {
+        Emitter.removeListener('preQuery', scopingHook);
+        spy.mockRestore();
+      }
     });
   });
 

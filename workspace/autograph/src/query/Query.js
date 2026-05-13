@@ -180,7 +180,7 @@ module.exports = class Query {
    * Finalize the query for the driver
    */
   #finalize(query) {
-    const { where = {}, sort = {}, op } = query;
+    const { where = {}, sort = {} } = query;
     const flatSort = Util.flatten(sort, { safe: true });
     const flatWhere = Util.flatten(where, { safe: true });
     const $sort = Util.unflatten(Object.keys(flatSort).reduce((prev, key) => Object.assign(prev, { [key]: {} }), {}), { safe: true });
@@ -204,8 +204,10 @@ module.exports = class Query {
       return prev;
     }, {}), { safe: true }));
 
-    // If we have 1 field in where clause this is a candidate for batching
-    query.batch = (op === 'findOne' || op === 'findMany') && Object.keys(query.where).length === 1 ? Object.keys(query.where)[0] : '__default__';
+    // (Batch-key inference removed — DataLoader now detects merge candidates by examining all
+    // queries arriving in the tick, finding subsets that differ in exactly one where-key. The
+    // prior single-key heuristic produced false negatives whenever a hook added a scoping field
+    // to the where clause.)
 
     // Construct joins
     const joinsByPath = {};
