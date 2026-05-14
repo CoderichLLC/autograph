@@ -940,20 +940,23 @@ module.exports = class Schema {
                 data: ${model}SubscriptionPayloadEventData!
               }
 
+              # AG15 target: emit full FK ref types here (Network!, [Network!]) for symmetry with
+              # query/mutation. Requires the resolver block below to be enabled. For now we emit
+              # ID / [ID] (matching AG12) to preserve subscription client compatibility.
               type ${model}SubscriptionPayloadEventData {
-                ${fields.map(field => `${field}: ${Schema.#getGQLType(field)}`)}
+                ${fields.map(field => `${field}: ${Schema.#getSubscriptionType(field)}`)}
               }
 
               interface ${model}SubscriptionQuery {
-                ${fields.map(field => `${field}: ${Schema.#getGQLType(field)}`)}
+                ${fields.map(field => `${field}: ${Schema.#getSubscriptionType(field)}`)}
               }
 
               type ${model}Create implements ${model}SubscriptionQuery {
-                ${fields.map(field => `${field}: ${Schema.#getGQLType(field)}`)}
+                ${fields.map(field => `${field}: ${Schema.#getSubscriptionType(field)}`)}
               }
 
               type ${model}Update implements ${model}SubscriptionQuery {
-                ${fields.map(field => `${field}: ${Schema.#getGQLType(field)}`)}
+                ${fields.map(field => `${field}: ${Schema.#getSubscriptionType(field)}`)}
               }
             `;
           })}
@@ -1009,6 +1012,40 @@ module.exports = class Schema {
             }, {}),
           });
         }, {}),
+        // AG15 — Subscription payload field resolvers (currently disabled).
+        //
+        // When enabled, this generates entity-field resolvers on the subscription payload types
+        // (<Model>SubscriptionPayloadEventData / <Model>Create / <Model>Update) using the same
+        // doc.$.lookup(field) pattern that powers the query/mutation path. With these resolvers
+        // in place, the subscription SDL can emit full FK reference types (`network: Network!`)
+        // instead of `ID`, restoring symmetry with query/mutation — subscribers can select
+        // `event.data.network { id name }` and get resolved entities, lazily (DataLoader-batched).
+        //
+        // Re-enabling requires:
+        //   1. Uncomment this block
+        //   2. Swap `Schema.#getSubscriptionType(field)` -> `Schema.#getGQLType(field)` in the
+        //      subscription SDL emitter above
+        //   3. Remove `Schema.#getSubscriptionType` (it would become a one-line wrapper)
+        //
+        // Currently commented out because flipping the subscription SDL types is a breaking
+        // change for existing clients who select FK fields scalar-style (`network` without
+        // subfields). AG15 is the right place to ship the breakage with a migration note.
+        //
+        // ...subscriptionModels.reduce((prev, model) => {
+        //   const fieldResolvers = Object.values(model.fields).filter(field => field.model?.isEntity && field.crud?.includes('r')).reduce((acc, field) => {
+        //     return Object.assign(acc, {
+        //       [field]: (doc, args, context, info) => {
+        //         if (!doc.$) doc = context[schema.namespace].resolver.toResultSet(model, doc);
+        //         return doc.$.lookup(field).args(args).info(info).resolve(info);
+        //       },
+        //     });
+        //   }, {});
+        //   return Object.assign(prev, {
+        //     [`${model}SubscriptionPayloadEventData`]: fieldResolvers,
+        //     [`${model}Create`]: fieldResolvers,
+        //     [`${model}Update`]: fieldResolvers,
+        //   });
+        // }, {}),
       },
     };
   }
@@ -1022,6 +1059,15 @@ module.exports = class Schema {
     if (!suffix && isRequired) type += '!';
     if (suffix === 'InputCreate' && !isPrimaryKey && isRequired && defaultValue == null) type += '!';
     return type;
+  }
+
+  // AG12-compatible subscription field typing: FK references emit as `ID` (or `[ID]`) so the
+  // schema matches the raw FK-scalar values published in subscription events. AG15 should swap
+  // this to the full `#getGQLType(field)` form and pair it with the (currently commented out)
+  // subscription payload field resolvers below — restoring full symmetry with query/mutation.
+  static #getSubscriptionType(field) {
+    if (field.isFKReference) return field.isArray ? '[ID]' : 'ID';
+    return Schema.#getGQLType(field);
   }
 
   static #getConnectionArguments(model) {
