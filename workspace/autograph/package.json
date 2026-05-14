@@ -13,6 +13,7 @@
     "test": "NODE_OPTIONS=\"--stack-trace-limit=1000\" jest --config=jest.config.js",
     "lint": "eslint ./",
     "dev": "coderich-dev",
+    "local": "nodemon ./test/server.js -e graphql,js,yml",
     "clinic": "clinic flame -- node ./test/server"
   },
   "dependencies": {
@@ -37,7 +38,8 @@
     "@graphql-tools/schema": "10.0.0",
     "clinic": "13.0.0",
     "graphql": "16.8.1",
-    "mongodb-memory-server": "8.13.0"
+    "mongodb-memory-server": "8.13.0",
+    "nodemon": "3.1.14"
   },
   "peerDependencies": {
     "graphql": "*"
