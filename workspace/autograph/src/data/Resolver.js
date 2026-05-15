@@ -21,7 +21,6 @@ module.exports = class Resolver {
     this.#xschema = xschema;
     this.#context = context;
     this.#dataLoaders = this.#createDataLoaders();
-    this.driver = this.raw; // Alias
     this.model = this.match; // Alias
     Util.set(this.#context, `${this.#schema.namespace}.resolver`, this);
   }
@@ -52,7 +51,7 @@ module.exports = class Resolver {
     });
   }
 
-  raw(model) {
+  driver(model) {
     model = this.toModel(model);
     return model?.source?.client?.driver(model.key);
   }
@@ -312,7 +311,7 @@ module.exports = class Resolver {
     return Emitter.emit(`pre${type}`, event).then(async (resultEarly) => {
       if (resultEarly !== undefined) return resultEarly;
 
-      if (['create', 'update'].includes(query.crud)) {
+      if (['create', 'update'].includes(query.crud) && !query.isSaveNative) {
         tquery.validate(); // sets async $thunks (e.g. ensureFK)
         await Promise.all([...query.input.$thunks]);
         await Emitter.emit('validate', event);

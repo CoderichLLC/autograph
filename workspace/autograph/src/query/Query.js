@@ -118,9 +118,9 @@ module.exports = class Query {
     let { input, where, sort } = this.#query;
     const args = { query: this.#query, resolver: this.#resolver, context: this.#context };
 
-    if (['create', 'update'].includes(this.#query.crud)) input = this.#model.transformers[this.#query.crud]?.transform(Util.unflatten(this.#query.input, { safe: true }), args);
-    if (!this.#query.isNative && ['read', 'update', 'delete'].includes(this.#query.crud)) where = this.#model.transformers.where.transform(Util.unflatten(this.#query.where ?? {}, { safe: true }), args);
-    if (['read'].includes(this.#query.crud)) sort = this.#model.transformers.sort.transform(Util.unflatten(this.#query.sort, { safe: true }), args);
+    if (['create', 'update'].includes(this.#query.crud) && !this.#query.isSaveNative) input = this.#model.transformers[this.#query.crud]?.transform(Util.unflatten(this.#query.input, { safe: true }), args);
+    if (!this.#query.isWhereNative && ['read', 'update', 'delete'].includes(this.#query.crud)) where = this.#model.transformers.where.transform(Util.unflatten(this.#query.where ?? {}, { safe: true }), args);
+    if (!this.#query.isSortNative && ['read'].includes(this.#query.crud)) sort = this.#model.transformers.sort.transform(Util.unflatten(this.#query.sort, { safe: true }), args);
 
     if (asClone) return this.clone({ input, where, sort });
     this.#query.input = input;
@@ -143,9 +143,9 @@ module.exports = class Query {
    * and Postgres jsonb_set).
    */
   toDriver() {
-    const { crud, input, doc, where, sort, before, after, isNative, isCursorPaging } = this.#query;
-    let $input = this.#model.transformers.toDriver.transform(input);
-    if (crud === 'update') {
+    const { crud, input, doc, where, sort, before, after, isWhereNative, isSaveNative, isSortNative, isCursorPaging } = this.#query;
+    let $input = isSaveNative ? input : this.#model.transformers.toDriver.transform(input);
+    if (crud === 'update' && !isSaveNative) {
       const ignorePaths = [...this.#model.ignorePaths];
       (function collectNullParents($obj, path = '') {
         if (!Util.isPlainObject($obj)) return;
@@ -164,14 +164,14 @@ module.exports = class Query {
       model: this.#model.key,
       select: this.#query.select.map(name => this.#model.fields[name].key),
       input: $input,
-      where: isNative ? where : this.#model.walk(where, node => Object.assign(node, { key: node.field.key })),
-      sort: this.#model.walk(sort, node => Object.assign(node, { key: node.field.key })),
+      where: isWhereNative ? where : this.#model.walk(where, node => Object.assign(node, { key: node.field.key })),
+      sort: isSortNative ? sort : this.#model.walk(sort, node => Object.assign(node, { key: node.field.key })),
       before: (!isCursorPaging || !before) ? undefined : JSONParse(Buffer.from(before, 'base64').toString('ascii')),
       after: (!isCursorPaging || !after) ? undefined : JSONParse(Buffer.from(after, 'base64').toString('ascii')),
       $schema: this.#schema.resolvePath,
     });
 
-    if (!isNative) this.#finalize(query.toObject());
+    if (!isWhereNative) this.#finalize(query.toObject());
 
     return query;
   }

@@ -980,37 +980,53 @@ module.exports = () => describe('TestSuite', () => {
 
   describe('Native Queries', () => {
     test('get', async () => {
-      expect(await resolver.match('Person').native({ name: 'Christie' }).one()).toMatchObject({ id: christie.id, name: 'christie', emailAddress: 'christie@gmail.com' }); // case insensitive
-      expect(await resolver.match('Person').native({ name: 'christie' }).one()).toMatchObject({ id: christie.id, name: 'christie', emailAddress: 'christie@gmail.com' });
-      expect(await resolver.match('Person').native({ name: 'Christie' }).count()).toBe(1); // case insensitive
-      expect(await resolver.match('Person').native({ name: 'christie' }).count()).toBe(1);
-      const count = await resolver.match('Person').native({ name: { $ne: 'chard' } }).count();
+      const nativeWhere = clause => resolver.match('Person').flags({ native: ['where'] }).where(clause);
+      expect(await nativeWhere({ name: 'Christie' }).one()).toMatchObject({ id: christie.id, name: 'christie', emailAddress: 'christie@gmail.com' }); // case insensitive
+      expect(await nativeWhere({ name: 'christie' }).one()).toMatchObject({ id: christie.id, name: 'christie', emailAddress: 'christie@gmail.com' });
+      expect(await nativeWhere({ name: 'Christie' }).count()).toBe(1); // case insensitive
+      expect(await nativeWhere({ name: 'christie' }).count()).toBe(1);
+      const count = await nativeWhere({ name: { $ne: 'chard' } }).count();
       expect(count).toBeGreaterThanOrEqual(1);
-      expect(await resolver.match('Person').native({ name: { $ne: 'christie' } }).count()).toBe(count - 1);
-      expect(await resolver.match('Person').native({ email_address: 'christie@gmail.com' }).count()).toBe(1);
+      expect(await nativeWhere({ name: { $ne: 'christie' } }).count()).toBe(count - 1);
+      expect(await nativeWhere({ email_address: 'christie@gmail.com' }).count()).toBe(1);
+    });
+
+    // Future-driver guardrail: when sort is native, the driver MUST pass the value through verbatim
+    // (no asc/desc → 1/-1 translation, no field-key walk). If a new driver forgets to honor
+    // isSortNative this test will fail — that's the point.
+    test('sort passthrough under flags({native: [sort]})', async () => {
+      const ascAG = await resolver.match('Person').sort({ name: 'asc' }).many();
+      const descAG = await resolver.match('Person').sort({ name: 'desc' }).many();
+      const ascNative = await resolver.match('Person').flags({ native: ['sort'] }).sort({ name: 1 }).many();
+      const descNative = await resolver.match('Person').flags({ native: ['sort'] }).sort({ name: -1 }).many();
+
+      expect(ascNative.map(p => `${p.id}`)).toEqual(ascAG.map(p => `${p.id}`));
+      expect(descNative.map(p => `${p.id}`)).toEqual(descAG.map(p => `${p.id}`));
+
+      // Sanity: with >1 Person, asc/desc must produce different orderings — otherwise the test above is vacuous.
+      if (ascAG.length > 1) expect(ascAG.map(p => `${p.id}`)).not.toEqual(descAG.map(p => `${p.id}`));
     });
   });
 
-  describe('Raw Queries', () => {
+  describe('Driver Queries', () => {
     test('get', async () => {
-      expect(await resolver.raw('Person').findOne({})).toBeDefined();
-      expect(await resolver.raw('Person').findOne({ name: 'richard' })).toBeNull(); // deleted
-      expect(await resolver.raw('Person').findOne({ name: 'Christie' })).toBeNull(); // case
-      expect(await resolver.raw('Person').findOne({ name: 'christie' })).toMatchObject({ name: 'christie', email_address: 'christie@gmail.com' });
-      expect(await resolver.driver('Person').findOne({ name: 'christie' })).toMatchObject({ name: 'christie', email_address: 'christie@gmail.com' }); // Alias
+      expect(await resolver.driver('Person').findOne({})).toBeDefined();
+      expect(await resolver.driver('Person').findOne({ name: 'richard' })).toBeNull(); // deleted
+      expect(await resolver.driver('Person').findOne({ name: 'Christie' })).toBeNull(); // case
+      expect(await resolver.driver('Person').findOne({ name: 'christie' })).toMatchObject({ name: 'christie', email_address: 'christie@gmail.com' });
 
-      // Raw -> Match counterparts
+      // Driver -> Match counterparts
       const matchPerson = await resolver.match('Person').where({ name: 'christie' }).one();
       const matchPeople = await resolver.match('Person').many();
 
-      // Raw findOne toResultSet
-      const rawPerson = await resolver.raw('Person').findOne({ name: 'christie' });
+      // Driver findOne toResultSet
+      const rawPerson = await resolver.driver('Person').findOne({ name: 'christie' });
       const $rawPerson = await resolver.toResultSet('Person', rawPerson);
       expect($rawPerson).toMatchObject(matchPerson);
       expect(`${$rawPerson}`).toBe('Person');
 
-      // Raw array toResultSet
-      const rawArray = await resolver.raw('Person').find().then(cursor => cursor.toArray());
+      // Driver array toResultSet
+      const rawArray = await resolver.driver('Person').find().then(cursor => cursor.toArray());
       expect(await resolver.toResultSet('Person', rawArray)).toMatchObject(matchPeople);
     });
   });
@@ -1048,10 +1064,10 @@ module.exports = () => describe('TestSuite', () => {
     });
 
     test('update should not clobber unknown attributes', async () => {
-      await resolver.raw('Person').findOneAndUpdate({ _id: christie.id }, { $set: { section: { name: 'sec', unknown: 'unknown' } } });
+      await resolver.driver('Person').findOneAndUpdate({ _id: christie.id }, { $set: { section: { name: 'sec', unknown: 'unknown' } } });
       const person = await resolver.match('Person').id(christie.id).save({ section: { name: 'section' } });
       expect(person.section).toEqual(expect.objectContaining({ id: expect.thunk(ObjectId.isValid), name: 'section', frozen: 'frozen' }));
-      const dbPerson = await resolver.raw('Person').findOne({ _id: christie.id });
+      const dbPerson = await resolver.driver('Person').findOne({ _id: christie.id });
       expect(dbPerson.section).toEqual(expect.objectContaining({ _id: expect.thunk(ObjectId.isValid), name: 'section', unknown: 'unknown' }));
     });
 

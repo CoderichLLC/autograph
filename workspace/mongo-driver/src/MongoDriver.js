@@ -16,7 +16,7 @@ module.exports = class MongoDriver {
 
   resolve(query) {
     query.options = { ...this.#config.query, ...query.options };
-    if (!query.isNative) query.where = MongoDriver.normalizeWhereClause(query.where);
+    if (!query.isWhereNative) query.where = MongoDriver.normalizeWhereClause(query.where);
     if (query.flags.debug) console.log(inspect(query, { showHidden: false, colors: true, depth: 3 }));
     return Util.promiseRetry(() => this[query.op](query), 5, 5, e => e.hasErrorLabel && e.hasErrorLabel('TransientTransactionError'));
   }
@@ -47,7 +47,7 @@ module.exports = class MongoDriver {
 
   updateOne(query) {
     query.options.returnDocument = 'after';
-    const $update = { $set: query.input };
+    const $update = query.isSaveNative ? query.input : { $set: query.input };
     return this.collection(query.model).findOneAndUpdate(query.where, $update, query.options);
   }
 
@@ -169,10 +169,10 @@ module.exports = class MongoDriver {
   }
 
   static aggregateQuery(query, count = false) {
-    const { model, select, where, sort = {}, skip, limit, joins, after, before, first, isNative } = query;
+    const { model, select, where, sort = {}, skip, limit, joins, after, before, first, isWhereNative, isSortNative } = query;
     const $aggregate = [{ $match: where }];
-    const $addFields = isNative ? {} : MongoDriver.convertFieldsForRegex(query.$schema, model, where);
-    const $sort = MongoDriver.convertFieldsForSort(sort);
+    const $addFields = isWhereNative ? {} : MongoDriver.convertFieldsForRegex(query.$schema, model, where);
+    const $sort = isSortNative ? sort : MongoDriver.convertFieldsForSort(sort);
 
     // Regex addFields
     if (Object.keys($addFields).length) $aggregate.unshift({ $addFields });

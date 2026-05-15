@@ -57,7 +57,7 @@ module.exports = class QueryBuilder {
    * Chainable methods
    */
   id(id) {
-    this.#propCheck('id', 'native', 'sort', 'skip', 'limit', 'before', 'after');
+    this.#propCheck('id', 'sort', 'skip', 'limit', 'before', 'after');
     this.#query.id = id;
     this.#query.where = mergeDeep(this.#query.where || {}, { id });
     this.#query.args.id = id;
@@ -80,17 +80,8 @@ module.exports = class QueryBuilder {
     return this;
   }
 
-  native(clause) {
-    this.#propCheck('native', 'id', 'where');
-    this.#query.isNative = true;
-    this.#query.native = clause;
-    this.#query.where = clause;
-    this.#query.args.native = clause;
-    return this;
-  }
-
   where(clause) {
-    this.#propCheck('where', 'native', false); // Allow redefine of "where" because we merge it
+    this.#propCheck('where', false); // Allow redefine of "where" because we merge it
     const $clause = mergeDeep(this.#query.where || {}, clause);
     this.#query.where = $clause;
     this.#query.args.where = $clause;
@@ -156,6 +147,11 @@ module.exports = class QueryBuilder {
 
   flags(flags) {
     Object.assign(this.#query.flags, flags);
+    const native = this.#query.flags.native;
+    const matches = key => native === true || (Array.isArray(native) && native.includes(key));
+    this.#query.isWhereNative = matches('where');
+    this.#query.isSaveNative = matches('save');
+    this.#query.isSortNative = matches('sort');
     return this;
   }
 
