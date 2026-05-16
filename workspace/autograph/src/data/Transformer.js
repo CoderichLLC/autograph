@@ -11,50 +11,24 @@ module.exports = class Transformer {
 
   #callArgs = {}; // Ephemeral per-call merge of #config.args + transform() args; never persisted
 
+  // Proxy handler kept ONLY for post-construction writes (e.g. `data.age = 11` re-running the
+  // pipeline). Initial construction goes through #applyKey directly to skip trap overhead.
   #operation = {
-    set: (target, prop, startValue, proxy) => {
-      if (this.#config.shape[prop]) {
-        let previousValue;
-
-        const result = this.#config.shape[prop].reduce((value, t) => {
-          previousValue = value;
-          if (typeof t === 'function') return Util.uvl(t({ startValue, value, ...this.#callArgs }), value);
-          prop = t; // rename key
-          return value;
-        }, startValue);
-
-        if (result instanceof Promise) {
-          target[prop] = previousValue;
-          proxy.$thunks.push(result);
-        } else if (result !== undefined || target.$userProvided?.has(prop) || this.#config.keepUndefined) {
-          target[prop] = result;
-        }
-      } else if (!this.#config.strictSchema) {
-        target[prop] = startValue;
-      }
-
+    set: (target, prop, startValue) => {
+      this.#applyKey(target, prop, startValue);
       return true;
     },
   };
 
-  /**
-   * Allowing construction of object before knowing full configuration
-   */
   constructor(config = {}) {
     this.config(config);
   }
 
-  /**
-   * Re-assign configuration after instantiation
-   */
   config(config = {}) {
     Object.assign(this.#config, config);
     return this;
   }
 
-  /**
-   * Re-assign args after instantiation
-   */
   args(args = {}) {
     Object.assign(this.#config.args, args);
     return this;
@@ -67,16 +41,58 @@ module.exports = class Transformer {
   transform(mixed, args = {}) {
     args.thunks ??= [];
     this.#callArgs = { ...this.#config.args, ...args };
+    const { defaults } = this.#config;
 
     const transformed = Util.map(mixed, (data) => {
-      const thunks = Object.defineProperties({}, {
+      const target = Object.defineProperties({}, {
         $thunks: { value: args.thunks },
         $userProvided: { value: new Set(Object.keys(data || {})) },
       });
-      const $data = Object.assign({}, this.#config.defaults, data); // eslint-disable-line
-      return Object.assign(new Proxy(thunks, this.#operation), $data);
+      const $data = Object.assign({}, defaults, data); // eslint-disable-line
+      // Direct loop instead of Object.assign(new Proxy(...), $data) — avoids the trap
+      // round-trip per key. Same semantics as the Proxy.set trap (see #applyKey).
+      const keys = Object.keys($data);
+      for (let i = 0; i < keys.length; i++) this.#applyKey(target, keys[i], $data[keys[i]]);
+      // Proxy retained on the *result* so post-transform writes still re-fire pipelines.
+      return new Proxy(target, this.#operation);
     });
 
     return this.#config.postTransform?.(transformed) || transformed;
+  }
+
+  // Single key transform — used both during construction (fast path) and from the Proxy.set
+  // trap (post-construction writes). Mirrors the original reducer-in-trap semantics:
+  //   - functions: pipeline-style reduce, undefined keeps previous value (Util.uvl)
+  //   - strings: rename the target key
+  //   - Promise result: store previous value, push promise to $thunks
+  //   - skip writes of `undefined` unless user originally provided the key or keepUndefined
+  //   - unknown keys: passthrough unless strictSchema
+  #applyKey(target, prop, startValue) {
+    const pipe = this.#config.shape[prop];
+
+    if (pipe) {
+      let value = startValue;
+      let previousValue = startValue;
+      const callArgs = this.#callArgs;
+      for (let i = 0; i < pipe.length; i++) {
+        const t = pipe[i];
+        previousValue = value;
+        if (typeof t === 'function') {
+          const r = t({ startValue, value, ...callArgs });
+          if (r !== undefined) value = r;
+        } else {
+          prop = t; // rename key
+        }
+      }
+
+      if (value instanceof Promise) {
+        target[prop] = previousValue;
+        target.$thunks.push(value);
+      } else if (value !== undefined || target.$userProvided.has(prop) || this.#config.keepUndefined) {
+        target[prop] = value;
+      }
+    } else if (!this.#config.strictSchema) {
+      target[prop] = startValue;
+    }
   }
 };

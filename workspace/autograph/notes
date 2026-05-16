@@ -31,9 +31,6 @@ Improvement Considerations:
   * There are times you may NOT want resolver to CRUD an attribute
     - eg. NetworkPlace.parent should be set via meta because of side-effects
   * Upsert???
-  * EventEmitter
-    - Debounce a function (debounce) to prevent excessive/redundant calls?
-    - Memoize a function to prevent excessive/redundant calls?
   * Why do you send `${model}` in query instead of the actual model object?
     - I "think" this is because you clone query and it's better/faster to clone a string
   * You need proper events on embedded documents so that "construct": "createdBy" would work!

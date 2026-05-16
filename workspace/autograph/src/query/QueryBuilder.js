@@ -147,7 +147,7 @@ module.exports = class QueryBuilder {
 
   flags(flags) {
     Object.assign(this.#query.flags, flags);
-    const native = this.#query.flags.native;
+    const { native } = this.#query.flags;
     const matches = key => native === true || (Array.isArray(native) && native.includes(key));
     this.#query.isWhereNative = matches('where');
     this.#query.isSaveNative = matches('save');

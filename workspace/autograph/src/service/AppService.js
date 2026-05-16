@@ -45,8 +45,6 @@ exports.JSONParse = (mixed) => {
   }
 };
 
-exports.withResolvers = () => {
-  let resolve, reject;
-  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
-  return { promise, resolve, reject };
-};
+// Node 22+ has Promise.withResolvers natively. Re-exported here so callers don't have to
+// remember to use the native API directly; deprecated but kept for one release as an alias.
+exports.withResolvers = Promise.withResolvers.bind(Promise);

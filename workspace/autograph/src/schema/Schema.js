@@ -502,10 +502,14 @@ module.exports = class Schema {
             // children were already transformed during the parent's read. The non-enumerable
             // $transformed marker lets a second call short-circuit without altering semantics.
             const docFields = Object.values($model.fields);
-            $model.docTransform = (doc, args = {}) => {
+            $model.docTransform = (doc, args = {}, Ctor) => {
               if (doc == null || typeof doc !== 'object') return doc;
               if (doc.$transformed) return doc;
-              const out = {};
+              // Ctor (if supplied) gives the result object the DocClass prototype at allocation
+              // time — lets Resolver.toResultSet avoid per-doc defineProperty + setPrototypeOf.
+              // Not propagated to embedded recursion: embedded sub-docs stay plain {} (matches
+              // pre-existing behavior — only top-level toResultSet'd docs got $, $model, etc.).
+              const out = Ctor ? new Ctor() : {};
               for (const docField of docFields) {
                 let value = docField.key in doc ? doc[docField.key] : docField.defaultValue;
                 if (value === undefined) continue; // eslint-disable-line
@@ -1004,10 +1008,16 @@ module.exports = class Schema {
         ...readModels.reduce((prev, model) => {
           return Object.assign(prev, {
             [model]: Object.values(model.fields).filter(field => field.model?.isEntity && field.crud?.includes('r')).reduce((prev2, field) => {
+              // Hot path: this resolver fires per FK/embedded entity field per doc. Inlining the
+              // `doc.$.lookup(field)` chain avoids one Proxy allocation and one wasted QueryResolver
+              // allocation (the proxy creates `match(model).id(doc.id)` but the lookup branch never
+              // uses it). Field model + virtual/fk metadata are closed over at schema-build time.
+              const { isVirtual, linkBy, linkField, fkField, model: fieldModel } = field;
               return Object.assign(prev2, {
                 [field]: (doc, args, context, info) => {
                   if (!doc.$) doc = context[schema.namespace].resolver.toResultSet(model, doc); // Ensure resultSet
-                  return doc.$.lookup(field).args(args).info(info).resolve(info);
+                  const where = isVirtual ? { [linkBy]: doc[linkField] } : { [fkField]: doc[field] };
+                  return context[schema.namespace].resolver.match(fieldModel).where(where).args(args).info(info).resolve(info);
                 },
               });
             }, {}),

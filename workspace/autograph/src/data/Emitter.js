@@ -2,6 +2,7 @@ const EventEmitter = require('node:events');
 const Util = require('@coderich/util');
 const Query = require('../query/Query');
 const { AbortEarlyError } = require('../service/ErrorService');
+const { $QUERY } = require('../service/Symbols');
 
 // Per-resolver memoization cache. WeakMap → entries vanish when the resolver
 // (typically one per request) is garbage collected, so memo lifetime tracks
@@ -17,12 +18,15 @@ const getResolverMemo = (resolver) => {
   return cache;
 };
 
-// Memo key for an event. The Resolver attaches the Query instance as `event.$query` in
-// #createSystemEvent; we call `toCacheKey()` directly on it (per-instance lazy cache).
+// Memo key for an event. The Resolver attaches the Query instance under a Symbol-keyed slot
+// on the event object (see Symbols.$QUERY); the Symbol key keeps it invisible to spread,
+// JSON.stringify, and for-in while letting V8 keep the event object's hidden class stable
+// (no later defineProperty). Calling `toCacheKey()` is cheap (per-instance lazy cache).
 // Falls back to Query.computeCacheKey for direct/test emits that don't carry a Query
 // instance. Returns null for events with no query at all (e.g., `setup`).
 const getMemoKey = (data) => {
-  if (data?.$query) return data.$query.toCacheKey();
+  const q = data?.[$QUERY];
+  if (q) return q.toCacheKey();
   if (data?.query) return Query.computeCacheKey(data.query);
   return null;
 };
@@ -78,7 +82,9 @@ const wrapNextMemoize = (listener) => {
 
 const normalizeOptions = (options) => {
   if (options == null) return {};
-  if (typeof options !== 'object') throw new TypeError('Emitter listener options must be an object');
+  if (typeof options !== 'object' || Array.isArray(options)) {
+    throw new TypeError(`Emitter listener options must be an object (received ${typeof options}); did you mean { priority: <n>, memoize: <bool> }?`);
+  }
   return options;
 };
 
@@ -87,9 +93,8 @@ const normalizeOptions = (options) => {
 // it through either side of the (potential) once-wrap that EventEmitter adds internally.
 const prepareListener = (listener, opts) => {
   const priority = opts.priority ?? 0;
-  const target = opts.memoize
-    ? (listener.length < 2 ? wrapBasicMemoize(listener) : wrapNextMemoize(listener))
-    : listener;
+  let target = listener;
+  if (opts.memoize) target = listener.length < 2 ? wrapBasicMemoize(listener) : wrapNextMemoize(listener);
   target.priority = priority;
   if (target !== listener) listener.priority = priority;
   return target;
@@ -109,8 +114,68 @@ const prepareListener = (listener, opts) => {
 class Emitter extends EventEmitter {
   #cache = new Map();
 
+  // Per-event listener index for the model-aware fast path.
+  //   genericCount — listeners registered without a model/key filter (Emitter.on/once direct).
+  //   byModel/byKey — wrapper listeners registered via onModels/onKeys, keyed by their filter value.
+  // hasListenersFor(event, model, key) answers "would any listener body actually run for this
+  // event+model+key combination?" without invoking the wrappers themselves. Resolver uses this
+  // to skip the entire emit chain for queries with no relevant hooks.
+  #listenerIndex = new Map(); // event → { genericCount, byModel: Map<string, count>, byKey: Map<string, count> }
+  #wrapperFilter = new WeakMap(); // registered listener (after prepareListener wrap) → { prop, arr } for decrement on remove
+
   #invalidate(event) {
     this.#cache.delete(event);
+  }
+
+  #getIndex(event) {
+    let entry = this.#listenerIndex.get(event);
+    if (!entry) {
+      entry = { genericCount: 0, byModel: new Map(), byKey: new Map() };
+      this.#listenerIndex.set(event, entry);
+    }
+    return entry;
+  }
+
+  #incFilter(event, prop, arr) {
+    const entry = this.#getIndex(event);
+    const map = prop === 'model' ? entry.byModel : entry.byKey;
+    for (const v of arr) {
+      const k = `${v}`;
+      map.set(k, (map.get(k) ?? 0) + 1);
+    }
+  }
+
+  #decFilter(event, prop, arr) {
+    const entry = this.#listenerIndex.get(event);
+    if (!entry) return;
+    const map = prop === 'model' ? entry.byModel : entry.byKey;
+    for (const v of arr) {
+      const k = `${v}`;
+      const c = (map.get(k) ?? 0) - 1;
+      if (c <= 0) map.delete(k); else map.set(k, c);
+    }
+  }
+
+  #incGeneric(event) {
+    this.#getIndex(event).genericCount += 1;
+  }
+
+  #decGeneric(event) {
+    const entry = this.#listenerIndex.get(event);
+    if (entry) entry.genericCount = Math.max(0, entry.genericCount - 1);
+  }
+
+  /**
+   * Returns true iff any registered listener's filter (or lack thereof) would match an event
+   * with the given model/key. Resolver's #createSystemEvent uses this as the fast-path guard.
+   */
+  hasListenersFor(event, model, key) {
+    const entry = this.#listenerIndex.get(event);
+    if (!entry) return false;
+    if (entry.genericCount > 0) return true;
+    if (model != null && entry.byModel.get(`${model}`) > 0) return true;
+    if (key != null && entry.byKey.get(`${key}`) > 0) return true;
+    return false;
   }
 
   #getListeners(event) {
@@ -154,6 +219,7 @@ class Emitter extends EventEmitter {
 
   on(event, listener, options) {
     const target = prepareListener(listener, normalizeOptions(options));
+    this.#incGeneric(event);
     this.#invalidate(event);
     return super.on(event, target);
   }
@@ -164,23 +230,38 @@ class Emitter extends EventEmitter {
 
   once(event, listener, options) {
     const target = prepareListener(listener, normalizeOptions(options));
+    this.#incGeneric(event);
     this.#invalidate(event);
     return super.once(event, target);
   }
 
   prependListener(event, listener, options) {
     const target = prepareListener(listener, normalizeOptions(options));
+    this.#incGeneric(event);
     this.#invalidate(event);
     return super.prependListener(event, target);
   }
 
   prependOnceListener(event, listener, options) {
     const target = prepareListener(listener, normalizeOptions(options));
+    this.#incGeneric(event);
     this.#invalidate(event);
     return super.prependOnceListener(event, target);
   }
 
   removeListener(event, listener) {
+    // Find the matching registered listener (might be a memoize wrapper around the original).
+    // Node's EventEmitter resolves both direct-reference and .listener-equality matches.
+    const raw = this.rawListeners(event).find(l => l === listener || l.listener === listener);
+    if (raw) {
+      const filter = this.#wrapperFilter.get(raw);
+      if (filter) {
+        this.#decFilter(event, filter.prop, filter.arr);
+        this.#wrapperFilter.delete(raw);
+      } else {
+        this.#decGeneric(event);
+      }
+    }
     this.#invalidate(event);
     return super.removeListener(event, listener);
   }
@@ -190,8 +271,22 @@ class Emitter extends EventEmitter {
   }
 
   removeAllListeners(event) {
-    if (event) this.#invalidate(event);
-    else this.#cache.clear();
+    if (event) {
+      // Decrement counts for every registered listener on this event before clearing.
+      for (const raw of this.rawListeners(event)) {
+        const filter = this.#wrapperFilter.get(raw);
+        if (filter) {
+          this.#decFilter(event, filter.prop, filter.arr);
+          this.#wrapperFilter.delete(raw);
+        } else {
+          this.#decGeneric(event);
+        }
+      }
+      this.#invalidate(event);
+    } else {
+      this.#listenerIndex.clear();
+      this.#cache.clear();
+    }
     return super.removeAllListeners(event);
   }
 
@@ -240,7 +335,17 @@ class Emitter extends EventEmitter {
       return next();
     };
 
-    return this.on(eventName, wrapper, options);
+    // Register via super.on directly (not this.on) so we can record the filter info in the
+    // per-(event, model|key) index instead of bumping the generic count. The model-aware
+    // listener fast path in #createSystemEvent depends on this distinction. Note: always
+    // super.on regardless of `once` — the wrapper itself self-removes on a matching emit,
+    // which preserves the "only fires once on a MATCHING event" semantic. Using super.once
+    // would let Node auto-remove on the first emit even when the model didn't match.
+    const target = prepareListener(wrapper, normalizeOptions(options));
+    this.#wrapperFilter.set(target, { prop, arr });
+    this.#incFilter(eventName, prop, arr);
+    this.#invalidate(eventName);
+    return super.on(eventName, target);
   }
 
   static sort(a, b) {

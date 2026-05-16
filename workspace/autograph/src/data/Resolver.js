@@ -6,6 +6,7 @@ const Emitter = require('./Emitter');
 const Loader = require('./Loader');
 const DataLoader = require('./DataLoader');
 const Transaction = require('./Transaction');
+const { $QUERY } = require('../service/Symbols');
 
 const loaders = {};
 
@@ -14,6 +15,7 @@ module.exports = class Resolver {
   #xschema;
   #context;
   #dataLoaders;
+  #docClasses = {}; // Per-(resolver, model) Class cache — prototype hosts $, $model, $save, $lookup
   #sessions = []; // Holds nested 2D array of transactions
 
   constructor({ schema, xschema, context }) {
@@ -238,56 +240,88 @@ module.exports = class Resolver {
   }
 
   toResultSet(model, result) {
-    const self = this;
     if (result == null) return result;
     if (typeof result !== 'object') return result;
     model = this.#schema.models[model];
+    const DocClass = this.#getDocClass(model);
+    const proto = DocClass.prototype;
 
     return Object.defineProperties(Util.map(result, (doc) => {
-      const $doc = model.docTransform(doc, { resolver: this, context: this.#context });
+      // docTransform creates the object with DocClass.prototype set at allocation time,
+      // so we avoid setPrototypeOf (deopt) and per-doc defineProperties for $/$model/etc.
+      const $doc = model.docTransform(doc, { resolver: this, context: this.#context }, DocClass);
 
-      // Assign useful/needed meta data
-      return Object.defineProperties($doc, {
-        $: {
-          get: () => {
-            return new Proxy(this.match(model).id($doc.id), {
-              get(queryResolver, cmd, proxy) {
-                return (...args) => {
-                  switch (cmd) {
-                    case 'save': {
-                      return queryResolver.save({ ...$doc, ...args[0] }); // $doc incase it's mutated
-                    }
-                    case 'lookup': {
-                      const field = self.toModel(model).fields[args[0]];
-                      const where = field.isVirtual ? { [field.linkBy]: $doc[field.linkField] } : { [field.fkField]: $doc[field] };
-                      return self.match(field.model).where(where);
-                    }
-                    default: {
-                      queryResolver = queryResolver[cmd](...args);
-                      return queryResolver instanceof Promise ? queryResolver : proxy;
-                    }
-                  }
-                };
-              },
-            });
-          },
-        },
-        $model: { value: model },
-        $cursor: { value: doc.$cursor },
-        toString: { value: () => `${model}` },
-        // Backwards compat
-        $save: { value: (...args) => $doc.$.save(...args) },
-        $lookup: {
-          value: async (prop, args) => {
-            const field = model.fields[prop];
-            const method = field.isArray ? 'many' : 'one';
-            return $doc.$.lookup(prop).args(args)[method]();
-          },
-        },
-      });
+      // Safety: already-$transformed docs early-return from docTransform without the new
+      // prototype. Patch it here — rare path; the common path takes Object.getPrototypeOf===proto.
+      if (Object.getPrototypeOf($doc) !== proto) Object.setPrototypeOf($doc, proto);
+
+      // toString MUST stay per-instance, not on the prototype: @coderich/util's
+      // isPlainObject() calls `proto.toString.call(obj)` looking for "[object Object]".
+      // A prototype-level toString returning the model name would defeat that check and
+      // break Util.pathmap / Util.flatten / unflatten across pull/splice/save paths.
+      Object.defineProperty($doc, 'toString', { value: DocClass.docToString });
+
+      // $cursor is per-instance; only set if the driver returned one
+      if (doc.$cursor !== undefined) Object.defineProperty($doc, '$cursor', { value: doc.$cursor });
+      return $doc;
     }), {
       $pageInfo: { value: result.$pageInfo },
     });
+  }
+
+  // Build (and cache) a Doc class for a given model. The class's prototype hosts the
+  // shared $ getter, $model, toString, $save, $lookup. One closure-set per (resolver, model),
+  // not per-doc — replaces six defineProperty + four closures per doc in the old code.
+  #getDocClass(model) {
+    const cached = this.#docClasses[model.name];
+    if (cached) return cached;
+
+    const self = this;
+
+    class Doc {}
+
+    // toString is intentionally NOT on the prototype — see toResultSet for the reason.
+    // We stash one shared instance here so per-doc defineProperty reuses the same function.
+    Doc.docToString = function () { return `${model}`; };
+
+    Object.defineProperties(Doc.prototype, {
+      $model: { value: model },
+      $: {
+        get() {
+          const $doc = this;
+          return new Proxy(self.match(model).id($doc.id), {
+            get(queryResolver, cmd, proxy) {
+              return (...args) => {
+                switch (cmd) {
+                  case 'save': {
+                    return queryResolver.save({ ...$doc, ...args[0] }); // $doc incase it's mutated
+                  }
+                  case 'lookup': {
+                    const field = self.toModel(model).fields[args[0]];
+                    const where = field.isVirtual ? { [field.linkBy]: $doc[field.linkField] } : { [field.fkField]: $doc[field] };
+                    return self.match(field.model).where(where);
+                  }
+                  default: {
+                    queryResolver = queryResolver[cmd](...args);
+                    return queryResolver instanceof Promise ? queryResolver : proxy;
+                  }
+                }
+              };
+            },
+          });
+        },
+      },
+      // Backwards compat — these used to be per-doc arrow closures; now shared on prototype
+      $save: { value(...args) { return this.$.save(...args); } },
+      $lookup: { async value(prop, args) {
+        const field = model.fields[prop];
+        const method = field.isArray ? 'many' : 'one';
+        return this.$.lookup(prop).args(args)[method]();
+      } },
+    });
+
+    this.#docClasses[model.name] = Doc;
+    return Doc;
   }
 
   toModel(model) {
@@ -306,16 +340,38 @@ module.exports = class Resolver {
     const tquery = $query.transform(false);
     const query = tquery.toObject();
     const type = query.isMutation ? 'Mutation' : 'Query';
-    // event.query stays the plain mutable object listeners read/write. event.$query is the
-    // Query instance — framework-internal handle the Emitter uses to call toCacheKey() for
-    // memoization. Non-enumerable so it doesn't show up in iteration/spread/JSON.stringify.
-    const event = { schema: this.#schema, context: this.#context, resolver: this, query };
-    Object.defineProperty(event, '$query', { value: tquery, configurable: true });
+    const needsValidate = (query.crud === 'create' || query.crud === 'update') && !query.isSaveNative;
+
+    // Hot-path bypass: when no listener's model/key filter matches this query (and no
+    // validation work to do), skip the entire emit chain. Each skipped emit avoids: an event-
+    // object allocation, an Emitter cache lookup, a Promise.resolve, and a .then microtask.
+    // For a wide read like findNetworkPlace with thousands of inner sub-resolvers
+    // (Category/Image/Workspace) that have no relevant hooks, this is a real win.
+    const { model: qModel, key: qKey } = query;
+    if (
+      !needsValidate
+      && !Emitter.hasListenersFor(`pre${type}`, qModel, qKey)
+      && !Emitter.hasListenersFor(`post${type}`, qModel, qKey)
+      && !Emitter.hasListenersFor('preResponse', qModel, qKey)
+      && !Emitter.hasListenersFor('postResponse', qModel, qKey)
+    ) {
+      return Promise.resolve(thunk(tquery)).then((result) => {
+        query.result = result;
+        return result;
+      }).catch((e) => { throw Boom.boomify(e); });
+    }
+
+    // event.query stays the plain mutable object listeners read/write. The Query instance is
+    // attached under a Symbol-keyed slot — framework-internal handle the Emitter uses to call
+    // toCacheKey() for memoization. Symbol key is invisible to spread/Object.keys/JSON.stringify
+    // (same hygiene the old defineProperty pattern provided) and lets V8 keep the event
+    // object's hidden class stable since the property is part of the initial object literal.
+    const event = { schema: this.#schema, context: this.#context, resolver: this, query, [$QUERY]: tquery };
 
     return Emitter.emit(`pre${type}`, event).then(async (resultEarly) => {
       if (resultEarly !== undefined) return resultEarly;
 
-      if (['create', 'update'].includes(query.crud) && !query.isSaveNative) {
+      if (needsValidate) {
         tquery.validate(); // sets async $thunks (e.g. ensureFK)
         await Promise.all([...query.input.$thunks]);
         await Emitter.emit('validate', event);
