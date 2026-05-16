@@ -1,13 +1,3 @@
-Release 0.14:
-  * $field.linkBy & $field.fkField are pointing to the same value; can they be consolidated?
-  * Why do you have Query.transform(asClone?????)
-  * docTransform: compiled plain function replaces Transformer-based doc transformer (read path)
-    - ~60% faster findMany (no Proxy overhead per result document)
-    - Result objects are plain JS objects; safe to mutate freely
-    - For mutations: cache is cleared before toResultSet(), so result is fresh
-    - For reads: DataLoader caches the raw driver result, NOT the docTransform output
-      * Each call to docTransform produces a new plain object so mutation is safe
-
 Known Issues:
   * Transactions (currently removed)
     - Very tricky to get right
@@ -38,7 +28,6 @@ Improvement Considerations:
     - GraphQL API passes in .args() and only selects what it needs.... is this ok for DataLoader Cache?
     - I disabled it... when selecting "count" only there are problems
   * Can you derive transaction support by virtue of function definition existing?
-  * Ability to override models' terminal commands (eg. one(), many())?
   * There are times you may NOT want resolver to CRUD an attribute
     - eg. NetworkPlace.parent should be set via meta because of side-effects
   * Upsert???
@@ -85,7 +74,6 @@ BREAKING CHANGELOG:
     - cb function now has signature (args, context)
     - cache is on by default and persists indefinitely (must be managed)
   * MongoClient now seperate NPM module @coderich/autograph-mongodb
-  * No more pre|post Response event
 
 ---------
 

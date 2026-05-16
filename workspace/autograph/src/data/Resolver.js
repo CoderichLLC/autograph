@@ -321,10 +321,16 @@ module.exports = class Resolver {
     }).then((result) => {
       query.result = result;
       return Emitter.emit(`post${type}`, event);
-    }).then(early => (early !== undefined ? early : Emitter.emit('preResponse', event)))
-      .then(early => (early !== undefined ? early : Emitter.emit('postResponse', event)))
-      .then((early = query.result) => early)
-      .catch((e) => { throw Boom.boomify(e); });
+    }).then((early) => {
+      if (early !== undefined) query.result = early;
+      return early !== undefined ? early : Emitter.emit('preResponse', event);
+    }).then((early) => {
+      if (early !== undefined) query.result = early;
+      return early !== undefined ? early : Emitter.emit('postResponse', event);
+    }).then((early) => {
+      if (early !== undefined) query.result = early;
+      return query.result;
+    }).catch((e) => { throw Boom.boomify(e); });
   }
 
   static $loader(name, resolver, config) {
