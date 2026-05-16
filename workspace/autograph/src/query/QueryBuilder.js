@@ -231,7 +231,6 @@ module.exports = class QueryBuilder {
     if (['create', 'update'].includes($crud)) {
       input = op === 'createMany' ? args : args[0];
       if (input === undefined) input = {};
-      if (id !== undefined) input.id = id;
       this.#query.args.input = input;
     }
 

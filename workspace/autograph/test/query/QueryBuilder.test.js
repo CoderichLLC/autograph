@@ -79,5 +79,23 @@ describe('QueryBuilder', () => {
       expect(query.isSaveNative).toBe(false);
       expect(query.isSortNative).toBe(false);
     });
+
+    test('id() does NOT mutate save input (native)', () => {
+      // Regression: mongo rejects `{$inc:..., id:...}` because `id` isn't a $-prefixed modifier.
+      // Autograph must never inject id into a native input — the user owns the shape.
+      const { builder } = make();
+      const input = { $inc: { count: 1 } };
+      builder.id('abc').flags({ native: ['save'] }).save(input);
+      expect(input).toEqual({ $inc: { count: 1 } });
+    });
+
+    test('id() does NOT mutate save input (non-native)', () => {
+      // The id is authoritatively on query.id (from .id()) — the $pk pipeline reads it from there.
+      // input stays exactly what the caller passed.
+      const { builder } = make();
+      const input = { name: 'rich' };
+      builder.id('abc').save(input);
+      expect(input).toEqual({ name: 'rich' });
+    });
   });
 });

@@ -68,17 +68,20 @@ module.exports = class Pipeline {
     //
     Pipeline.define('$pk', (params) => {
       const { pkField } = params.model;
-      const userValue = params.value?.[pkField] || params.value;
       const docValue = get(params.query.doc, params.path);
+      const isArrayElement = params.path.some(p => typeof p === 'number');
+      // Top-level pk: prefer an inline id in the input, otherwise the id supplied via .id() (query.id).
+      // Array-element pk: only consider value-supplied ids — query.id is the parent doc's id, not the element's.
       // Three cases:
-      //   (1) Top-level + single embedded: doc-first preserves ids on partial updates and avoids
-      //       id churn; also handles where-batch-update where input.id is shared/raced.
+      //   (1) Top-level + single embedded: doc-first preserves ids on partial updates and avoids id churn.
       //   (2) Array element where the user explicitly supplied an id (startValue is truthy):
       //       user wins — they're targeting that specific element.
       //   (3) Array element with no user-supplied id (startValue is undefined): positional fallback
       //       to doc preserves array-element ids so downstream smart-merge logic can locate the
       //       intended doc element to merge into.
-      const isArrayElement = params.path.some(p => typeof p === 'number');
+      const userValue = isArrayElement
+        ? (params.value?.[pkField] || params.value)
+        : (params.value?.[pkField] || params.value || params.query.id);
       const userExplicit = isArrayElement && params.startValue !== undefined;
       const v = userExplicit ? (userValue || docValue) : (docValue || userValue);
       if (v == null) return params.field.generator({ ...params, value: v });
