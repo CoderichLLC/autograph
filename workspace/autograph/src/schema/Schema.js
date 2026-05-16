@@ -537,9 +537,8 @@ module.exports = class Schema {
             $field.model = $schema.models[$field.type];
             $field.linkTo = $schema.models[$field.linkTo];
             $field.crud = Util.uvl($field.crud, $field.model?.scope, 'crud');
-            $field.linkBy ??= $field.linkTo?.pkField; // This defines join logic (below) for both straight+virtual references
-            $field.fkField ??= $field.linkTo?.pkField; // This is the fkReference field for straight references
-            // $field.fkField ??= $field.model?.pkField; // This is the fkReference field for straight references
+            $field.linkBy ??= $field.linkTo?.pkField; // Join key on the LINKED model — used when this side is virtual (set via @link(by:))
+            $field.fkField ??= $field.linkTo?.pkField; // Property to extract from FK-input objects + join target for stored FKs (set via @field(fk:))
             $field.linkField = $field.isVirtual ? $model.fields[$model.pkField] : $field;
             $field.isFKReference = $field.fkField && !$field.isPrimaryKey && $field.model?.isMarkedModel && !$field.model?.isEmbedded;
             $field.isEmbedded = Boolean($field.model && !$field.isFKReference && !$field.isPrimaryKey);
@@ -577,7 +576,9 @@ module.exports = class Schema {
             // and ensureFK has nothing to validate against — it's a custom-resolver field.
             if ($field.isFKReference && $field.isPersistable !== false) {
               const to = $field.model.key;
-              const on = $field.linkTo.fields[$field.linkBy].key;
+              // Virtual side: join `linkTo[linkBy]` against this model's pk (linkBy names the FK column on the linked model).
+              // Straight FK side: join `linkTo[fkField]` against this field's stored value (fkField names the linked column our value targets).
+              const on = $field.linkTo.fields[$field.isVirtual ? $field.linkBy : $field.fkField].key;
               const from = $field.linkField.key;
               const as = `join_${to}`;
               $field.join = { to, on, from, as };

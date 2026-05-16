@@ -1,17 +1,4 @@
-Release 0.13:
-  * Sort by name (name.en) does not work
-    - I believe the transformations on where + sort are not accurate
-  * Atlas Search Support
-    - How to modify the query?
-  * Do we support input meta?
-
-Release 0.14 (in progress):
-  * Emitter event shape finalized: { schema, context, resolver, query }
-    - query IS the single source of truth (no more merged, no more top-level aliases)
-    - event.query.input (post-cast/transform Proxy) replaces event.merged
-    - event.query.result replaces event.result shortcut
-  * Schema.merge - what is the order of priority and do we need to specify it as a param (passive?)
-  * Break up Schema monolith (schema.parse() usage)
+Release 0.14:
   * $field.linkBy & $field.fkField are pointing to the same value; can they be consolidated?
   * Why do you have Query.transform(asClone?????)
   * docTransform: compiled plain function replaces Transformer-based doc transformer (read path)
