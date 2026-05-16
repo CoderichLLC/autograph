@@ -43,6 +43,29 @@ const createMergedProxy = (input, doc) => new Proxy(input, {
   },
 });
 
+// Shared with Emitter so memo keys and DataLoader cache keys can't drift.
+// Includes model/crud/id/input on top of the read-path fields:
+// - model: per-loader implicit on the read path (constant), used to distinguish on the write path
+// - crud:  always 'read' inside a loader (constant), distinguishes pre/post Mutation events
+// - id:    merged into `where` by QueryBuilder.id() on reads (redundant), explicit on mutations
+// - input: undefined on reads (skipped by stringify), required to distinguish mutations
+const computeCacheKey = q => JSON.stringify({
+  model: q.model,
+  crud: q.crud,
+  op: q.op,
+  id: q.id,
+  input: q.input,
+  where: q.where,
+  sort: q.sort,
+  select: q.select,
+  skip: q.skip,
+  limit: q.limit,
+  before: q.before,
+  after: q.after,
+  first: q.first,
+  last: q.last,
+});
+
 module.exports = class Query {
   #config;
   #resolver;
@@ -51,6 +74,9 @@ module.exports = class Query {
   #model;
   #query;
   #resolution;
+  #cacheKey;
+
+  static computeCacheKey = computeCacheKey;
 
   constructor(config) {
     const { schema, context, resolver, query, resolution = withResolvers() } = config;
@@ -96,19 +122,13 @@ module.exports = class Query {
     });
   }
 
+  // Unique identity of this query, used by both DataLoader's cacheKeyFn (read path) and
+  // Emitter's memoize lookups (all events). Composition lives in `computeCacheKey` above
+  // so the two paths can't drift. Lazily cached per Query instance.
   toCacheKey() {
-    return JSON.stringify({
-      op: this.#query.op,
-      select: this.#query.select,
-      where: this.#query.where,
-      sort: this.#query.sort,
-      skip: this.#query.skip,
-      limit: this.#query.limit,
-      before: this.#query.before,
-      after: this.#query.after,
-      first: this.#query.first,
-      last: this.#query.last,
-    });
+    if (this.#cacheKey !== undefined) return this.#cacheKey;
+    this.#cacheKey = computeCacheKey(this.#query);
+    return this.#cacheKey;
   }
 
   /**
@@ -126,6 +146,7 @@ module.exports = class Query {
     this.#query.input = input;
     this.#query.where = where;
     this.#query.sort = sort;
+    this.#cacheKey = undefined; // invalidate; $cacheKey getter recomputes on next access
     return this;
   }
 

@@ -306,7 +306,11 @@ module.exports = class Resolver {
     const tquery = $query.transform(false);
     const query = tquery.toObject();
     const type = query.isMutation ? 'Mutation' : 'Query';
+    // event.query stays the plain mutable object listeners read/write. event.$query is the
+    // Query instance — framework-internal handle the Emitter uses to call toCacheKey() for
+    // memoization. Non-enumerable so it doesn't show up in iteration/spread/JSON.stringify.
     const event = { schema: this.#schema, context: this.#context, resolver: this, query };
+    Object.defineProperty(event, '$query', { value: tquery, configurable: true });
 
     return Emitter.emit(`pre${type}`, event).then(async (resultEarly) => {
       if (resultEarly !== undefined) return resultEarly;

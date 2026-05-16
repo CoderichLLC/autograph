@@ -235,8 +235,8 @@ describe('Emitter', () => {
     const fn21 = jest.fn();
     const fn31 = jest.fn();
     Emitter.on('event', fn11);
-    Emitter.prependListener('event', fn31, -Infinity);
-    Emitter.on('event', fn21, 1);
+    Emitter.prependListener('event', fn31, { priority: -Infinity });
+    Emitter.on('event', fn21, { priority: 1 });
     Emitter.emit('event');
     expect(fn21.mock.invocationCallOrder[0]).toBeLessThan(fn11.mock.invocationCallOrder[0]);
     expect(fn21.mock.invocationCallOrder[0]).toBeLessThan(fn31.mock.invocationCallOrder[0]);
@@ -245,9 +245,57 @@ describe('Emitter', () => {
     // Infinities
     const inf1 = jest.fn();
     const inf2 = jest.fn();
-    Emitter.on('event', inf1, Infinity);
-    Emitter.on('event', inf2, Infinity);
+    Emitter.on('event', inf1, { priority: Infinity });
+    Emitter.on('event', inf2, { priority: Infinity });
     Emitter.emit('event');
     expect(inf1.mock.invocationCallOrder[0]).toBeLessThan(inf2.mock.invocationCallOrder[0]);
+  });
+
+  describe('Memoize', () => {
+    test('empty events skip work', async () => {
+      // Sanity: emitting an event with no listeners returns a resolved promise without invoking anything
+      const result = await Emitter.emit('memoEmpty', { resolver, query: { model: 'X' } });
+      expect(result).toBeUndefined();
+    });
+
+    test('basic listener fires once per unique query when memoize: true', async () => {
+      const fn = jest.fn(() => undefined);
+      Emitter.on('memoBasic', fn, { memoize: true });
+      const event = { resolver, query: { model: 'M', crud: 'read', op: 'findOne', where: { id: 1 } } };
+      await Emitter.emit('memoBasic', event);
+      await Emitter.emit('memoBasic', event);
+      await Emitter.emit('memoBasic', event);
+      expect(fn).toBeCalledTimes(1);
+
+      // Different query key → listener runs again
+      await Emitter.emit('memoBasic', { resolver, query: { ...event.query, where: { id: 2 } } });
+      expect(fn).toBeCalledTimes(2);
+    });
+
+    test('next-style listener memoizes the value passed to next()', async () => {
+      const fn = jest.fn((event, next) => next());
+      Emitter.on('memoNext', fn, { memoize: true });
+      const event = { resolver, query: { model: 'M', crud: 'read', op: 'findOne', where: { id: 1 } } };
+      await Emitter.emit('memoNext', event);
+      await Emitter.emit('memoNext', event);
+      expect(fn).toBeCalledTimes(1);
+    });
+
+    test('memoize without resolver is a silent no-op', async () => {
+      const fn = jest.fn(() => undefined);
+      Emitter.on('memoNoResolver', fn, { memoize: true });
+      await Emitter.emit('memoNoResolver', { query: { model: 'M' } });
+      await Emitter.emit('memoNoResolver', { query: { model: 'M' } });
+      expect(fn).toBeCalledTimes(2); // fires every call because no resolver scope
+    });
+
+    test('without memoize: true the listener fires every call', async () => {
+      const fn = jest.fn(() => undefined);
+      Emitter.on('memoOff', fn);
+      const event = { resolver, query: { model: 'M', crud: 'read', op: 'findOne' } };
+      await Emitter.emit('memoOff', event);
+      await Emitter.emit('memoOff', event);
+      expect(fn).toBeCalledTimes(2);
+    });
   });
 });
