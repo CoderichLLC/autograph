@@ -67,7 +67,9 @@ module.exports = class Loader {
       return results.flat().sort((a, b) => a.i - b.i).map(({ query, $query, data }) => {
         if (data == null) return null; // Explicit return null;
         if ($query.isCursorPaging && Array.isArray(data)) data = Loader.#paginateResults(data, query.toObject());
-        return this.#resolver.toResultSet(this.#model, data);
+        // Pass this batch's GraphQL info so toResultSet can drive selection-aware
+        // eager/lazy. Different batches may carry different infos; each is handled per-batch.
+        return this.#resolver.toResultSet(this.#model, data, $query.info);
       });
     });
   }

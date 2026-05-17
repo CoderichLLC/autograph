@@ -7,6 +7,7 @@ const { isLeafValue, mergeDeep, fromGUID } = require('../service/AppService');
 const Transformer = require('../data/Transformer');
 const Pipeline = require('../data/Pipeline');
 const Emitter = require('../data/Emitter');
+const { $RAW } = require('../service/Symbols');
 
 const operations = ['Query', 'Mutation', 'Subscription'];
 const interfaceKinds = [Kind.INTERFACE_TYPE_DEFINITION, Kind.INTERFACE_TYPE_EXTENSION];
@@ -502,20 +503,58 @@ module.exports = class Schema {
             // children were already transformed during the parent's read. The non-enumerable
             // $transformed marker lets a second call short-circuit without altering semantics.
             const docFields = Object.values($model.fields);
-            $model.docTransform = (doc, args = {}, Ctor) => {
+            $model.docTransform = (doc, args = {}, selection) => {
               if (doc == null || typeof doc !== 'object') return doc;
               if (doc.$transformed) return doc;
-              // Ctor (if supplied) gives the result object the DocClass prototype at allocation
-              // time — lets Resolver.toResultSet avoid per-doc defineProperty + setPrototypeOf.
-              // Not propagated to embedded recursion: embedded sub-docs stay plain {} (matches
-              // pre-existing behavior — only top-level toResultSet'd docs got $, $model, etc.).
+              // Look up the per-(resolver, model) DocClass from the resolver. Auto-propagating
+              // through embedded recursion this way means sub-docs also get the right prototype
+              // + shared lazy getters without the caller threading a Ctor down. When no resolver
+              // is available (legacy callers, tests), Ctor is undefined → falls back to {}.
+              const Ctor = args.resolver?.getDocClass?.($model);
+              const lazyGetters = Ctor?.lazyGetters;
+              const lazySetters = Ctor?.lazySetters;
+              // selection (built once at the top-level toResultSet call, passed explicitly
+              // rather than via args to avoid spreading args on every embedded recursion) tells
+              // us which transform-eligible fields the GraphQL caller asked for. Selected →
+              // eager (run transform now, store data property). Unselected → lazy (defer behind
+              // a shared getter; if a hook/spread reads it later, the getter still fires).
+              // When selection is undefined (embedded recursion from a lazy getter, non-
+              // GraphQL caller), every eligible field is lazy.
               const out = Ctor ? new Ctor() : {};
               for (const docField of docFields) {
                 let value = docField.key in doc ? doc[docField.key] : docField.defaultValue;
                 if (value === undefined) continue; // eslint-disable-line
                 if (docField.isArray) value = value == null ? value : Util.ensureArray(value);
-                if (docField.isEmbedded) value = Util.map(value, v => docField.model.docTransform(v, args));
-                if (docField.pipelines.deserialize.length) value = Pipeline.resolve({ ...args, model: $model, field: docField, value }, 'deserialize');
+                const hasEmbedded = docField.isEmbedded;
+                const hasDeserialize = docField.pipelines.deserialize.length > 0;
+                const isEligible = (hasEmbedded || hasDeserialize) && value != null;
+                const isSelected = selection ? selection.fields.has(docField.name) : false;
+                const goLazy = lazyGetters && isEligible && !isSelected;
+
+                if (goLazy) {
+                  // LAZY: shared getter on the DocClass; raw value goes in this[$RAW][name]
+                  // for the getter to consume on first access.
+                  if (!out[$RAW]) out[$RAW] = {};
+                  out[$RAW][docField.name] = value;
+                  Object.defineProperty(out, docField.name, {
+                    enumerable: true,
+                    configurable: true,
+                    get: lazyGetters[docField.name],
+                    set: lazySetters[docField.name],
+                  });
+                  continue; // eslint-disable-line
+                }
+
+                // EAGER. Pass the sub-selection straight through as the third arg — no spread
+                // needed, args itself is unchanged. If selection is undefined or doesn't have
+                // this field's embedded sub-tree, sub-doc gets undefined → all-lazy.
+                if (hasEmbedded) {
+                  const subSelection = selection?.embedded?.[docField.name];
+                  value = Util.map(value, v => docField.model.docTransform(v, args, subSelection));
+                }
+                if (hasDeserialize) {
+                  value = Pipeline.resolve({ ...args, model: $model, field: docField, value }, 'deserialize');
+                }
                 out[docField.name] = value;
               }
               Object.defineProperty(out, '$transformed', { value: true });

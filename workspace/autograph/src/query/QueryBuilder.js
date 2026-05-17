@@ -76,7 +76,9 @@ module.exports = class QueryBuilder {
   }
 
   info(info) {
-    // this.select(getGQLSelectFields(this.#query.model, info));
+    // Store info on the query so the resolve path can build a selection tree once and
+    // drive selection-aware eager/lazy decisions in docTransform. See AppService.buildSelectionTree.
+    this.#query.info = info;
     return this;
   }
 

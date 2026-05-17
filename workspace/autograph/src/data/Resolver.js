@@ -6,7 +6,9 @@ const Emitter = require('./Emitter');
 const Loader = require('./Loader');
 const DataLoader = require('./DataLoader');
 const Transaction = require('./Transaction');
-const { $QUERY } = require('../service/Symbols');
+const Pipeline = require('./Pipeline');
+const { buildSelectionTree } = require('../service/AppService');
+const { $QUERY, $RAW } = require('../service/Symbols');
 
 const loaders = {};
 
@@ -208,7 +210,9 @@ module.exports = class Resolver {
 
         // Return results
         if (crud === 'delete') return doc;
-        return this.toResultSet(model, results);
+        // Pass mutation's selection set through so the returned doc applies the same eager/lazy
+        // split as reads. Mutations have info too — caller uses .info(info) before save/delete.
+        return this.toResultSet(model, results, query.toObject().info);
       });
     } else {
       thunk = (tquery) => {
@@ -239,17 +243,22 @@ module.exports = class Resolver {
     });
   }
 
-  toResultSet(model, result) {
+  toResultSet(model, result, info) {
     if (result == null) return result;
     if (typeof result !== 'object') return result;
     model = this.#schema.models[model];
-    const DocClass = this.#getDocClass(model);
+    const DocClass = this.getDocClass(model);
     const proto = DocClass.prototype;
+    // Parse the GraphQL selection once per call. If info is missing (legacy callers, internal
+    // recursion paths), selection will be null and docTransform falls back to all-lazy.
+    const selection = buildSelectionTree(info, model.name);
 
     return Object.defineProperties(Util.map(result, (doc) => {
       // docTransform creates the object with DocClass.prototype set at allocation time,
       // so we avoid setPrototypeOf (deopt) and per-doc defineProperties for $/$model/etc.
-      const $doc = model.docTransform(doc, { resolver: this, context: this.#context }, DocClass);
+      // Selection is passed as the third arg (rather than embedded in args) so internal
+      // recursion can swap it without spreading args on every call.
+      const $doc = model.docTransform(doc, { resolver: this, context: this.#context }, selection);
 
       // Safety: already-$transformed docs early-return from docTransform without the new
       // prototype. Patch it here — rare path; the common path takes Object.getPrototypeOf===proto.
@@ -270,9 +279,11 @@ module.exports = class Resolver {
   }
 
   // Build (and cache) a Doc class for a given model. The class's prototype hosts the
-  // shared $ getter, $model, toString, $save, $lookup. One closure-set per (resolver, model),
-  // not per-doc — replaces six defineProperty + four closures per doc in the old code.
-  #getDocClass(model) {
+  // shared $ getter, $model, $save, $lookup (one closure-set per (resolver, model), not per-doc).
+  // Doc.lazyGetters holds shared getter functions for transform-eligible fields — re-used by
+  // every doc instance via Object.defineProperty on the instance (so spread/iteration still
+  // fires them), saving the closure allocation that the previous per-doc-getter pattern paid.
+  getDocClass(model) {
     const cached = this.#docClasses[model.name];
     if (cached) return cached;
 
@@ -318,6 +329,46 @@ module.exports = class Resolver {
         const method = field.isArray ? 'many' : 'one';
         return this.$.lookup(prop).args(args)[method]();
       } },
+    });
+
+    // Shared lazy getters/setters — one pair per (resolver, model, field). The doc instance
+    // only needs an own accessor descriptor pointing at these functions; no per-doc closure
+    // required.
+    //
+    // Getter: read raw value from this[$RAW], run the transform pipeline, memoize as an own
+    // data property (self-replace), return value. Subsequent reads are direct data property
+    // access (no getter dispatch).
+    //
+    // Setter: a lazy property with no setter would throw "Cannot set property ... which has
+    // only a getter" if anything writes before reading (hooks doing `doc.name = X`, the
+    // `$.save({...$doc, ...})` proxy, internal in-place mutations like pull/push/splice).
+    // We install a shared setter that overwrites the accessor with a writable data property
+    // holding the new value — bypassing the getter entirely. Same self-replace pattern, just
+    // driven by writes instead of reads.
+    //
+    // cachedArgs is hoisted out of the getter — the resolver and context are stable for the
+    // DocClass lifetime, so allocating once beats rebuilding on every getter fire.
+    const cachedArgs = { resolver: self, context: self.getContext() };
+    Doc.lazyGetters = {};
+    Doc.lazySetters = {};
+    Object.values(model.fields).forEach((docField) => {
+      const hasEmbedded = docField.isEmbedded;
+      const hasDeserialize = docField.pipelines?.deserialize?.length > 0;
+      if (!hasEmbedded && !hasDeserialize) return;
+      const fieldRef = docField;
+      const fieldName = docField.name;
+      Doc.lazyGetters[fieldName] = function lazyGetter() {
+        const raws = this[$RAW];
+        const raw = raws ? raws[fieldName] : undefined;
+        let v = raw;
+        if (hasEmbedded && v != null) v = Util.map(v, sv => fieldRef.model.docTransform(sv, cachedArgs));
+        if (hasDeserialize) v = Pipeline.resolve({ ...cachedArgs, model, field: fieldRef, value: v }, 'deserialize');
+        Object.defineProperty(this, fieldName, { value: v, writable: true, enumerable: true, configurable: true });
+        return v;
+      };
+      Doc.lazySetters[fieldName] = function lazySetter(v) {
+        Object.defineProperty(this, fieldName, { value: v, writable: true, enumerable: true, configurable: true });
+      };
     });
 
     this.#docClasses[model.name] = Doc;
