@@ -158,6 +158,32 @@ grep -rEn "\btoId\b|@field\([^)]*\b(transform|destruct):" src/ migrations/
 - `@model(source: "default")` — selects the data source from `config.dataSources`. Replaces 0.12's `driver: "..."` arg (which is still accepted as a transitional alias).
 - `@model(decorate: "default")` — selects the SDL template from `config.decorators` to merge into this type. Replaces ad-hoc inheritance/composition patterns.
 
+### 3e. Write-path pipeline stages receive the *clean input*, not a doc-merged view
+
+**What:** On a mutation, each write-path stage (`cast → normalize → instruct → construct/restruct → serialize`) is now invoked with the field's value taken from the **caller's input for this mutation only**. The thunk args are `{ startValue, value, query, resolver, context, model, field }`:
+- `value` — the field's value flowing through *this* input (first stage: `value === startValue`, the input value for the key; later stages: the prior stage's output). **It is the input value, not the persisted value.**
+- On a *partial update* that omits the field, `value` is `undefined`.
+- The persisted pre-image is `query.doc` (present on update/delete, `undefined` on create). **This is the "existing value."**
+
+In 0.12 the transformer shaped a doc-merged object, so for an omitted field `value` was effectively the *existing* value. In 0.14 the create/update transformer runs over clean input (see §6b), so omitted fields arrive as `undefined`.
+
+**Why this bites:** a custom stage written as `value || <derive-from-context>` (or `value ?? …`) to mean *"keep the existing value, else default"* silently changed behavior on **update**. Because `value` is now `undefined` for any field the caller didn't supply, and because `instruct` runs on **both** create and update, the stage falls through to the context-derived default and **overwrites the stored value** on every update — even when the mutation never mentioned that field.
+
+It stays invisible until the field's correct value differs from the context default. (A `network` field instructed from `context.network.id` never differs from the record's network, so its re-derivation is a harmless no-op — and `validate: immutable` would catch a genuine mismatch. A `workspaces` field instructed from `context.workspace.id` *does* differ — e.g. a live record edited from the draft view — so it gets clobbered to the selected workspace.) Single-context test harnesses won't catch it either, since input and doc share one workspace.
+
+**Migration:**
+- To preserve an existing value on partial update, read it from the pre-image — `value || query?.doc?.<field> || <default>` — do **not** rely on `value`.
+- Scope create-only population to `construct`, update-only to `restruct`. Reserve `instruct` for values meant to be (re)derived on *every* write.
+- Pair context-derived identity fields with `validate: immutable` so a genuine mismatch throws instead of silently writing.
+
+**Find:**
+```sh
+# custom pipelines that default from context but may ignore the existing doc value
+grep -rEn "Pipeline\.define\(" src/ | grep -E "context\.|requestInfo"
+# fields whose instruct/restruct stage runs on update
+grep -rEn "@field\([^)]*\b(instruct|restruct):" src/
+```
+
 ---
 
 ## 4. Resolver API
