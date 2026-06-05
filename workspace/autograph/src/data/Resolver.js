@@ -37,6 +37,20 @@ module.exports = class Resolver {
     return this.#context;
   }
 
+  // Public accessor for #context. AG12 exposed `resolver.context` as a public, re-assignable
+  // property; consumers rely on re-pointing it after their server framework swaps the context
+  // object (e.g. Apollo Server shallow-copies the context — apollographql/apollo-server#3146 —
+  // so the object resolvers receive differs from the one this Resolver was constructed with).
+  // Restoring the setter keeps `event.context` pointed at the live, mutated context.
+  get context() {
+    return this.#context;
+  }
+
+  set context(context) {
+    this.#context = context;
+    Util.set(this.#context, `${this.#schema.namespace}.resolver`, this);
+  }
+
   clear(model) {
     this.#dataLoaders[model].clearAll();
     return this;
