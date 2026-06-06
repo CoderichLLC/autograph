@@ -1,0 +1,65 @@
+const { parse } = require('graphql');
+const Pipeline = require('../data/Pipeline');
+
+module.exports = function createFrameworkTypeDefs(directives) {
+  const { model, field, link, index } = directives;
+
+  return parse(`
+    scalar AutoGraphMixed
+    scalar AutoGraphDriver # DELETE WHEN MIGRATED
+
+    enum AutoGraphIndexEnum { unique }
+    enum AutoGraphAuthzEnum { private protected public } # DELETE WHEN MIGRATED
+    enum AutoGraphOnDeleteEnum { cascade nullify restrict }
+    enum AutoGraphPipelineEnum { ${Object.keys(Pipeline).filter(k => !k.startsWith('$')).join(' ')} }
+
+    directive @${model}(
+      id: String # Specify the generator strategy (default: "default")
+      pk: String # Specify the PK field (default "id")
+      key: String # Specify db table/collection name
+      crud: AutoGraphMixed # CRUD API
+      scope: AutoGraphMixed #
+      meta: AutoGraphMixed # Custom input "meta" field for mutations
+      source: AutoGraphMixed # Data source (default: "default")
+      decorate: AutoGraphMixed # Decorator (default: "default")
+      embed: Boolean # Mark this an embedded model (default false)
+      persist: Boolean # Persist this model (default true)
+
+      authz: AutoGraphAuthzEnum # Access level used for authorization (default: private)
+      namespace: String # Logical grouping of models that can be globbed (useful for authz)
+    ) on OBJECT | INTERFACE
+
+    directive @${field}(
+      id: String # Specify the generator strategy (default: "default")
+      fk: String # Specify the FK field (default model.pk)
+      key: String # Specify db key
+      persist: Boolean # Persist this field (default true)
+      connection: Boolean # Treat this field as a connection type (default false - rolling this out slowly)
+      default: AutoGraphMixed # Define a default value
+      crud: AutoGraphMixed # CRUD API
+      onDelete: AutoGraphOnDeleteEnum # onDelete behavior
+
+      # Pipeline Structure
+      normalize: [AutoGraphPipelineEnum!]
+      instruct: [AutoGraphPipelineEnum!]
+      construct: [AutoGraphPipelineEnum!]
+      restruct: [AutoGraphPipelineEnum!]
+      serialize: [AutoGraphPipelineEnum!]
+      deserialize: [AutoGraphPipelineEnum!]
+      validate: [AutoGraphPipelineEnum!]
+
+    ) on FIELD_DEFINITION | INPUT_FIELD_DEFINITION | SCALAR
+
+    directive @${link}(
+      to: AutoGraphMixed  # The MODEL to link to (default's to modelRef)
+      by: AutoGraphMixed! # The FIELD to match yourself by
+      use: AutoGraphMixed # The VALUE to use (default's to @link'd value); useful for many-to-many relationships
+    ) on FIELD_DEFINITION
+
+    directive @${index}(
+      name: String
+      on: [AutoGraphMixed!]!
+      type: AutoGraphIndexEnum!
+    ) repeatable on OBJECT
+  `);
+};

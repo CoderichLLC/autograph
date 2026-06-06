@@ -1,6 +1,7 @@
 const get = require('lodash.get');
 const Util = require('@coderich/util');
 const QueryBuilder = require('./QueryBuilder');
+
 module.exports = class QueryResolver extends QueryBuilder {
   #model;
   #schema;
