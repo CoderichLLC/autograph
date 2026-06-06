@@ -595,3 +595,106 @@ Findings from the Spitfire-side audit, captured here so the migration plan has a
 ### Still ahead
 - **`setup` listener payload**: 3 occurrences (`User/setup.js`, `@1.setup/transformations.js`, `@support/DataValidation/setup.js`) — all need to treat the listener arg as a parsed-schema POJO (not a `Schema` instance with methods). Verify when their tests run.
 - **NetworkDeepLinkConfiguration**: setup uses AG12 `query.toObject()` calls and `$query.match` (the old where-clause name). Migrated to `query.where` + clean read-merged/write-input pattern, but no test coverage for this module — verify when something exercises it.
+
+---
+
+# Upgrading to autograph 0.15
+
+This guide covers every breaking change introduced between `0.14.x` and `0.15.x`.
+
+---
+
+## Removed deprecations
+
+### `Schema.getModels()` and `Schema.getModel(name)` removed
+
+These public accessors were deprecated in 0.14 and are now removed.
+
+**Before:**
+```js
+const models = schema.getModels();
+const person = schema.getModel('Person');
+```
+
+**After:** Access the parsed schema POJO instead (available from the `setup` event or via `schema.toObject()`):
+```js
+emitter.on('setup', ({ models }) => {
+  const person = models.Person;
+});
+```
+
+---
+
+### `parsedSchema.getModel(name)` removed from setup payload
+
+The `getModel` function that was attached to the `parsedSchema` object passed to `emitter.on('setup', ...)` is no longer present.
+
+**After:** Use `parsedSchema.models[name]` directly.
+
+---
+
+### `@field(transform: [...])` removed
+
+The `transform` pipeline directive argument was renamed to `normalize` in 0.14 and the backwards-compat shim is now gone.
+
+**Find:** `grep -r "transform:" schema/` — look for `@field(transform: ...)` in GraphQL SDL files.
+
+**Before:**
+```graphql
+name: String @field(transform: ["toLowerCase"])
+```
+
+**After:**
+```graphql
+name: String @field(normalize: ["toLowerCase"])
+```
+
+---
+
+### `@model(gqlScope:)`, `@model(fieldScope:)`, `@field(gqlScope:)`, `@field(dalScope:)` removed
+
+These directive arguments were renamed to `crud` and `scope` in 0.14. The backwards-compat shims and the SDL arguments themselves are now removed.
+
+**Find:** `grep -r "gqlScope\|dalScope\|fieldScope" schema/`
+
+**Before:**
+```graphql
+type Person @model(gqlScope: "crud") { ... }
+name: String @field(gqlScope: "r", dalScope: "crud")
+```
+
+**After:**
+```graphql
+type Person @model(crud: "crud") { ... }
+name: String @field(crud: "r")
+```
+
+---
+
+### `@model(driver:)`, `@model(createdAt:)`, `@model(updatedAt:)`, `@field(ref:)` removed
+
+These transitional `@model` and `@field` directive arguments (present since 0.14 only to ease migration) are now removed from the framework SDL.
+
+- `@model(driver: ...)` → use `@model(source: ...)` (the renamed form from 0.14)
+- `@model(createdAt:)` / `@model(updatedAt:)` → these were AG12 syntax; use a custom `decorate:` config instead
+- `@field(ref: ...)` → specify the model reference through the type system or `@link`
+
+---
+
+### `AppService.withResolvers` export removed
+
+The re-exported `withResolvers` helper from `@coderich/util/AppService` was a one-release alias for `Promise.withResolvers`.
+
+**Find:** `grep -r "withResolvers" src/` — look for imports of this from autograph internals.
+
+**After:** Use `Promise.withResolvers()` directly (available natively in Node 22+, and polyfilled by autograph's minimum supported Node version).
+
+---
+
+### `AppService.guidToId(autograph, guid)` — `legacyMode` branch removed
+
+The `legacyMode` branch (which returned `guid` as-is when `autograph.legacyMode` was truthy) is removed. The function now always decodes the GUID.
+
+**Before (legacy path):** If `autograph.legacyMode` was set, raw GUIDs were passed through unchanged.
+
+**After:** GUIDs are always decoded via `fromGUID`. Remove any `legacyMode` flag from your autograph config.

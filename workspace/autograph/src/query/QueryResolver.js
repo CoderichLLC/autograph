@@ -1,15 +1,13 @@
 const get = require('lodash.get');
 const Util = require('@coderich/util');
 const QueryBuilder = require('./QueryBuilder');
-const { withResolvers } = require('../service/AppService');
-
 module.exports = class QueryResolver extends QueryBuilder {
   #model;
   #schema;
   #config;
   #context;
   #resolver;
-  #resolution = withResolvers(); // Promise for when the query is resolved
+  #resolution = Promise.withResolvers(); // Promise for when the query is resolved
 
   constructor(config) {
     const { schema, context, resolver, query } = config;

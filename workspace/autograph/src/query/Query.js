@@ -1,5 +1,5 @@
 const Util = require('@coderich/util');
-const { isGlob, globToRegex, mergeDeep, JSONParse, withResolvers } = require('../service/AppService');
+const { isGlob, globToRegex, mergeDeep, JSONParse } = require('../service/AppService');
 
 // Deep "merged" view: input first, falls through to doc — recursively for plain objects.
 // READ-ONLY. Writes/deletes throw with a hint pointing at `query.input` as the correct
@@ -79,7 +79,7 @@ module.exports = class Query {
   static computeCacheKey = computeCacheKey;
 
   constructor(config) {
-    const { schema, context, resolver, query, resolution = withResolvers() } = config;
+    const { schema, context, resolver, query, resolution = Promise.withResolvers() } = config;
     this.#config = config;
     this.#resolver = resolver;
     this.#context = context;

@@ -40,16 +40,6 @@ module.exports = class Schema {
     this.#typeDefs = Schema.#framework(this.#config.directives);
   }
 
-  /* ****** DEPRECATE! ****** */
-  getModels() {
-    return this.#schema.models;
-  }
-
-  getModel(name) {
-    return this.#schema.models[`${name}`];
-  }
-  /* ***************** */
-
   /**
    * Decorate each marked @model with config-driven field decorators
    */
@@ -141,9 +131,6 @@ module.exports = class Schema {
     this.#schema = { models: {}, enums: {}, scalars: {}, indexes: [], namespace };
     let target, model, field, isList;
     const thunks = [];
-
-    // Deprecate
-    this.#schema.getModel = name => this.#schema.models[`${name}`];
 
     // Parse AST (build/defined this.#schema)
     visit(this.#typeDefs, {
@@ -272,10 +259,6 @@ module.exports = class Schema {
                 target.pipelines.validate = target.pipelines.validate.concat(value).filter(Boolean);
                 break;
               }
-              case `${directives.field}-transform`: { // Deprecated
-                target.pipelines.normalize = target.pipelines.normalize.concat(value).filter(Boolean);
-                break;
-              }
               case `${directives.link}-to`: {
                 target.linkTo = value;
                 target.isVirtual ??= true;
@@ -306,11 +289,6 @@ module.exports = class Schema {
                 target[key] = value;
                 break;
               }
-
-              // Backwards compat (deprecated)
-              case 'model-gqlScope': { model.crud = value; break; }
-              case 'model-fieldScope': { model.scope = value; break; }
-              case 'field-gqlScope': { target.crud = value; break; }
 
               // Pipelines
               default: {
@@ -798,13 +776,6 @@ module.exports = class Schema {
         embed: Boolean # Mark this an embedded model (default false)
         persist: Boolean # Persist this model (default true)
 
-        # TEMP TO APPEASE TRANSITION
-        driver: AutoGraphDriver # External data driver
-        createdAt: String # Specify db key (default "createdAt")
-        updatedAt: String # Specify db key (default "updatedAt")
-        gqlScope: AutoGraphMixed # Dictate how GraphQL API behaves
-        dalScope: AutoGraphMixed # Dictate how the DAL behaves
-        fieldScope: AutoGraphMixed # Dictate how a FIELD may use me
         authz: AutoGraphAuthzEnum # Access level used for authorization (default: private)
         namespace: String # Logical grouping of models that can be globbed (useful for authz)
       ) on OBJECT | INTERFACE
@@ -828,11 +799,6 @@ module.exports = class Schema {
         deserialize: [AutoGraphPipelineEnum!]
         validate: [AutoGraphPipelineEnum!]
 
-        # TEMP TO APPEASE TRANSITION
-        ref: AutoGraphMixed # Specify the modelRef field's name (overrides isEmbedded)
-        gqlScope: AutoGraphMixed # Dictate how GraphQL API behaves
-        dalScope: AutoGraphMixed # Dictate how the DAL behaves
-        transform: [AutoGraphPipelineEnum!]
       ) on FIELD_DEFINITION | INPUT_FIELD_DEFINITION | SCALAR
 
       directive @${link}(

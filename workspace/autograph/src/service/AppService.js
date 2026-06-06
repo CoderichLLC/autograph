@@ -13,7 +13,7 @@ exports.isLeafValue = value => Array.isArray(value) || value instanceof Date || 
 exports.mergeDeep = (...args) => DeepMerge.all(args, { isMergeableObject: obj => (Util.isPlainObjectOrArray(obj)), arrayMerge: smartMerge });
 exports.hashObject = obj => ObjectHash(obj, { respectType: false, respectFunctionNames: false, respectFunctionProperties: false, unorderedArrays: true, ignoreUnknown: true, replacer: r => (ObjectId.isValid(r) ? `${r}` : r) });
 exports.fromGUID = guid => Buffer.from(`${guid}`, 'base64').toString('ascii').split(',');
-exports.guidToId = (autograph, guid) => (autograph.legacyMode ? guid : exports.uvl(exports.fromGUID(guid)[1], guid));
+exports.guidToId = (autograph, guid) => exports.uvl(exports.fromGUID(guid)[1], guid);
 
 exports.getGQLReturnType = (info) => {
   const returnType = `${info.returnType}`;
@@ -117,7 +117,3 @@ exports.JSONParse = (mixed) => {
     return undefined;
   }
 };
-
-// Node 22+ has Promise.withResolvers natively. Re-exported here so callers don't have to
-// remember to use the native API directly; deprecated but kept for one release as an alias.
-exports.withResolvers = Promise.withResolvers.bind(Promise);
