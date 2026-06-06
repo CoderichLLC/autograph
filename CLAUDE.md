@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Autograph** is a GraphQL auto-generation library that decorates a GraphQL schema with CRUD resolvers, data pipelines, and event hooks. It follows a schema-first approach where directives (`@model`, `@field`, `@link`, `@index`) drive code generation.
+**Autograph** is a GraphQL auto-generation library that decorates a GraphQL schema with CRUD resolvers, data pipelines, and event hooks. It follows a schema-first approach where directives (`@model`, `@field`, `@link`) drive code generation.
 
 ## Monorepo Structure
 
@@ -86,7 +86,6 @@ type Person @model {
 - `@model` — Marks a type as a managed entity; `@model(source: "myDataSource")` targets a named driver
 - `@field(...)` — Pipeline stage assignments, validation, casting
 - `@link(by: "fieldName")` — Relationship definition (foreign key)
-- `@index(...)` — Index configuration
 
 ### DataLoader / Caching
 

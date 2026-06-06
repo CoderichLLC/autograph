@@ -1,6 +1,6 @@
 # Upgrading to autograph 0.14
 
-This guide covers every breaking change introduced between `0.12.9` and `0.14.4`. It is the shared reference for the Spitfire migration. Each entry has **What**, **Why**, and **Find** (a grep that locates affected code in a consumer).
+This guide covers every breaking change introduced between `0.12.x` and `0.14.x`. It is the shared reference for the Spitfire migration. Each entry has **What**, **Why**, and **Find** (a grep that locates affected code in a consumer).
 
 > Open questions are collected at the bottom under **Unresolved**. Anything in that section is a place where the author intent is ambiguous and we should decide before the migration is "done."
 
@@ -8,7 +8,7 @@ This guide covers every breaking change introduced between `0.12.9` and `0.14.4`
 
 ## Why upgrade?
 
-The 0.13 → 0.14 line is primarily a **simplification + performance** release.
+The 0.12 → 0.14 line is primarily a **simplification + performance** release.
 
 - **Read path is ~60% faster on `findMany`.** The Proxy-based, Transformer-driven deserialize was replaced by a per-model compiled `docTransform` plain function. No Proxy traps on hot result paths.
 - **Result objects are now plain JS objects, safe to mutate.** DataLoader caches the raw driver result, not the post-transform output, so mutating a result no longer poisons subsequent dataloader hits.
