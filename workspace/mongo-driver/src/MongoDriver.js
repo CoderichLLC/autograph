@@ -1,4 +1,3 @@
-const { inspect } = require('node:util');
 const Util = require('@coderich/util');
 const { MongoClient, ObjectId } = require('mongodb');
 
@@ -14,48 +13,70 @@ module.exports = class MongoDriver {
     this.#connection = this.#mongoClient.connect();
   }
 
-  resolve(query) {
-    query.options = { ...this.#config.query, ...query.options };
-    if (query.flags.debug) console.log(inspect(query, { showHidden: false, colors: true, depth: 3 }));
-    return Util.promiseRetry(() => this[query.op](query), 5, 5, e => e.hasErrorLabel && e.hasErrorLabel('TransientTransactionError'));
+  prepare(query) {
+    const options = { ...this.#config.query, ...query.options };
+    const plan = { op: query.op, model: query.model, options };
+
+    switch (query.op) {
+      case 'findOne':
+      case 'findMany':
+        plan.$aggregate = MongoDriver.aggregateQuery(query);
+        break;
+      case 'count':
+        plan.$aggregate = MongoDriver.aggregateQuery(query, true);
+        break;
+      case 'createOne':
+        plan.doc = query.input;
+        delete plan.options.collation;
+        break;
+      case 'updateOne':
+        plan.options.returnDocument = 'after';
+        plan.where = query.where;
+        plan.update = query.isSaveNative ? query.input : { $set: query.input };
+        break;
+      case 'deleteOne':
+      case 'deleteMany':
+        plan.where = query.where;
+        break;
+      default:
+        break;
+    }
+
+    return plan;
   }
 
-  findOne(query) {
-    const $aggregate = MongoDriver.aggregateQuery(query);
-    return this.collection(query.model).aggregate($aggregate, query.options).then(cursor => cursor.next());
+  execute(plan) {
+    return Util.promiseRetry(() => this[plan.op](plan), 5, 5, e => e.hasErrorLabel && e.hasErrorLabel('TransientTransactionError'));
   }
 
-  findMany(query) {
-    const $aggregate = MongoDriver.aggregateQuery(query);
-    return this.collection(query.model).aggregate($aggregate, query.options).then(cursor => cursor.toArray());
+  findOne(plan) {
+    return this.collection(plan.model).aggregate(plan.$aggregate, plan.options).then(cursor => cursor.next());
   }
 
-  count(query) {
-    const $aggregate = MongoDriver.aggregateQuery(query, true);
-    return this.collection(query.model).aggregate($aggregate, query.options).then((cursor) => {
-      return cursor.next().then((doc) => {
-        return doc ? doc.count : 0;
-      });
+  findMany(plan) {
+    return this.collection(plan.model).aggregate(plan.$aggregate, plan.options).then(cursor => cursor.toArray());
+  }
+
+  count(plan) {
+    return this.collection(plan.model).aggregate(plan.$aggregate, plan.options).then((cursor) => {
+      return cursor.next().then(doc => (doc ? doc.count : 0));
     });
   }
 
-  createOne(query) {
-    delete query.options.collation;
-    return this.collection(query.model).insertOne(query.input, query.options).then(result => ({ ...query.input, _id: result.insertedId }));
+  createOne(plan) {
+    return this.collection(plan.model).insertOne(plan.doc, plan.options).then(result => ({ ...plan.doc, _id: result.insertedId }));
   }
 
-  updateOne(query) {
-    query.options.returnDocument = 'after';
-    const $update = query.isSaveNative ? query.input : { $set: query.input };
-    return this.collection(query.model).findOneAndUpdate(query.where, $update, query.options);
+  updateOne(plan) {
+    return this.collection(plan.model).findOneAndUpdate(plan.where, plan.update, plan.options);
   }
 
-  deleteOne(query) {
-    return this.collection(query.model).deleteOne(query.where, query.options);
+  deleteOne(plan) {
+    return this.collection(plan.model).deleteOne(plan.where, plan.options);
   }
 
-  deleteMany(query) {
-    return this.collection(query.model).deleteMany(query.where, query.options);
+  deleteMany(plan) {
+    return this.collection(plan.model).deleteMany(plan.where, plan.options);
   }
 
   collection(name) {
@@ -188,8 +209,6 @@ module.exports = class MongoDriver {
       // Field projections
       if (select?.length) $aggregate.push({ $project: select.reduce((prev, key) => Object.assign(prev, { [key]: 1 }), {}) });
     }
-
-    if (query.flags.debug) console.log(inspect($aggregate, { depth: null, showHidden: false, colors: true }));
 
     return $aggregate;
   }

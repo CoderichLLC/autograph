@@ -1,6 +1,6 @@
 {
-  "name": "@coderich/autograph-mongodb",
-  "main": "src/MongoDriver.js",
+  "name": "@coderich/postgres-mongodb",
+  "main": "src/PostgresDriver.js",
   "version": "6.16.5",
   "publishConfig": {
     "access": "public"
@@ -10,17 +10,15 @@
     "!__mocks__"
   ],
   "scripts": {
-    "test": "jest --config=jest.config.js",
-    "lint": "eslint ./",
     "dev": "coderich-dev",
+    "lint": "eslint ./",
+    "test": "jest --config=jest.config.js",
     "clinic-test": "clinic flame -- node ../../node_modules/jest/bin/jest.js --config=jest.config.js --runInBand"
   },
   "dependencies": {
-    "@coderich/util": "2.2.3",
-    "mongodb": "6.16.0"
+    "@coderich/util": "2.2.3"
   },
   "devDependencies": {
-    "@coderich/autograph-db-tests": "*",
-    "mongodb-memory-server": "8.13.0"
+    "@coderich/autograph-db-tests": "*"
   }
 }

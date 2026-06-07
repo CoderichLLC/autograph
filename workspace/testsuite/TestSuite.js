@@ -1135,10 +1135,10 @@ module.exports = () => describe('TestSuite', () => {
       };
       Emitter.on('preQuery', scopingHook);
 
-      // Spy on the underlying mongo driver. Each #resolve clustering step results in 1 spy hit
+      // Spy on the underlying mongo driver. Each execute() call results in 1 spy hit
       // per Mongo round-trip — the assertion is on the count.
       const client = global.mongoClient;
-      const spy = jest.spyOn(client, 'resolve');
+      const spy = jest.spyOn(client, 'execute');
 
       try {
         // Make sure caches are clean so each Book lookup goes through #resolve.

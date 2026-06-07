@@ -7,7 +7,7 @@ const Loader = require('./Loader');
 const DataLoader = require('./DataLoader');
 const Transaction = require('./Transaction');
 const Pipeline = require('./Pipeline');
-const { buildSelectionTree } = require('../service/AppService');
+const { inspect, buildSelectionTree } = require('../service/AppService');
 const { $QUERY, $RAW } = require('../service/Symbols');
 
 const loaders = {};
@@ -215,19 +215,26 @@ module.exports = class Resolver {
     const currSession = this.#sessions.at(-1);
 
     if (isMutation) {
-      thunk = tquery => this.#schema.models[model].source.client.resolve(tquery.toDriver().toObject()).then((results) => {
-        // We clear the cache immediately (regardless if we're in transaction or not)
-        this.clear(model);
+      thunk = (tquery) => {
+        const { client } = this.#schema.models[model].source;
+        const driverQuery = tquery.toDriver().toObject();
+        const plan = client.prepare(driverQuery);
+        if (driverQuery.flags?.debug) inspect(plan);
 
-        // If we're in a transaction, we clear the cache of all sessions when this session resolves
-        currSession?.thunks.push(...this.#sessions.map(s => () => s.parent.clear(model)));
+        return client.execute(plan).then((results) => {
+          // We clear the cache immediately (regardless if we're in transaction or not)
+          this.clear(model);
 
-        // Return results
-        if (crud === 'delete') return doc;
-        // Pass mutation's selection set through so the returned doc applies the same eager/lazy
-        // split as reads. Mutations have info too — caller uses .info(info) before save/delete.
-        return this.toResultSet(model, results, query.toObject().info);
-      });
+          // If we're in a transaction, we clear the cache of all sessions when this session resolves
+          currSession?.thunks.push(...this.#sessions.map(s => () => s.parent.clear(model)));
+
+          // Return results
+          if (crud === 'delete') return doc;
+          // Pass mutation's selection set through so the returned doc applies the same eager/lazy
+          // split as reads. Mutations have info too — caller uses .info(info) before save/delete.
+          return this.toResultSet(model, results, query.toObject().info);
+        });
+      };
     } else {
       thunk = (tquery) => {
         const { where, op } = query.toObject();

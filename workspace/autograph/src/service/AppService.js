@@ -1,3 +1,4 @@
+const { inspect } = require('node:util');
 const Util = require('@coderich/util');
 const PicoMatch = require('picomatch');
 const FillRange = require('fill-range');
@@ -14,6 +15,7 @@ exports.mergeDeep = (...args) => DeepMerge.all(args, { isMergeableObject: obj =>
 exports.hashObject = obj => ObjectHash(obj, { respectType: false, respectFunctionNames: false, respectFunctionProperties: false, unorderedArrays: true, ignoreUnknown: true, replacer: r => (ObjectId.isValid(r) ? `${r}` : r) });
 exports.fromGUID = guid => Buffer.from(`${guid}`, 'base64').toString('ascii').split(',');
 exports.guidToId = (autograph, guid) => exports.uvl(exports.fromGUID(guid)[1], guid);
+exports.inspect = (obj, opts = { showHidden: false, colors: true, depth: 5 }) => console.log(inspect(obj, opts)); // eslint-disable-line no-console
 
 exports.getGQLReturnType = (info) => {
   const returnType = `${info.returnType}`;

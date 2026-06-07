@@ -1,6 +1,7 @@
 const get = require('lodash.get');
 const Util = require('@coderich/util');
 const DataLoader = require('dataloader');
+const { inspect } = require('../service/AppService');
 
 module.exports = class Loader {
   #model;
@@ -161,7 +162,9 @@ module.exports = class Loader {
   }
 
   static #runSingle(client, batch) {
-    return client.resolve(batch.$query).then(data => [{ data, ...batch }]);
+    const plan = client.prepare(batch.$query);
+    if (batch.$query.flags?.debug) inspect(plan);
+    return client.execute(plan).then(data => [{ data, ...batch }]);
   }
 
   // Execute one merged query for a cluster, then distribute results back to each original batch
@@ -184,7 +187,10 @@ module.exports = class Loader {
 
     // Below the threshold, individual driver calls are cheaper than the merge overhead.
     if (allValues.length < 3) {
-      return Promise.all(batches.map(b => client.resolve(b.$query).then(data => ({ data, ...b }))));
+      return Promise.all(batches.map((b) => {
+        const plan = client.prepare(b.$query);
+        return client.execute(plan).then(data => ({ data, ...b }));
+      }));
     }
 
     // Preserve every where field — only the batchKey is widened to $in across all values.
@@ -194,9 +200,9 @@ module.exports = class Loader {
     // Split the values into chunks of CHUNK_SIZE; one Mongo query per chunk, all in parallel.
     const chunks = [];
     for (let i = 0; i < allValues.length; i += CHUNK_SIZE) chunks.push(allValues.slice(i, i + CHUNK_SIZE));
-    const chunkQueries = chunks.map(values => ({ ...batches[0].$query, op: 'findMany', where: { ...sharedWhere, [batchKey]: { $in: values } } }));
+    const chunkPlans = chunks.map(values => client.prepare({ ...batches[0].$query, op: 'findMany', where: { ...sharedWhere, [batchKey]: { $in: values } } }));
 
-    return Promise.all(chunkQueries.map(q => client.resolve(q))).then((docsByChunk) => {
+    return Promise.all(chunkPlans.map(plan => client.execute(plan))).then((docsByChunk) => {
       // Dedupe across chunks by id. When the fanout key is an array-valued field (e.g.,
       // NetworkPlace.ancestors), a doc whose array spans multiple chunks is returned by each.
       // Set-based dedupe later compares by reference and can't collapse those JS-distinct
