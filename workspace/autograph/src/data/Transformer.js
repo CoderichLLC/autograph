@@ -46,13 +46,16 @@ module.exports = class Transformer {
     const transformed = Util.map(mixed, (data) => {
       const target = Object.defineProperties({}, {
         $thunks: { value: args.thunks },
-        $userProvided: { value: new Set(Object.keys(data || {})) },
+        $userProvided: { value: Util.isPlainObject(data) ? data : {} },
       });
+
       const $data = Object.assign({}, defaults, data); // eslint-disable-line
+
       // Direct loop instead of Object.assign(new Proxy(...), $data) — avoids the trap
       // round-trip per key. Same semantics as the Proxy.set trap (see #applyKey).
       const keys = Object.keys($data);
       for (let i = 0; i < keys.length; i++) this.#applyKey(target, keys[i], $data[keys[i]]);
+
       // Proxy retained on the *result* so post-transform writes still re-fire pipelines.
       return new Proxy(target, this.#operation);
     });
@@ -88,7 +91,7 @@ module.exports = class Transformer {
       if (value instanceof Promise) {
         target[prop] = previousValue;
         target.$thunks.push(value);
-      } else if (value !== undefined || target.$userProvided.has(prop) || this.#config.keepUndefined) {
+      } else if (value !== undefined || prop in target.$userProvided || this.#config.keepUndefined) {
         target[prop] = value;
       }
     } else if (!this.#config.strictSchema) {

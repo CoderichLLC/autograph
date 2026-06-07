@@ -12,7 +12,8 @@
   "scripts": {
     "test": "jest --config=jest.config.js",
     "lint": "eslint ./",
-    "dev": "coderich-dev"
+    "dev": "coderich-dev",
+    "clinic-test": "clinic flame -- node ../../node_modules/jest/bin/jest.js --config=jest.config.js --runInBand"
   },
   "dependencies": {
     "@coderich/util": "2.2.3",

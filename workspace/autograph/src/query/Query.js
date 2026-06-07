@@ -212,10 +212,12 @@ module.exports = class Query {
       return node;
     }, { key: 'key' });
 
-    // Reconstruct the where clause by pulling out anything that requires a join
+    // Reconstruct the where clause by pulling out anything that requires a join.
+    // Arrays are normalized to { $in: [...] } here (core owns this; drivers receive pre-normalized queries).
     query.where = Object.entries(flatWhere).reduce((prev, [key, value]) => {
       if (this.#model.isJoinPath(key, 'key')) return prev;
       value = Util.map(value, el => (isGlob(el) ? globToRegex(el) : el));
+      if (Array.isArray(value)) value = { $in: value };
       return Object.assign(prev, { [key]: value });
     }, {});
 

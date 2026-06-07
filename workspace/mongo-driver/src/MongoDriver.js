@@ -16,7 +16,6 @@ module.exports = class MongoDriver {
 
   resolve(query) {
     query.options = { ...this.#config.query, ...query.options };
-    if (!query.isWhereNative) query.where = MongoDriver.normalizeWhereClause(query.where);
     if (query.flags.debug) console.log(inspect(query, { showHidden: false, colors: true, depth: 3 }));
     return Util.promiseRetry(() => this[query.op](query), 5, 5, e => e.hasErrorLabel && e.hasErrorLabel('TransientTransactionError'));
   }
@@ -98,13 +97,6 @@ module.exports = class MongoDriver {
   }
 
   static ObjectId = ObjectId;
-
-  static normalizeWhereClause(where) {
-    return Object.entries(Util.flatten(where, { safe: true })).reduce((prev, [key, value]) => {
-      if (Array.isArray(value)) return Object.assign(prev, { [key]: { $in: value } });
-      return Object.assign(prev, { [key]: value });
-    }, {});
-  }
 
   static aggregateJoin(query, join) {
     const { as, to: from, on: foreignField, from: localField, where: $match } = join;

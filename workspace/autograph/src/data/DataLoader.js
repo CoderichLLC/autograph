@@ -194,7 +194,7 @@ module.exports = class Loader {
     // Split the values into chunks of CHUNK_SIZE; one Mongo query per chunk, all in parallel.
     const chunks = [];
     for (let i = 0; i < allValues.length; i += CHUNK_SIZE) chunks.push(allValues.slice(i, i + CHUNK_SIZE));
-    const chunkQueries = chunks.map(values => ({ ...batches[0].$query, op: 'findMany', where: { ...sharedWhere, [batchKey]: values } }));
+    const chunkQueries = chunks.map(values => ({ ...batches[0].$query, op: 'findMany', where: { ...sharedWhere, [batchKey]: { $in: values } } }));
 
     return Promise.all(chunkQueries.map(q => client.resolve(q))).then((docsByChunk) => {
       // Dedupe across chunks by id. When the fanout key is an array-valued field (e.g.,

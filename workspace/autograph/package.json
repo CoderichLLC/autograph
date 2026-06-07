@@ -14,7 +14,8 @@
     "lint": "eslint ./",
     "dev": "coderich-dev",
     "local": "nodemon ./test/server.js -e graphql,js,yml",
-    "clinic": "clinic flame -- node ./test/server"
+    "clinic": "clinic flame -- node ./test/server",
+    "clinic-test": "clinic flame -- node ../../node_modules/jest/bin/jest.js --config=jest.config.js --runInBand"
   },
   "dependencies": {
     "@coderich/util": "2.2.3",
@@ -36,7 +37,6 @@
     "@coderich/autograph-db-tests": "*",
     "@coderich/autograph-mongodb": "*",
     "@graphql-tools/schema": "10.0.0",
-    "clinic": "13.0.0",
     "graphql": "16.8.1",
     "mongodb-memory-server": "8.13.0",
     "nodemon": "3.1.14"

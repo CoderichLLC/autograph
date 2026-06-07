@@ -4,10 +4,12 @@
     "workspace/*"
   ],
   "scripts": {
+    "lint": "eslint ./",
     "test": "npm run test -ws",
-    "lint": "eslint ./"
+    "clinic-test": "npm run clinic-test -ws"
   },
   "devDependencies": {
-    "@coderich/dev": "0.6.3"
+    "@coderich/dev": "0.6.3",
+    "clinic": "13.0.0"
   }
 }
