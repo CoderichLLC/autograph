@@ -14,6 +14,7 @@ npm workspaces under `workspace/`:
 |---------|-------------|
 | `workspace/autograph/` | Core library (`@coderich/autograph`) |
 | `workspace/mongo-driver/` | MongoDB adapter (`@coderich/autograph-mongodb`) |
+| `workspace/postgres-driver/` | PostgreSQL adapter (`@coderich/autograph-pg`) |
 | `workspace/testsuite/` | Shared integration test suite (`@coderich/autograph-db-tests`) |
 
 ## Commands
@@ -135,7 +136,7 @@ emitter.on('postResponse',({ schema, context, resolver, query }) => { ... });
 
 ## Testing
 
-Tests live in `workspace/autograph/test/` and `workspace/mongo-driver/test/`. The shared `@coderich/autograph-db-tests` package (`workspace/testsuite/`) provides `TestSuite.js` — a comprehensive integration suite run by both packages against a MongoDB memory server.
+Tests live in `workspace/autograph/test/` and driver packages. The shared `@coderich/autograph-db-tests` package (`workspace/testsuite/`) provides `TestSuite.js` — a comprehensive integration suite run by each driver package against an in-memory database.
 
 Test setup files (autograph workspace):
 - `jest.prepare.js` — Early bootstrap
@@ -143,6 +144,90 @@ Test setup files (autograph workspace):
 - `jest.service.js` — Starts `mongodb-memory-server`
 
 Files ending in `.testSKIP.js` or `.testNotYet.js` are intentionally excluded from the test run.
+
+## Writing a Driver
+
+A driver is a class with two required methods (`prepare` and `execute`) plus several methods used directly by the TestSuite. Every driver workspace follows the same structure as `workspace/mongo-driver/` or `workspace/postgres-driver/`.
+
+### Driver Contract
+
+```js
+class MyDriver {
+  // Convert an autograph query descriptor into an opaque plan object.
+  // The plan is passed unchanged to execute().
+  prepare(query) { ... }
+
+  // Execute a previously-prepared plan and return results.
+  execute(plan) { ... }
+
+  // Required by TestSuite "Driver Queries" section.
+  // Returns a raw table/collection accessor that bypasses autograph pipelines.
+  driver(name) {
+    return {
+      findOne(where),           // → Promise<row | null>
+      findMany(where),          // → Promise<row[]>
+      find(where),              // → Promise<{ toArray() }>   (MongoDB cursor shape)
+      findOneAndUpdate(where, update),  // update may be { $set: patch } or plain patch
+    };
+  }
+
+  // Required by TestSuite "Bug Fixes" section.
+  // Returns a raw collection accessor.
+  collection(name) {
+    return { query(...args) };  // raw query execution
+  }
+
+  disconnect() { ... }   // called in afterAll
+
+  // Required only if dataSource.supports includes 'transactions'.
+  // Must return: { session, commit(), rollback() }
+  // session is forwarded to every plan via query.options.session.
+  transaction() { ... }
+}
+```
+
+### What `prepare(query)` receives
+
+| Field | Description |
+|---|---|
+| `query.op` | `'findOne'` \| `'findMany'` \| `'count'` \| `'createOne'` \| `'updateOne'` \| `'deleteOne'` \| `'deleteMany'` |
+| `query.model` | Table/collection name string |
+| `query.where` | Flat object. **MongoDB-style operators are pre-flattened by `Util.flatten`** — `{ price: { $ne: -999 } }` arrives as `{ 'price.$ne': -999 }`. Reconstruct before use. |
+| `query.input` | Mutation payload (also flat/dot-notated for nested fields) |
+| `query.sort` | Flat sort object, e.g. `{ name: 'asc' }` |
+| `query.select` | Array of column/field name strings |
+| `query.joins` | Array of join descriptors for populated fields |
+| `query.$schema` | `fn(modelFieldPath) → fieldMeta` — returns field metadata (`isArray`, `isEmbedded`, `type`, `key`, `isPrimaryKey`, `isVirtual`, ...) |
+| `query.options?.session` | Transaction session object; only present when `dataSource.supports` includes `'transactions'` and a transaction is active |
+
+### Transactions
+
+`Transaction.js` checks `supports.includes('transactions')` before calling `client.transaction()`. If `'transactions'` is not in the `supports` array, autograph substitutes a no-op `{ commit: () => null, rollback: () => null }` with **no session** — meaning `query.options?.session` will always be `undefined` and every plan runs outside a transaction, silently.
+
+`transaction()` must return `{ session, commit(), rollback() }`. The `session` value is merged into `query.options` by `QueryResolverTransaction` and forwarded to `prepare()` for every query within that transaction.
+
+### ObjectId shim (non-MongoDB drivers)
+
+The TestSuite uses `global.ObjectId`, `expect.any(ObjectId)`, `ObjectId.isValid()`, and `new ObjectId(id)`. Non-MongoDB drivers should use the provided shim instead of the real MongoDB ObjectId:
+
+```js
+const { createObjectIdShim } = require('@coderich/autograph-db-tests');
+global.ObjectId = createObjectIdShim();
+```
+
+IDs remain plain strings everywhere. `Symbol.hasInstance` is overridden so that any non-empty string satisfies `instanceof ObjectId`, making `expect.any(ObjectId)` pass without wrapping IDs in ObjectId instances.
+
+### ID generation and sort order
+
+The TestSuite implicitly relies on IDs sorting in insertion order (e.g. multi-result assertions compare results in creation order). MongoDB ObjectIds are time-ordered, so this holds naturally. Non-MongoDB drivers **must generate IDs that sort lexicographically in creation order** — random UUIDs will cause intermittent ordering failures. A monotonically-increasing counter formatted as a fixed-width hex string works well:
+
+```js
+let seq = 0;
+function nextId() {
+  const hex = (++seq).toString(16).padStart(32, '0');
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+}
+```
 
 ## Known Issues (from `workspace/autograph/notes`)
 

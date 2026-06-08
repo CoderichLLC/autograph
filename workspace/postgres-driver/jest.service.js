@@ -1,5 +1,5 @@
 const { newDb } = require('pg-mem');
-const { setup } = require('@coderich/autograph-db-tests');
+const { setup, createObjectIdShim } = require('@coderich/autograph-db-tests');
 const PostgresDriver = require('./src/PostgresDriver');
 
 // Map autograph field metadata to a Postgres column type.
@@ -36,29 +36,9 @@ exports.setup = async () => {
   const { Pool } = pgMem.adapters.createPg();
   const pool = new Pool();
 
-  // ObjectId shim used by the shared TestSuite.
-  // IDs are plain strings everywhere — we override Symbol.hasInstance so that
-  // `expect.any(ObjectId)` and `x instanceof ObjectId` both pass for non-empty strings.
-  global.ObjectId = class ObjectId {
-    constructor(id) {
-      this._id = (id && typeof id === 'object' && '_id' in id) ? id._id : String(id);
-    }
-
-    toString() { return this._id; }
-    valueOf() { return this._id; }
-
-    static isValid(v) {
-      const str = (v && typeof v === 'object' && '_id' in v) ? v._id : v;
-      return typeof str === 'string' && str.length > 0;
-    }
-
-    // Allow plain non-empty strings to satisfy `instanceof ObjectId` checks.
-    // This lets `expect.any(ObjectId)` pass for plain string IDs returned from queries.
-    static [Symbol.hasInstance](v) {
-      if (v !== null && typeof v === 'object' && Object.getPrototypeOf(v) === global.ObjectId.prototype) return true;
-      return typeof v === 'string' && v.length > 0;
-    }
-  };
+  // ObjectId shim: IDs are plain strings; Symbol.hasInstance override makes
+  // `expect.any(ObjectId)` pass for non-empty strings. See testsuite/index.js.
+  global.ObjectId = createObjectIdShim();
 
   global.postgresClient = new PostgresDriver({ pool });
 
