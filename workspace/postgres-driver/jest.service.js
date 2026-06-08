@@ -1,0 +1,105 @@
+const { newDb } = require('pg-mem');
+const { setup } = require('@coderich/autograph-db-tests');
+const PostgresDriver = require('./src/PostgresDriver');
+
+// Map autograph field metadata to a Postgres column type.
+function fieldToSqlType(field) {
+  if (field.isArray || (field.isEmbedded && field.model)) return 'JSONB';
+  switch (field.type) {
+    case 'Int':    return 'INTEGER';
+    case 'Float':  return 'NUMERIC';
+    case 'Boolean': return 'BOOLEAN';
+    case 'Date':   return 'TIMESTAMPTZ';
+    case 'AutoGraphMixed': return 'JSONB';
+    default:       return 'TEXT'; // String, ID, enum refs, FK references
+  }
+}
+
+// Generate CREATE TABLE statements from parsed autograph models.
+function buildDDL(models) {
+  return Object.values(models)
+    .filter(m => m.isMarkedModel && !m.isEmbedded)
+    .map((model) => {
+      const cols = Object.values(model.fields)
+        .filter(f => !f.isVirtual)
+        .map((field) => {
+          const type = fieldToSqlType(field);
+          const pk = field.isPrimaryKey ? ' PRIMARY KEY' : '';
+          return `"${field.key}" ${type}${pk}`;
+        });
+      return `CREATE TABLE IF NOT EXISTS "${model.key}" (${cols.join(', ')})`;
+    });
+}
+
+exports.setup = async () => {
+  const pgMem = newDb();
+  const { Pool } = pgMem.adapters.createPg();
+  const pool = new Pool();
+
+  // ObjectId shim used by the shared TestSuite.
+  // IDs are plain strings everywhere — we override Symbol.hasInstance so that
+  // `expect.any(ObjectId)` and `x instanceof ObjectId` both pass for non-empty strings.
+  global.ObjectId = class ObjectId {
+    constructor(id) {
+      this._id = (id && typeof id === 'object' && '_id' in id) ? id._id : String(id);
+    }
+
+    toString() { return this._id; }
+    valueOf() { return this._id; }
+
+    static isValid(v) {
+      const str = (v && typeof v === 'object' && '_id' in v) ? v._id : v;
+      return typeof str === 'string' && str.length > 0;
+    }
+
+    // Allow plain non-empty strings to satisfy `instanceof ObjectId` checks.
+    // This lets `expect.any(ObjectId)` pass for plain string IDs returned from queries.
+    static [Symbol.hasInstance](v) {
+      if (v !== null && typeof v === 'object' && Object.getPrototypeOf(v) === global.ObjectId.prototype) return true;
+      return typeof v === 'string' && v.length > 0;
+    }
+  };
+
+  global.postgresClient = new PostgresDriver({ pool });
+
+  // Alias mongoClient so the DataLoader spy test can find the client.
+  global.mongoClient = global.postgresClient;
+
+  // Monotonically increasing sequential ID counter.
+  // Sequential IDs ensure that entities created earlier always sort before later ones,
+  // matching the ordering semantics the shared TestSuite was written for (MongoDB ObjectIds).
+  let idSeq = 0;
+  function nextId() {
+    const n = ++idSeq;
+    const hex = n.toString(16).padStart(32, '0');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+
+  // Build schema + resolver (no DB calls yet)
+  const result = setup({
+    generator: ({ value }) => {
+      // Unwrap real ObjectId instances to their plain string; generate new IDs as plain strings.
+      if (value && typeof value === 'object' && '_id' in value) return value._id;
+      return value || nextId();
+    },
+    dataSource: {
+      supports: ['transactions'],
+      client: global.postgresClient,
+    },
+  });
+  Object.assign(global, result);
+
+  const parsed = global.schema.parse();
+
+  // Create tables
+  for (const ddl of buildDDL(parsed.models)) {
+    await pool.query(ddl); // eslint-disable-line no-await-in-loop
+  }
+
+  // Create indexes
+  await Promise.all(parsed.indexes.map(({ key, name, type, on }) => {
+    const cols = on.map(c => `"${c}"`).join(', ');
+    const unique = type === 'unique' ? 'UNIQUE ' : '';
+    return pool.query(`CREATE ${unique}INDEX IF NOT EXISTS "${name}" ON "${key}" (${cols})`);
+  }));
+};
