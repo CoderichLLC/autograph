@@ -537,7 +537,7 @@ function parseSchema(config, typeDefs) {
             const on = $field.linkTo.fields[$field.isVirtual ? $field.linkBy : $field.fkField].key;
             const from = $field.linkField.key;
             const as = `join_${to}`;
-            $field.join = { to, on, from, as };
+            $field.join = { to, on, from, as, toSource: $field.model.source };
             $field.pipelines.validate.push('ensureFK'); // Absolute Last
           }
         });

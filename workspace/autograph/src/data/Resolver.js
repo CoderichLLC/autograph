@@ -2,6 +2,7 @@ const { graphql } = require('graphql');
 const Boom = require('@hapi/boom');
 const Util = require('@coderich/util');
 const QueryResolver = require('../query/QueryResolver');
+const QueryPlanner = require('../query/QueryPlanner');
 const Emitter = require('./Emitter');
 const Loader = require('./Loader');
 const DataLoader = require('./DataLoader');
@@ -17,6 +18,7 @@ module.exports = class Resolver {
   #xschema;
   #context;
   #dataLoaders;
+  #queryPlanner; // lazy — created on first read (needs `this` fully constructed)
   #docClasses = {}; // Per-(resolver, model) Class cache — prototype hosts $, $model, $save, $lookup
   #sessions = []; // Holds nested 2D array of transactions
 
@@ -250,7 +252,8 @@ module.exports = class Resolver {
           }
         }
 
-        return this.#dataLoaders[model].resolve(tquery);
+        this.#queryPlanner ??= new QueryPlanner(this.#schema, this);
+        return this.#queryPlanner.resolve(model, tquery, rq => this.#dataLoaders[model].resolve(rq));
       };
     }
 
