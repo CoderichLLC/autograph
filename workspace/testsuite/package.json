@@ -1,6 +1,6 @@
 {
   "name": "@coderich/autograph-db-tests",
-  "version": "0.14.19",
+  "version": "0.15.0",
   "publishConfig": {
     "access": "public"
   },
@@ -8,8 +8,10 @@
     "dev": "coderich-dev"
   },
   "dependencies": {
-    "@coderich/autograph": "*",
     "validator": "13.15.22"
+  },
+  "peerDependencies": {
+    "@coderich/autograph": "0.15.x"
   },
   "devDependencies": {}
 }

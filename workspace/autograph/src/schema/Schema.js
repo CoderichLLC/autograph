@@ -9,6 +9,9 @@ const { generateApi, getConnectionArguments } = require('./SchemaApi');
 
 const interfaceKinds = [Kind.INTERFACE_TYPE_DEFINITION, Kind.INTERFACE_TYPE_EXTENSION];
 const modelKinds = [Kind.OBJECT_TYPE_DEFINITION, Kind.OBJECT_TYPE_EXTENSION].concat(interfaceKinds);
+// Inheritance injects fields into the canonical *definition* nodes only. Injecting into both a type's
+// definition AND its extension would declare the same field twice ("Field X can only be defined once").
+const inheritKinds = [Kind.OBJECT_TYPE_DEFINITION, Kind.INTERFACE_TYPE_DEFINITION];
 const operations = ['Query', 'Mutation', 'Subscription'];
 
 module.exports = class Schema {
@@ -110,10 +113,72 @@ module.exports = class Schema {
   }
 
   /**
+   * Interface -> implementer field inheritance.
+   *
+   * GraphQL has no object-type `extends`: a type that `implements` an interface must physically declare
+   * every interface field or `makeExecutableSchema` throws. Rather than re-declare them in every `.graphql`,
+   * copy each interface's fields (with their directives) into its implementers, add-if-absent so an
+   * implementer's own declaration always wins (covariant narrowing / per-field directive overrides).
+   *
+   * Runs before parse() builds models, so the inherited fields reach BOTH the emitted typeDefs (valid
+   * executable schema) AND the internal $schema (inherited @field directives/pipelines/defaults apply to
+   * the concrete model). Safe to make automatic: GraphQL already mandates implementers expose every
+   * interface field, so this can only remove boilerplate, never produce an invalid schema. Schemas that
+   * still re-declare (the legacy pattern) are unaffected — the field is already present, so injection skips it.
+   */
+  #inheritInterfaceFields() {
+    // Index interface field sets by name, unioning definition + extension nodes. Also record what each
+    // interface itself implements, for transitive (interface-implements-interface) resolution.
+    const interfaceFields = {}; // name -> Map(fieldName -> FieldDefinitionNode)
+    const interfaceParents = {}; // name -> [parent interface names]
+
+    this.#typeDefs.definitions.forEach((node) => {
+      if (!interfaceKinds.includes(node.kind)) return;
+      const name = node.name.value;
+      const fields = (interfaceFields[name] ??= new Map());
+      (node.fields || []).forEach(f => fields.has(f.name.value) || fields.set(f.name.value, f));
+      (interfaceParents[name] ??= []).push(...(node.interfaces || []).map(i => i.name.value));
+    });
+
+    // Expand each interface's field set with its parents' fields, resolving in dependency order.
+    const resolving = new Set();
+    const resolved = new Set();
+    const expand = (name) => {
+      if (resolved.has(name) || !interfaceFields[name]) return;
+      if (resolving.has(name)) throw new Error(`Interface inheritance cycle detected at "${name}"`);
+      resolving.add(name);
+      (interfaceParents[name] || []).forEach((parent) => {
+        expand(parent);
+        interfaceFields[parent]?.forEach((f, fname) => interfaceFields[name].has(fname) || interfaceFields[name].set(fname, f));
+      });
+      resolving.delete(name);
+      resolved.add(name);
+    };
+    Object.keys(interfaceFields).forEach(expand);
+
+    // Inject the (transitively resolved) interface fields into each implementing definition, existing-wins.
+    const config = { noLocation: true, onFieldTypeConflict: (f, a, b) => a };
+    this.#typeDefs = visit(this.#typeDefs, {
+      enter: (node) => {
+        if (!inheritKinds.includes(node.kind) || operations.includes(node.name.value)) return undefined;
+        // Union the implemented interfaces' fields by name (a type may implement an interface AND its
+        // parent, e.g. `implements Mid & Base`, surfacing the same field twice).
+        const incoming = new Map();
+        (node.interfaces || []).forEach(i => interfaceFields[i.name.value]?.forEach((f, fname) => incoming.has(fname) || incoming.set(fname, f)));
+        if (!incoming.size) return undefined;
+        return { ...node, fields: mergeFields(node, node.fields || [], [...incoming.values()], config) };
+      },
+    });
+
+    return this;
+  }
+
+  /**
    * Parse typeDefs; returning a schema POJO
    */
   parse() {
     if (this.#schema) return this.#schema;
+    this.#inheritInterfaceFields();
     const { schema, typeDefs } = parseSchema(this.#config, this.#typeDefs);
     this.#schema = schema;
     this.#typeDefs = typeDefs;

@@ -192,3 +192,125 @@ describe('Interface', () => {
     });
   });
 });
+
+// interface -> implementer field inheritance: an implementer need only declare its OWN fields; the
+// interface's fields are copied in automatically (with their directives), so makeExecutableSchema
+// succeeds without re-declaration. This is the AG15 DRY-SDL feature.
+describe('Interface field inheritance', () => {
+  const { GraphQLNonNull } = require('graphql');
+
+  test('an implementer that declares only its own field still satisfies the interface', () => {
+    const td = `
+      type Garage @model(key: "garage") { id: ID! vehicles: [Vehicle!] }
+      interface Vehicle @model(embed: true, discriminator: "kind") { kind: String! wheels: Int }
+      type Car implements Vehicle @model(embed: true, typeKey: "car") { doors: Int }
+    `;
+    const executable = makeExecutableSchema(new Schema({}).merge(td).api().toObject()); // would throw if Car lacked kind/wheels
+    const fields = executable.getType('Car').getFields();
+    expect(fields).toHaveProperty('kind'); // inherited
+    expect(fields).toHaveProperty('wheels'); // inherited
+    expect(fields).toHaveProperty('doors'); // own
+  });
+
+  test('the implementer wins on conflict — a covariant (non-null) override is preserved, not overwritten', () => {
+    const td = `
+      type Catalog @model(key: "catalog") { id: ID! items: [Item!] }
+      interface Item @model(embed: true) { id: ID! label: String }
+      type Widget implements Item @model(embed: true) { label: String! }
+    `;
+    const fields = makeExecutableSchema(new Schema({}).merge(td).api().toObject()).getType('Widget').getFields();
+    expect(fields).toHaveProperty('id'); // inherited
+    expect(fields.label.type).toBeInstanceOf(GraphQLNonNull); // Widget's String! kept; NOT clobbered by interface's String
+  });
+
+  // Inheritance copies the whole FieldDefinitionNode (incl. its directive AST), so parse() processes the
+  // interface's @field directives ON the concrete model — they don't just appear, they take effect:
+  // default -> create-transform default, key -> storage column, serialize -> serialize pipeline,
+  // persist -> non-persistable. Asserted against the interface's own field, so it's a true copy.
+  test('inherited fields carry their interface @field directives and they take effect on the concrete model', () => {
+    const td = `
+      type Shelf @model(key: "shelf") { id: ID! books: [Book!] }
+      interface Book @model(embed: true) {
+        order: Int! @field(default: 0)
+        isbn: String @field(key: "isbn_10")
+        title: String @field(serialize: toUpperCase)
+        draft: String @field(persist: false)
+      }
+      type Novel implements Book @model(embed: true) { author: String }
+    `;
+    const { Novel, Book } = new Schema({}).merge(td).parse().models;
+
+    // @field(default:) -> feeds the create transformer's defaults (SchemaParser create defaults: curr.defaultValue)
+    expect(Novel.fields.order.defaultValue).toBeDefined();
+    expect(Novel.fields.order.defaultValue).toEqual(Book.fields.order.defaultValue);
+    // @field(key:) -> remapped storage column
+    expect(Novel.fields.isbn.key).toBe('isbn_10');
+    // @field(serialize:) -> serialize pipeline (executed lazily by Pipeline.$serialize at transform time)
+    expect(Novel.fields.title.pipelines.serialize).toContain('toUpperCase');
+    expect(Novel.fields.title.pipelines.serialize).toEqual(Book.fields.title.pipelines.serialize);
+    // @field(persist:) -> non-persistable
+    expect(Novel.fields.draft.isPersistable).toBe(false);
+  });
+
+  test('inheritance is transitive (interface implementing interface)', () => {
+    const td = `
+      type Box @model(key: "box") { id: ID! things: [Leaf!] }
+      interface Base @model(embed: true) { a: String }
+      interface Mid implements Base @model(embed: true) { b: String }
+      type Leaf implements Mid & Base @model(embed: true) { c: String }
+    `;
+    const executable = makeExecutableSchema(new Schema({}).merge(td).api().toObject());
+    const leaf = executable.getType('Leaf').getFields();
+    expect(Object.keys(leaf)).toEqual(expect.arrayContaining(['a', 'b', 'c'])); // grandparent + parent + own
+    const mid = executable.getType('Mid').getFields();
+    expect(Object.keys(mid)).toEqual(expect.arrayContaining(['a', 'b'])); // child interface also gets grandparent field
+  });
+
+  // Transparency: removing the redeclarations must NOT change either interface-input flow. (The
+  // global-schema write-round-trip / oneOf-dispatch tests above are the runtime counterpart — they
+  // pass identically whether or not the implementer fixtures redeclare interface fields.)
+  test('fat-input flow is unchanged: interface input still aggregates the union; __resolveType still wired', () => {
+    const td = `
+      type Zoo @model(key: "zoo") { id: ID! animals: [Animal!] }
+      interface Animal @model(embed: true, discriminator: "kind") { kind: String! name: String! }
+      type Dog implements Animal @model(embed: true, typeKey: "k9") { barkVolume: Int }
+      type Cat implements Animal @model(embed: true, typeKey: "feline") { livesLeft: Int }
+    `;
+    const obj = new Schema({}).merge(td).api().toObject();
+    const input = makeExecutableSchema(obj).getType('AnimalInputCreate').getFields();
+    expect(input).toHaveProperty('name'); // interface field (implementers no longer redeclare it)
+    expect(input).toHaveProperty('barkVolume'); // Dog-only, aggregated onto the fat input
+    expect(input).toHaveProperty('livesLeft'); // Cat-only, aggregated onto the fat input
+    // __resolveType maps the inherited discriminator value -> concrete type
+    expect(obj.resolvers.Animal.__resolveType({ kind: 'k9' })).toBe('Dog');
+    expect(obj.resolvers.Animal.__resolveType({ kind: 'feline' })).toBe('Cat');
+  });
+
+  test('oneOf flow is unchanged: @oneOf input keyed by typeKey; branch inputs carry inherited + own fields; dispatcher intact', () => {
+    const td = `
+      type Shelter @model(key: "shelter") { id: ID! residents: [Critter!] }
+      interface Critter @model(embed: true, discriminator: "kind", oneOf: true) { kind: String! name: String! }
+      type Pup implements Critter @model(embed: true, typeKey: "k9") { barkVolume: Int }
+      type Kitty implements Critter @model(embed: true, typeKey: "feline") { livesLeft: Int }
+    `;
+    const schema = new Schema({}).merge(td);
+    const $schema = schema.parse(); // internal model (drives the write-path unwrap/route/stamp)
+    const executable = makeExecutableSchema(schema.api().toObject());
+
+    const createInput = executable.getType('CritterInputCreate');
+    expect(createInput.isOneOf).toBe(true);
+    const branches = createInput.getFields();
+    expect(branches).toHaveProperty('k9');
+    expect(branches).toHaveProperty('feline');
+    expect(String(branches.k9.type)).toBe('PupInputCreate');
+
+    // The concrete branch input still contains the inherited interface field plus its own.
+    const pupInput = executable.getType('PupInputCreate').getFields();
+    expect(pupInput).toHaveProperty('name'); // inherited from Critter
+    expect(pupInput).toHaveProperty('barkVolume'); // own
+
+    // Internal dispatch wiring survives: oneOf flag + typeKey -> concrete-type registry.
+    expect($schema.models.Critter.oneOf).toBe(true);
+    expect($schema.models.Critter.typeMap).toMatchObject({ k9: 'Pup', feline: 'Kitty' });
+  });
+});
