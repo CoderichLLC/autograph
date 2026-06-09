@@ -85,23 +85,20 @@ module.exports = class QueryPlanner {
       // Only pre-query when filtering BY a property of the related model (sub-path present)
       if (!field?.isFKReference || !subParts.length || !field.model?.source || field.model.source === rootSource) {
         sameSourceWhere[path] = value;
-        continue;
+      } else {
+        if (!whereGroupsByField[fieldName]) {
+          whereGroupsByField[fieldName] = {
+            fieldName,
+            conditions: {},
+            // Where to inject the $in result on THIS model's where clause
+            localInjectField: field.isVirtual ? model.pkField : fieldName,
+            // Which field to SELECT from the foreign model (gives us the values to inject)
+            foreignSelectField: field.isVirtual ? field.linkBy : field.fkField,
+            foreignModelName: field.model.name,
+          };
+        }
+        whereGroupsByField[fieldName].conditions[subParts.join('.')] = value;
       }
-
-      if (!whereGroupsByField[fieldName]) {
-        whereGroupsByField[fieldName] = {
-          fieldName,
-          field,
-          conditions: {},
-          // Where to inject the $in result on THIS model's where clause
-          localInjectField: field.isVirtual ? model.pkField : fieldName,
-          // Which field to SELECT from the foreign model (gives us the values to inject)
-          foreignSelectField: field.isVirtual ? field.linkBy : field.fkField,
-          foreignModelName: field.model.name,
-        };
-      }
-
-      whereGroupsByField[fieldName].conditions[subParts.join('.')] = value;
     }
 
     const crossSourceWhere = Object.values(whereGroupsByField);
@@ -110,7 +107,6 @@ module.exports = class QueryPlanner {
     // If ANY key is cross-source, ALL sort + ALL pagination is stripped from the driver
     // query and applied in-memory after augmenting results with foreign sort values.
     const sortSpec = []; // full sort spec in original priority order, for in-memory sort
-    const sameSourceSort = {};
 
     for (const [path, direction] of Object.entries(flatSort)) {
       const [fieldName, ...subParts] = path.split('.');
@@ -120,21 +116,24 @@ module.exports = class QueryPlanner {
         field?.isFKReference && subParts.length && field.model?.source && field.model.source !== rootSource,
       );
 
+      let localFKField = null;
+      let foreignLookupField = null;
+      if (isCrossSource) {
+        localFKField = field.isVirtual ? model.pkField : fieldName;
+        foreignLookupField = field.isVirtual ? field.linkBy : field.fkField;
+      }
+
       sortSpec.push({
-        path,           // original path, e.g. 'author.name'
+        path,
         dir,
         isCrossSource,
         augmentKey: isCrossSource ? `__xsort_${fieldName}` : null,
-        // Cross-source-specific fields (null for same-source)
         fieldName: isCrossSource ? fieldName : null,
-        field: isCrossSource ? field : null,
-        sortPath: isCrossSource ? subParts.join('.') : null,   // sub-path within foreign model
-        localFKField: isCrossSource ? (field.isVirtual ? model.pkField : fieldName) : null,
-        foreignLookupField: isCrossSource ? (field.isVirtual ? field.linkBy : field.fkField) : null,
+        sortPath: isCrossSource ? subParts.join('.') : null, // sub-path within foreign model
+        localFKField,
+        foreignLookupField,
         foreignModelName: isCrossSource ? field.model.name : null,
       });
-
-      if (!isCrossSource) sameSourceSort[path] = direction;
     }
 
     const crossSourceSort = sortSpec.filter(s => s.isCrossSource);
@@ -147,7 +146,6 @@ module.exports = class QueryPlanner {
       crossSourceSort,
       sortSpec,
       sameSourceWhere,
-      sameSourceSort,
       originalPagination: { op, limit, skip, first, last, before, after, isCursorPaging },
     };
   }
@@ -162,21 +160,25 @@ module.exports = class QueryPlanner {
    * Returns null if any pre-query produces no results (guaranteed empty primary result).
    */
   async #preResolve(plan, tquery) {
-    const { crossSourceWhere, crossSourceSort, sameSourceWhere, sameSourceSort, op } = plan;
+    const { crossSourceWhere, crossSourceSort, sameSourceWhere, op } = plan;
     const rawQuery = tquery.toObject();
 
     // Start from the same-source where paths only
     const rewrittenWhere = Util.unflatten(sameSourceWhere, { safe: true });
 
-    for (const { field, conditions, localInjectField, foreignSelectField, foreignModelName } of crossSourceWhere) {
-      const foreignDocs = await this.#resolver.match(foreignModelName)
+    const preQueryResults = await Promise.all(
+      crossSourceWhere.map(({ conditions, localInjectField, foreignSelectField, foreignModelName }) => this.#resolver.match(foreignModelName)
         .where(conditions)
         .select([foreignSelectField])
-        .many();
+        .many()
+        .then(docs => ({
+          localInjectField,
+          ids: docs.map(d => d[foreignSelectField]).flat().filter(Boolean),
+        }))),
+    );
 
-      const ids = foreignDocs.map(d => d[foreignSelectField]).flat().filter(Boolean);
+    for (const { localInjectField, ids } of preQueryResults) {
       if (!ids.length) return null; // short-circuit — no primary results possible
-
       // Inject as array; Query.#finalize() normalises arrays to { $in: [...] }
       rewrittenWhere[localInjectField] = ids;
     }
@@ -225,16 +227,16 @@ module.exports = class QueryPlanner {
     if (results == null || typeof results === 'number') return results;
     if (!Array.isArray(results) || !results.length) return results;
 
-    // Batch-fetch sort values from each foreign source and augment result docs
-    for (const sortEntry of crossSourceSort) {
-      const { localFKField, foreignLookupField, foreignModelName, sortPath, augmentKey, field } = sortEntry;
+    // Batch-fetch sort values from each foreign source and augment result docs (in parallel)
+    await Promise.all(crossSourceSort.map(async (sortEntry) => {
+      const { localFKField, foreignLookupField, foreignModelName, sortPath, augmentKey } = sortEntry;
 
       // Collect the FK values from the primary results
       const fkValues = [...new Set(
         results.map(doc => doc[localFKField]).flat().filter(Boolean).map(String),
       )];
 
-      if (!fkValues.length) continue;
+      if (!fkValues.length) return;
 
       // Select just enough from the foreign model to build the sort map
       const topSortField = sortPath ? sortPath.split('.')[0] : null;
@@ -263,7 +265,7 @@ module.exports = class QueryPlanner {
           enumerable: false,
         });
       });
-    }
+    }));
 
     // In-memory multi-key stable sort using the full original sort spec (priority order preserved)
     results.sort((a, b) => {
@@ -272,12 +274,14 @@ module.exports = class QueryPlanner {
         const bVal = augmentKey != null ? b[augmentKey] : get(b, path);
 
         // Nulls sort last regardless of direction
-        if (aVal == null && bVal == null) continue;
-        if (aVal == null) return 1;
-        if (bVal == null) return -1;
-
-        const cmp = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
-        if (cmp !== 0) return dir === 'asc' ? cmp : -cmp;
+        if (aVal != null || bVal != null) {
+          if (aVal == null) return 1;
+          if (bVal == null) return -1;
+          let cmp = 0;
+          if (aVal < bVal) cmp = -1;
+          else if (aVal > bVal) cmp = 1;
+          if (cmp !== 0) return dir === 'asc' ? cmp : -cmp;
+        }
       }
       return 0;
     });
@@ -285,7 +289,7 @@ module.exports = class QueryPlanner {
     // Apply pagination in-memory
     let paginated;
     if (isCursorPaging) {
-      paginated = this.#applyCursorPagination(results, { first, last, before, after }, sortSpec);
+      paginated = QueryPlanner.#applyCursorPagination(results, { first, last, before, after }, sortSpec);
     } else {
       let sliced = results;
       if (skip) sliced = sliced.slice(skip);
@@ -314,7 +318,7 @@ module.exports = class QueryPlanner {
    *
    * `first`/`last` already include the +2 bookend adjustment added by QueryBuilder.
    */
-  #applyCursorPagination(results, { first, last, before, after }, sortSpec) {
+  static #applyCursorPagination(results, { first, last, before, after }, sortSpec) {
     // Encode a $cursor on every doc using the current sort field values
     if (sortSpec.length) {
       results.forEach((doc) => {
@@ -349,8 +353,13 @@ module.exports = class QueryPlanner {
     if (limiter) {
       const overage = results.length - (limiter - 2);
       if (overage > 0) {
-        if (first) { results.splice(-overage); hasNextPage = true; }
-        else { results.splice(0, overage); hasPreviousPage = true; }
+        if (first) {
+          results.splice(-overage);
+          hasNextPage = true;
+        } else {
+          results.splice(0, overage);
+          hasPreviousPage = true;
+        }
       }
     }
 

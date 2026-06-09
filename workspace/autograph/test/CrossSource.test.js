@@ -12,15 +12,11 @@
  * does NOT share state with the global jest.setup.js resolver.
  */
 
-// eslint-disable-next-line import/no-extraneous-dependencies
 const { MongoMemoryReplSet } = require('mongodb-memory-server');
-// eslint-disable-next-line import/no-extraneous-dependencies
 const { newDb } = require('pg-mem');
-// eslint-disable-next-line import/no-extraneous-dependencies
 const MongoClient = require('@coderich/autograph-mongodb');
-// eslint-disable-next-line import/no-extraneous-dependencies
 const PostgresDriver = require('@coderich/autograph-postgres');
-const { Schema, Resolver } = require('@coderich/autograph');
+const { Schema, Resolver } = require('..');
 
 // Sequential string IDs — identical generator for both sources.
 // Plain strings work as MongoDB _id and Postgres TEXT, avoiding ObjectId conversion.
@@ -53,10 +49,6 @@ let mongoServer;
 let alice;
 let bob;
 let carol;
-let rockA;
-let rockB;
-let jazzA;
-let classicalA;
 
 beforeAll(async () => {
   // --- MongoDB (Musician) ---
@@ -95,9 +87,9 @@ beforeAll(async () => {
       .filter(f => !f.isVirtual)
       .map((field) => {
         const pk = field.isPrimaryKey ? ' PRIMARY KEY' : '';
-        const type = (field.isArray || (field.isEmbedded && field.model)) ? 'JSONB'
-          : field.type === 'Int' ? 'INTEGER'
-          : 'TEXT';
+        let type = 'TEXT';
+        if (field.isArray || (field.isEmbedded && field.model)) type = 'JSONB';
+        else if (field.type === 'Int') type = 'INTEGER';
         return `"${field.key}" ${type}${pk}`;
       });
     // eslint-disable-next-line no-await-in-loop
@@ -112,7 +104,7 @@ beforeAll(async () => {
   ]);
 
   // Seed Albums into Postgres (Alice has two so multi-result WHERE can be tested)
-  [rockA, rockB, jazzA, classicalA] = await Promise.all([
+  await Promise.all([
     resolver.match('Album').save({ title: 'Rock A', year: 2000, musician: alice.id }),
     resolver.match('Album').save({ title: 'Rock B', year: 2005, musician: alice.id }),
     resolver.match('Album').save({ title: 'Jazz A', year: 2010, musician: bob.id }),
