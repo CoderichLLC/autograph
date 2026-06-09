@@ -127,4 +127,68 @@ describe('Interface', () => {
       expect(input.critters[0]).toMatchObject({ name: 'Rex', barkVolume: 7 });
     });
   });
+
+  // @oneOf interface input dispatch: the write carries a polymorphic wrapper { <typeKey>: {...} }.
+  // The runtime must unwrap the single key, route the inner value through the CONCRETE model's
+  // transformer, stamp the discriminator (= typeKey) so reads can __resolveType, and produce a
+  // FLAT concrete doc (no wrapper key) — not the fat-input shape.
+  describe('oneOf interface input dispatch (global schema)', () => {
+    let schema, resolver, factory;
+
+    beforeAll(() => {
+      ({ schema, resolver } = global);
+      factory = model => new QueryBuilder({ resolver, schema, query: { model }, context: {} });
+    });
+
+    test('create unwraps the oneOf key, routes to the concrete model, and stamps the discriminator', async () => {
+      const { input } = (await factory('Keeper').save({
+        name: 'Bob',
+        varmints: [
+          { k9: { name: 'Rex', barkVolume: 11 } },
+          { cat: { name: 'Felix', livesLeft: 9 } },
+        ],
+      }).transform()).toObject();
+
+      expect(input.varmints[0]).toMatchObject({ kind: 'k9', name: 'Rex', barkVolume: 11 });
+      expect(input.varmints[0].k9).toBeUndefined(); // unwrapped, not nested
+      expect(input.varmints[1]).toMatchObject({ kind: 'cat', name: 'Felix', livesLeft: 9 });
+      expect(input.varmints[1].cat).toBeUndefined();
+    });
+
+    test('update dispatches the oneOf key the same way', async () => {
+      const { input } = (await factory('Keeper').id('000000000000000000000001').save({
+        varmints: [{ k9: { name: 'Rex', barkVolume: 7 } }],
+      }).transform()).toObject();
+
+      expect(input.varmints[0]).toMatchObject({ kind: 'k9', name: 'Rex', barkVolume: 7 });
+      expect(input.varmints[0].k9).toBeUndefined();
+    });
+  });
+
+  // The Resolver/ORM path has no GraphQL selection set, so interfaces should be fully transparent:
+  // a real save -> read returns each concrete doc with its TYPE-SPECIFIC fields (barkVolume for the
+  // dog, livesLeft for the cat) and no `... on` gymnastics. This is the actual DB round-trip (mongo
+  // memory server via global.resolver), not just the transform pipeline.
+  describe('Resolver path transparency (no `... on` required)', () => {
+    let resolver;
+
+    beforeAll(() => { ({ resolver } = global); });
+
+    test('save + read an embedded interface returns concrete type-specific fields transparently', async () => {
+      const owner = await resolver.match('Owner').save({
+        name: 'Transparent',
+        critters: [
+          { kind: 'k9', name: 'Rex', barkVolume: 11 },
+          { kind: 'cat', name: 'Felix', livesLeft: 9 },
+        ],
+      });
+
+      const read = await resolver.match('Owner').id(owner.id).one();
+
+      expect(read.critters[0]).toMatchObject({ kind: 'k9', name: 'Rex', barkVolume: 11 });
+      expect(read.critters[1]).toMatchObject({ kind: 'cat', name: 'Felix', livesLeft: 9 });
+      // Probe: is the GraphQL __typename present on the plain resolver read? (Documenting behavior.)
+      console.log('[transparency probe] __typename on resolver read:', read.critters[0].__typename); // eslint-disable-line no-console
+    });
+  });
 });

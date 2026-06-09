@@ -1,3 +1,4 @@
+// eslint-disable-next-line import/no-extraneous-dependencies -- dev-only test helper (in-memory pg)
 const { newDb } = require('pg-mem');
 const { setup, createObjectIdShim } = require('@coderich/autograph-db-tests');
 const PostgresDriver = require('./src/PostgresDriver');
@@ -6,12 +7,12 @@ const PostgresDriver = require('./src/PostgresDriver');
 function fieldToSqlType(field) {
   if (field.isArray || (field.isEmbedded && field.model)) return 'JSONB';
   switch (field.type) {
-    case 'Int':    return 'INTEGER';
-    case 'Float':  return 'NUMERIC';
+    case 'Int': return 'INTEGER';
+    case 'Float': return 'NUMERIC';
     case 'Boolean': return 'BOOLEAN';
-    case 'Date':   return 'TIMESTAMPTZ';
+    case 'Date': return 'TIMESTAMPTZ';
     case 'AutoGraphMixed': return 'JSONB';
-    default:       return 'TEXT'; // String, ID, enum refs, FK references
+    default: return 'TEXT'; // String, ID, enum refs, FK references
   }
 }
 

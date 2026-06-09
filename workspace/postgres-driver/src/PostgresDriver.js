@@ -22,6 +22,7 @@ module.exports = class PostgresDriver {
     this.#pool = pool || new pg.Pool({ connectionString: uri });
   }
 
+  // eslint-disable-next-line class-methods-use-this -- instance method by driver-interface contract
   prepare(query) {
     // Re-assemble MongoDB-style operators that autograph flattens via Util.flatten:
     // e.g. { 'price.$ne': -999 } → { price: { $ne: -999 } }
@@ -94,7 +95,8 @@ module.exports = class PostgresDriver {
   execute(plan) {
     return Util.promiseRetry(
       () => this[plan.op](plan),
-      5, 5,
+      5,
+      5,
       e => e.message?.includes('could not serialize access'),
     );
   }
@@ -144,6 +146,7 @@ module.exports = class PostgresDriver {
       if (aj.joinWhere && Object.keys(aj.joinWhere).length) {
         q = q.where(PostgresDriver.buildWhereCallback(aj.joinWhere, joinedTables, aj.$schema, aj.to, aj.to));
       }
+      // eslint-disable-next-line no-await-in-loop -- sequential: each join filters the next, with an early break
       const pkRows = await this.#run(q, session);
       const matchingPks = new Set(pkRows.map(r => String(r[aj.pkCol])));
 
@@ -173,7 +176,7 @@ module.exports = class PostgresDriver {
   }
 
   createOne(plan) {
-    return this.#run(plan.sql, plan.session).then(rows => {
+    return this.#run(plan.sql, plan.session).then((rows) => {
       const row = rows[0];
       if (row && plan.session) {
         const ctx = this.#txnContexts.get(plan.session);
@@ -464,75 +467,73 @@ module.exports = class PostgresDriver {
   // Apply deferred JS-side filters to a result row array.
   static applyJsFilters(rows, jsFilters) {
     if (!jsFilters?.length) return rows;
-    return rows.filter(row =>
-      jsFilters.every((filter) => {
-        const { col } = filter;
-        // Support dotted paths for nested JSONB values (e.g. 'building.tenants')
-        const val = col.includes('.')
-          ? col.split('.').reduce((obj, key) => obj?.[key], row)
-          : row[col];
+    return rows.filter(row => jsFilters.every((filter) => {
+      const { col } = filter;
+      // Support dotted paths for nested JSONB values (e.g. 'building.tenants')
+      const val = col.includes('.')
+        ? col.split('.').reduce((obj, key) => obj?.[key], row)
+        : row[col];
 
-        if (filter.type === 'inList') {
-          // OR semantics: row matches any target (regex or scalar) in the list.
-          const str = Array.isArray(val) ? null : String(val ?? '');
+      if (filter.type === 'inList') {
+        // OR semantics: row matches any target (regex or scalar) in the list.
+        const str = Array.isArray(val) ? null : String(val ?? '');
+        return filter.values.some((target) => {
+          if (target instanceof RegExp) {
+            if (Array.isArray(val)) return val.some(item => target.test(String(item ?? '')));
+            return target.test(str);
+          }
+          if (Array.isArray(val)) return val.some(item => String(item ?? '').toLowerCase() === String(target ?? '').toLowerCase());
+          return (str ?? '').toLowerCase() === String(target ?? '').toLowerCase();
+        });
+      }
+
+      if (filter.type === 'contains') {
+        if (!Array.isArray(val)) return false;
+        // OR semantics: array contains at least one of the target values.
+        return filter.values.some(target => val.some((item) => {
+          if (target instanceof RegExp) return target.test(String(item ?? ''));
+          if (typeof item === 'string' && typeof target === 'string') {
+            return item.toLowerCase() === target.toLowerCase();
+          }
+          return item == target; // eslint-disable-line eqeqeq
+        }),
+        );
+      }
+
+      // Nested JSONB array element: does the JSONB array column contain an element where
+      // the sub-path matches the filter value?
+      if (filter.type === 'nestedField') {
+        const arr = row[filter.col];
+        if (!Array.isArray(arr)) return false;
+        const pathParts = filter.path.split('.');
+        return arr.some((elem) => {
+          const v = pathParts.reduce((obj, key) => obj?.[key], elem);
+          if (filter.value instanceof RegExp) return filter.value.test(String(v ?? ''));
+          if (typeof v === 'string' && typeof filter.value === 'string') {
+            return v.toLowerCase() === filter.value.toLowerCase();
+          }
+          return v == filter.value; // eslint-disable-line eqeqeq
+        });
+      }
+
+      if (filter.type === 'nestedFieldIn') {
+        const arr = row[filter.col];
+        if (!Array.isArray(arr)) return false;
+        const pathParts = filter.path.split('.');
+        return arr.some((elem) => {
+          const v = pathParts.reduce((obj, key) => obj?.[key], elem);
           return filter.values.some((target) => {
-            if (target instanceof RegExp) {
-              if (Array.isArray(val)) return val.some(item => target.test(String(item ?? '')));
-              return target.test(str);
+            if (target instanceof RegExp) return target.test(String(v ?? ''));
+            if (typeof v === 'string' && typeof target === 'string') {
+              return v.toLowerCase() === target.toLowerCase();
             }
-            if (Array.isArray(val)) return val.some(item => String(item ?? '').toLowerCase() === String(target ?? '').toLowerCase());
-            return (str ?? '').toLowerCase() === String(target ?? '').toLowerCase();
+            return v == target; // eslint-disable-line eqeqeq
           });
-        }
+        });
+      }
 
-        if (filter.type === 'contains') {
-          if (!Array.isArray(val)) return false;
-          // OR semantics: array contains at least one of the target values.
-          return filter.values.some(target =>
-            val.some((item) => {
-              if (target instanceof RegExp) return target.test(String(item ?? ''));
-              if (typeof item === 'string' && typeof target === 'string') {
-                return item.toLowerCase() === target.toLowerCase();
-              }
-              return item == target; // eslint-disable-line eqeqeq
-            }),
-          );
-        }
-
-        // Nested JSONB array element: does the JSONB array column contain an element where
-        // the sub-path matches the filter value?
-        if (filter.type === 'nestedField') {
-          const arr = row[filter.col];
-          if (!Array.isArray(arr)) return false;
-          const pathParts = filter.path.split('.');
-          return arr.some((elem) => {
-            const v = pathParts.reduce((obj, key) => obj?.[key], elem);
-            if (filter.value instanceof RegExp) return filter.value.test(String(v ?? ''));
-            if (typeof v === 'string' && typeof filter.value === 'string') {
-              return v.toLowerCase() === filter.value.toLowerCase();
-            }
-            return v == filter.value; // eslint-disable-line eqeqeq
-          });
-        }
-
-        if (filter.type === 'nestedFieldIn') {
-          const arr = row[filter.col];
-          if (!Array.isArray(arr)) return false;
-          const pathParts = filter.path.split('.');
-          return arr.some((elem) => {
-            const v = pathParts.reduce((obj, key) => obj?.[key], elem);
-            return filter.values.some((target) => {
-              if (target instanceof RegExp) return target.test(String(v ?? ''));
-              if (typeof v === 'string' && typeof target === 'string') {
-                return v.toLowerCase() === target.toLowerCase();
-              }
-              return v == target; // eslint-disable-line eqeqeq
-            });
-          });
-        }
-
-        return true;
-      }),
+      return true;
+    }),
     );
   }
 
@@ -682,7 +683,7 @@ module.exports = class PostgresDriver {
       const c = s[i];
       if (c === '(' || c === '[') depth++;
       else if (c === ')' || c === ']') depth--;
-      else if (c === '|' && depth === 0) { parts.push(cur); cur = ''; continue; }
+      else if (c === '|' && depth === 0) { parts.push(cur); cur = ''; continue; } // eslint-disable-line no-continue
       cur += c;
     }
     parts.push(cur);
@@ -807,8 +808,7 @@ module.exports = class PostgresDriver {
             }
             for (const re of regexes) {
               const likes = PostgresDriver.regexToLike(re);
-              if (likes?.length === 1) { parts.push(`${colExpr} ILIKE ?`); bindings.push(likes[0]); }
-              else if (likes?.length > 1) { parts.push(`(${likes.map(() => `${colExpr} ILIKE ?`).join(' OR ')})`); bindings.push(...likes); }
+              if (likes?.length === 1) { parts.push(`${colExpr} ILIKE ?`); bindings.push(likes[0]); } else if (likes?.length > 1) { parts.push(`(${likes.map(() => `${colExpr} ILIKE ?`).join(' OR ')})`); bindings.push(...likes); }
             }
             if (others.length) {
               parts.push(`${colExpr} IN (${others.map(() => '?').join(', ')})`);
@@ -925,7 +925,8 @@ module.exports = class PostgresDriver {
 
   static applyJoins(q, mainTable, joins, joinedTables = new Set(), seenTables = new Map(), $schema = null, arrayJoins = null) {
     joins.forEach((join) => {
-      let { to, on: foreignField, from: localField, where: joinWhere, children } = join;
+      const { to, on: foreignField, where: joinWhere, children } = join;
+      let { from: localField } = join; // reassigned below during dotted-path resolution
 
       // Dotted localField: multi-hop path like "sections.person" or "section.person".
       // If the FIRST component is a JSONB array column → collect as embeddedArray (JS-side).
@@ -958,7 +959,7 @@ module.exports = class PostgresDriver {
           // Build a ->> path expression to extract the FK from the JSONB column.
           const restParts = parts.slice(1);
           let expr = `"${mainTable}"."${firstComp}"`;
-          restParts.slice(0, -1).forEach(p => { expr += `->'${p}'`; });
+          restParts.slice(0, -1).forEach((p) => { expr += `->'${p}'`; });
           expr += `->>'${restParts[restParts.length - 1]}'`;
           jsonbOnExpr = expr;
         }

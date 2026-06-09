@@ -572,6 +572,27 @@ function parseSchema(config, typeDefs) {
     // strictSchema create/update transformers would otherwise strip any field absent from the
     // shape that was frozen pre-aggregation.
     iface.buildDerived($schema);
+
+    // oneOf interfaces receive a polymorphic wrapper input ({ <typeKey>: {...} }) rather than the
+    // fat field shape. Override create/update with a dispatcher: unwrap the single key, route the
+    // inner value through the CONCRETE model's transformer, and stamp the discriminator (= typeKey)
+    // so the stored doc is a flat concrete doc that __resolveType can map on read. validate/toDriver
+    // need no special-casing — they run on the already-flattened concrete doc via aggregated fields.
+    if (iface.oneOf) {
+      const dispatch = (crud, v, args) => {
+        if (!Util.isPlainObject(v)) return v;
+        const [typeKey, inner] = Object.entries(v)[0] || [];
+        const concrete = $schema.models[iface.typeMap[typeKey]];
+        if (!concrete || !Util.isPlainObject(inner)) return v;
+        const out = concrete.transformers[crud].transform(inner, args);
+        out[iface.discriminator] = typeKey;
+        return out;
+      };
+
+      ['create', 'update'].forEach((crud) => {
+        iface.transformers[crud] = { transform: (value, args) => Util.map(value, v => dispatch(crud, v, args)) };
+      });
+    }
   });
 
   // Resolve indexes

@@ -174,4 +174,29 @@ module.exports = `
     name: String!
     critters: [Critter!]
   }
+
+  # oneOf variant: the interface opts into @oneOf, so its input is a polymorphic wrapper keyed by
+  # each implementer's typeKey ({ k9: {...} } | { cat: {...} }). On write the runtime must unwrap
+  # the single key, route the inner value through the concrete model, and stamp the discriminator.
+  interface Varmint @model(embed: true, discriminator: "kind", oneOf: true) {
+    kind: String!
+    name: String!
+  }
+
+  type Hound implements Varmint @model(embed: true, typeKey: "k9") {
+    kind: String!
+    name: String!
+    barkVolume: Int
+  }
+
+  type Tabby implements Varmint @model(embed: true, typeKey: "cat") {
+    kind: String!
+    name: String!
+    livesLeft: Int
+  }
+
+  type Keeper @model {
+    name: String!
+    varmints: [Varmint!]
+  }
 `;
