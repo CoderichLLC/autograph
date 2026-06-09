@@ -149,4 +149,29 @@ module.exports = `
   type RoleDetail {
     scope: String
   }
+
+  # Embedded interface + implementers (mirrors the in-house Kiosk tile pattern). Each implementer
+  # adds its own field that does NOT exist on the interface — exercising field aggregation and the
+  # write-path round-trip (implementer-only fields must survive serialize, not be stripped).
+  interface Critter @model(embed: true, discriminator: "kind") {
+    kind: String!
+    name: String!
+  }
+
+  type Dog implements Critter @model(embed: true, typeKey: "k9") {
+    kind: String!
+    name: String!
+    barkVolume: Int
+  }
+
+  type Feline implements Critter @model(embed: true, typeKey: "cat") {
+    kind: String!
+    name: String!
+    livesLeft: Int
+  }
+
+  type Owner @model {
+    name: String!
+    critters: [Critter!]
+  }
 `;

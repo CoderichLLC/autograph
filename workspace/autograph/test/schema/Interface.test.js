@@ -1,5 +1,6 @@
 const { makeExecutableSchema } = require('@graphql-tools/schema');
 const Schema = require('../../src/schema/Schema');
+const QueryBuilder = require('../../src/query/QueryBuilder');
 
 // Embedded interface (mirrors the in-house Kiosk pattern) whose two implementers each add their
 // own field. Today Autograph only generates the interface's *own* fields into AnimalInputCreate,
@@ -91,5 +92,39 @@ describe('Interface', () => {
     expect(String(createFields.feline.type)).toBe('KittyInputCreate');
 
     expect(executable.getType('CritterInputUpdate').isOneOf).toBe(true);
+  });
+
+  // Write-path round-trip: an implementer-only field (Dog.barkVolume, Feline.livesLeft) on an
+  // embedded interface array must SURVIVE serialization. The interface's create/update transformer
+  // is strictSchema — if its shape doesn't include the aggregated implementer fields, those values
+  // get stripped before they ever reach the driver (the exact Kiosk title/poiItems bug).
+  describe('embedded interface write round-trip (global schema)', () => {
+    let schema, resolver, factory;
+
+    beforeAll(() => {
+      ({ schema, resolver } = global);
+      factory = model => new QueryBuilder({ resolver, schema, query: { model }, context: {} });
+    });
+
+    test('implementer-only fields survive the create transform', async () => {
+      const { input } = (await factory('Owner').save({
+        name: 'Bob',
+        critters: [
+          { kind: 'k9', name: 'Rex', barkVolume: 11 },
+          { kind: 'cat', name: 'Felix', livesLeft: 9 },
+        ],
+      }).transform()).toObject();
+
+      expect(input.critters[0]).toMatchObject({ name: 'Rex', barkVolume: 11 });
+      expect(input.critters[1]).toMatchObject({ name: 'Felix', livesLeft: 9 });
+    });
+
+    test('implementer-only fields survive the update transform', async () => {
+      const { input } = (await factory('Owner').id('000000000000000000000001').save({
+        critters: [{ kind: 'k9', name: 'Rex', barkVolume: 7 }],
+      }).transform()).toObject();
+
+      expect(input.critters[0]).toMatchObject({ name: 'Rex', barkVolume: 7 });
+    });
   });
 });

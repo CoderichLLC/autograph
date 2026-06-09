@@ -331,8 +331,12 @@ module.exports = class Schema {
         if (modelKinds.includes(node.kind)) {
           const $model = model;
 
-          // Model resolution after field resolution (push)
-          thunks.push(($schema) => {
+          // Model resolution after field resolution (push). Captured on the model so it can be
+          // re-run after interface field-aggregation: aggregating implementer fields onto an
+          // interface invalidates every fields-derived structure built here (transformers,
+          // docTransform, ignorePaths), so interface models must rebuild these post-aggregation.
+          $model.buildDerived = ($schema) => {
+            $model.ignorePaths = []; // reset — repopulated below; avoids dupes on re-run
             $model.resolvePath = (path, prop = 'name') => this.#schema.resolvePath(`${$model[prop]}.${path}`, prop);
 
             $model.isJoinPath = (path, prop = 'name') => {
@@ -569,7 +573,9 @@ module.exports = class Schema {
               if (f.isScalar) $model.ignorePaths.push(path.join('.'));
               return null;
             }, { path: [] });
-          });
+          };
+
+          thunks.push($model.buildDerived);
         } else if (node.kind === Kind.FIELD_DEFINITION) {
           const $field = field;
           const $model = model;
@@ -655,6 +661,12 @@ module.exports = class Schema {
         Object.values(impl.fields).forEach((f) => { iface.fields[f.name] ??= f; });
         iface.typeMap[impl.directives?.model?.typeKey ?? impl.name] = impl.name;
       });
+
+      // Field set just changed — rebuild the interface's fields-derived structures (transformers,
+      // docTransform, ignorePaths) so implementer fields survive the write/read round-trip. The
+      // strictSchema create/update transformers would otherwise strip any field absent from the
+      // shape that was frozen pre-aggregation.
+      iface.buildDerived(this.#schema);
     });
 
     // Resolve indexes
