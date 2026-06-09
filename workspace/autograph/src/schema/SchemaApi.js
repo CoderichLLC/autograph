@@ -97,6 +97,15 @@ function generateApi(schema) {
       })}
 
       ${createModels.map((model) => {
+        // Polymorphic interface input: @oneOf keyed by each implementer's typeKey -> its own input.
+        if (model.oneOf) {
+          return `
+            input ${model}InputCreate @oneOf {
+              ${Object.entries(model.typeMap).map(([key, typeName]) => `${key}: ${typeName}InputCreate`).join('\n')}
+            }
+          `;
+        }
+
         const fields = Object.values(model.fields).filter(field => field.crud?.includes('c') && !field.isVirtual);
 
         return `
@@ -107,6 +116,14 @@ function generateApi(schema) {
       })}
 
       ${updateModels.map((model) => {
+        if (model.oneOf) {
+          return `
+            input ${model}InputUpdate @oneOf {
+              ${Object.entries(model.typeMap).map(([key, typeName]) => `${key}: ${typeName}InputUpdate`).join('\n')}
+            }
+          `;
+        }
+
         const fields = Object.values(model.fields).filter(field => field.crud?.includes('u') && !field.isVirtual);
 
         return `
@@ -245,7 +262,11 @@ function generateApi(schema) {
                 return context[schema.namespace].resolver.match(fieldModel).where(where).args(args).info(info).resolve(info);
               },
             });
-          }, {}),
+            // Interface models also need a __resolveType so GraphQL can pick the concrete type for
+            // interface-typed fields. The discriminator field (default "type") holds the value that
+            // maps to a concrete type via typeMap. Seeded here (the last writer of resolvers[model])
+            // so it merges with the field resolvers above instead of being clobbered by them.
+          }, model.isInterface ? { __resolveType: doc => model.typeMap[doc[model.discriminator]] } : {}),
         });
       }, {}),
       // AG15 — Subscription payload field resolvers (currently disabled).
