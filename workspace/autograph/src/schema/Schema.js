@@ -156,6 +156,8 @@ module.exports = class Schema {
           target = model = this.#schema.models[name] = {
             name,
             key: name,
+            isInterface: interfaceKinds.includes(node.kind),
+            interfaces: (node.interfaces || []).map(i => i.name.value),
             fields: {},
             crud: 'crud', // For use when creating API Queries and Mutations
             scope: 'crud', // For use when defining types (how it's field.model reference can be used)
@@ -641,6 +643,20 @@ module.exports = class Schema {
     // Resolve data thunks
     thunks.forEach(thunk => thunk(this.#schema));
 
+    // Aggregate implementer fields onto interface models so generated inputs/pipelines cover the
+    // full union of concrete fields — no need to re-declare every implementer field on the
+    // interface. Add-if-absent: the interface's own field definition always wins.
+    Object.values(this.#schema.models).filter(m => m.isInterface).forEach((iface) => {
+      iface.discriminator = iface.directives?.model?.discriminator || 'type';
+      iface.oneOf = Boolean(iface.directives?.model?.oneOf); // emit a @oneOf input instead of a fat union
+      iface.typeMap = {}; // discriminator value -> concrete (implementer) type name, for __resolveType
+      Object.values(this.#schema.models).forEach((impl) => {
+        if (impl.isInterface || !impl.interfaces?.includes(iface.name)) return;
+        Object.values(impl.fields).forEach((f) => { iface.fields[f.name] ??= f; });
+        iface.typeMap[impl.directives?.model?.typeKey ?? impl.name] = impl.name;
+      });
+    });
+
     // Resolve indexes
     this.#schema.indexes = this.#schema.indexes.map((index) => {
       const { key } = index.model;
@@ -797,6 +813,9 @@ module.exports = class Schema {
         decorate: AutoGraphMixed # Decorator (default: "default")
         embed: Boolean # Mark this an embedded model (default false)
         persist: Boolean # Persist this model (default true)
+        discriminator: String # (interface) field holding the concrete-type discriminator value (default "type")
+        typeKey: AutoGraphMixed # (implementer) discriminator value that maps to this concrete type (default: the type name)
+        oneOf: Boolean # (interface) generate a @oneOf polymorphic input instead of a fat union input
 
         # TEMP TO APPEASE TRANSITION
         driver: AutoGraphDriver # External data driver
@@ -911,6 +930,15 @@ module.exports = class Schema {
         })}
 
         ${createModels.map((model) => {
+          // Polymorphic interface input: @oneOf keyed by each implementer's typeKey -> its own input.
+          if (model.oneOf) {
+            return `
+              input ${model}InputCreate @oneOf {
+                ${Object.entries(model.typeMap).map(([key, typeName]) => `${key}: ${typeName}InputCreate`).join('\n')}
+              }
+            `;
+          }
+
           const fields = Object.values(model.fields).filter(field => field.crud?.includes('c') && !field.isVirtual);
 
           return `
@@ -921,6 +949,14 @@ module.exports = class Schema {
         })}
 
         ${updateModels.map((model) => {
+          if (model.oneOf) {
+            return `
+              input ${model}InputUpdate @oneOf {
+                ${Object.entries(model.typeMap).map(([key, typeName]) => `${key}: ${typeName}InputUpdate`).join('\n')}
+              }
+            `;
+          }
+
           const fields = Object.values(model.fields).filter(field => field.crud?.includes('u') && !field.isVirtual);
 
           return `
@@ -1059,7 +1095,11 @@ module.exports = class Schema {
                   return context[schema.namespace].resolver.match(fieldModel).where(where).args(args).info(info).resolve(info);
                 },
               });
-            }, {}),
+              // Interface models also need a __resolveType so GraphQL can pick the concrete type
+              // for interface-typed fields. The discriminator field (default "type") holds the
+              // concrete type name. Seeded here (the last writer of resolvers[model]) so it merges
+              // with the field resolvers above instead of being clobbered by them.
+            }, model.isInterface ? { __resolveType: doc => model.typeMap[doc[model.discriminator]] } : {}),
           });
         }, {}),
         // AG15 — Subscription payload field resolvers (currently disabled).

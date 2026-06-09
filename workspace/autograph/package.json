@@ -35,9 +35,9 @@
     "@apollo/server": "5.5.1",
     "@coderich/autograph-db-tests": "*",
     "@coderich/autograph-mongodb": "*",
-    "@graphql-tools/schema": "10.0.0",
+    "@graphql-tools/schema": "10.0.3",
     "clinic": "13.0.0",
-    "graphql": "16.8.1",
+    "graphql": "16.11.0",
     "mongodb-memory-server": "8.13.0",
     "nodemon": "3.1.14"
   },
