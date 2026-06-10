@@ -12,18 +12,18 @@ const typeDefs = `
     animals: [Animal!]
   }
 
-  interface Animal @model(embed: true, discriminator: "kind") {
+  interface Animal @model(embed: true, typeField: "kind") {
     kind: String!
     name: String!
   }
 
-  type Dog implements Animal @model(embed: true, typeKey: "k9") {
+  type Dog implements Animal @model(embed: true, typeValue: "k9") {
     kind: String!
     name: String!
     barkVolume: Int
   }
 
-  type Cat implements Animal @model(embed: true, typeKey: "feline") {
+  type Cat implements Animal @model(embed: true, typeValue: "feline") {
     kind: String!
     name: String!
     livesLeft: Int
@@ -31,25 +31,25 @@ const typeDefs = `
 `;
 
 // Same shape, but the interface opts into @oneOf — its input should become a polymorphic
-// @oneOf keyed by each implementer's typeKey, instead of the fat union input.
+// @oneOf keyed by each implementer's typeValue, instead of the fat union input.
 const oneOfTypeDefs = `
   type Shelter @model(key: "shelter") {
     id: ID!
     residents: [Critter!]
   }
 
-  interface Critter @model(embed: true, discriminator: "kind", oneOf: true) {
+  interface Critter @model(embed: true, typeField: "kind", oneOf: true) {
     kind: String!
     name: String!
   }
 
-  type Pup implements Critter @model(embed: true, typeKey: "k9") {
+  type Pup implements Critter @model(embed: true, typeValue: "k9") {
     kind: String!
     name: String!
     barkVolume: Int
   }
 
-  type Kitty implements Critter @model(embed: true, typeKey: "feline") {
+  type Kitty implements Critter @model(embed: true, typeValue: "feline") {
     kind: String!
     name: String!
     livesLeft: Int
@@ -68,19 +68,19 @@ describe('Interface', () => {
   });
 
   // Reads of an interface-typed field need a __resolveType so GraphQL can pick the concrete type.
-  // It reads the declared discriminator field (here `kind`), whose value is the concrete type name.
-  // The discriminator field holds a domain value (e.g. "k9"), NOT the GraphQL type name ("Dog").
-  // __resolveType must MAP the value -> concrete type name via the typeKey registry.
-  test('user-defined interface __resolveType maps the discriminator value to the concrete type', () => {
+  // It reads the declared typeField field (here `kind`), whose value is the concrete type name.
+  // The typeField field holds a domain value (e.g. "k9"), NOT the GraphQL type name ("Dog").
+  // __resolveType must MAP the value -> concrete type name via the typeValue registry.
+  test('user-defined interface __resolveType maps the typeField value to the concrete type', () => {
     const { resolvers } = new Schema({}).merge(typeDefs).api().toObject();
     expect(typeof resolvers.Animal?.__resolveType).toBe('function');
     expect(resolvers.Animal.__resolveType({ kind: 'k9', name: 'Rex' })).toBe('Dog');
     expect(resolvers.Animal.__resolveType({ kind: 'feline', name: 'Felix' })).toBe('Cat');
   });
 
-  // @model(oneOf: true) → the interface input is a @oneOf keyed by each implementer's typeKey,
+  // @model(oneOf: true) → the interface input is a @oneOf keyed by each implementer's typeValue,
   // each pointing at that implementer's own input (not the fat union of all fields).
-  test('oneOf interface generates a @oneOf input keyed by typeKey', () => {
+  test('oneOf interface generates a @oneOf input keyed by typeValue', () => {
     const executable = makeExecutableSchema(new Schema({}).merge(oneOfTypeDefs).api().toObject());
 
     const createInput = executable.getType('CritterInputCreate');
@@ -128,9 +128,9 @@ describe('Interface', () => {
     });
   });
 
-  // @oneOf interface input dispatch: the write carries a polymorphic wrapper { <typeKey>: {...} }.
+  // @oneOf interface input dispatch: the write carries a polymorphic wrapper { <typeValue>: {...} }.
   // The runtime must unwrap the single key, route the inner value through the CONCRETE model's
-  // transformer, stamp the discriminator (= typeKey) so reads can __resolveType, and produce a
+  // transformer, stamp the typeField (= typeValue) so reads can __resolveType, and produce a
   // FLAT concrete doc (no wrapper key) — not the fat-input shape.
   describe('oneOf interface input dispatch (global schema)', () => {
     let schema, resolver, factory;
@@ -140,7 +140,7 @@ describe('Interface', () => {
       factory = model => new QueryBuilder({ resolver, schema, query: { model }, context: {} });
     });
 
-    test('create unwraps the oneOf key, routes to the concrete model, and stamps the discriminator', async () => {
+    test('create unwraps the oneOf key, routes to the concrete model, and stamps the typeField', async () => {
       const { input } = (await factory('Keeper').save({
         name: 'Bob',
         varmints: [
@@ -202,8 +202,8 @@ describe('Interface field inheritance', () => {
   test('an implementer that declares only its own field still satisfies the interface', () => {
     const td = `
       type Garage @model(key: "garage") { id: ID! vehicles: [Vehicle!] }
-      interface Vehicle @model(embed: true, discriminator: "kind") { kind: String! wheels: Int }
-      type Car implements Vehicle @model(embed: true, typeKey: "car") { doors: Int }
+      interface Vehicle @model(embed: true, typeField: "kind") { kind: String! wheels: Int }
+      type Car implements Vehicle @model(embed: true, typeValue: "car") { doors: Int }
     `;
     const executable = makeExecutableSchema(new Schema({}).merge(td).api().toObject()); // would throw if Car lacked kind/wheels
     const fields = executable.getType('Car').getFields();
@@ -272,26 +272,26 @@ describe('Interface field inheritance', () => {
   test('fat-input flow is unchanged: interface input still aggregates the union; __resolveType still wired', () => {
     const td = `
       type Zoo @model(key: "zoo") { id: ID! animals: [Animal!] }
-      interface Animal @model(embed: true, discriminator: "kind") { kind: String! name: String! }
-      type Dog implements Animal @model(embed: true, typeKey: "k9") { barkVolume: Int }
-      type Cat implements Animal @model(embed: true, typeKey: "feline") { livesLeft: Int }
+      interface Animal @model(embed: true, typeField: "kind") { kind: String! name: String! }
+      type Dog implements Animal @model(embed: true, typeValue: "k9") { barkVolume: Int }
+      type Cat implements Animal @model(embed: true, typeValue: "feline") { livesLeft: Int }
     `;
     const obj = new Schema({}).merge(td).api().toObject();
     const input = makeExecutableSchema(obj).getType('AnimalInputCreate').getFields();
     expect(input).toHaveProperty('name'); // interface field (implementers no longer redeclare it)
     expect(input).toHaveProperty('barkVolume'); // Dog-only, aggregated onto the fat input
     expect(input).toHaveProperty('livesLeft'); // Cat-only, aggregated onto the fat input
-    // __resolveType maps the inherited discriminator value -> concrete type
+    // __resolveType maps the inherited typeField value -> concrete type
     expect(obj.resolvers.Animal.__resolveType({ kind: 'k9' })).toBe('Dog');
     expect(obj.resolvers.Animal.__resolveType({ kind: 'feline' })).toBe('Cat');
   });
 
-  test('oneOf flow is unchanged: @oneOf input keyed by typeKey; branch inputs carry inherited + own fields; dispatcher intact', () => {
+  test('oneOf flow is unchanged: @oneOf input keyed by typeValue; branch inputs carry inherited + own fields; dispatcher intact', () => {
     const td = `
       type Shelter @model(key: "shelter") { id: ID! residents: [Critter!] }
-      interface Critter @model(embed: true, discriminator: "kind", oneOf: true) { kind: String! name: String! }
-      type Pup implements Critter @model(embed: true, typeKey: "k9") { barkVolume: Int }
-      type Kitty implements Critter @model(embed: true, typeKey: "feline") { livesLeft: Int }
+      interface Critter @model(embed: true, typeField: "kind", oneOf: true) { kind: String! name: String! }
+      type Pup implements Critter @model(embed: true, typeValue: "k9") { barkVolume: Int }
+      type Kitty implements Critter @model(embed: true, typeValue: "feline") { livesLeft: Int }
     `;
     const schema = new Schema({}).merge(td);
     const $schema = schema.parse(); // internal model (drives the write-path unwrap/route/stamp)
@@ -309,7 +309,7 @@ describe('Interface field inheritance', () => {
     expect(pupInput).toHaveProperty('name'); // inherited from Critter
     expect(pupInput).toHaveProperty('barkVolume'); // own
 
-    // Internal dispatch wiring survives: oneOf flag + typeKey -> concrete-type registry.
+    // Internal dispatch wiring survives: oneOf flag + typeValue -> concrete-type registry.
     expect($schema.models.Critter.oneOf).toBe(true);
     expect($schema.models.Critter.typeMap).toMatchObject({ k9: 'Pup', feline: 'Kitty' });
   });

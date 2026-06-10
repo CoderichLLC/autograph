@@ -558,13 +558,13 @@ function parseSchema(config, typeDefs) {
   // full union of concrete fields — no need to re-declare every implementer field on the
   // interface. Add-if-absent: the interface's own field definition always wins.
   Object.values($schema.models).filter(m => m.isInterface).forEach((iface) => {
-    iface.discriminator = iface.directives?.model?.discriminator || 'type';
+    iface.typeField = iface.directives?.model?.typeField || 'type';
     iface.oneOf = Boolean(iface.directives?.model?.oneOf); // emit a @oneOf input instead of a fat union
-    iface.typeMap = {}; // discriminator value -> concrete (implementer) type name, for __resolveType
+    iface.typeMap = {}; // typeValue -> concrete (implementer) type name, for __resolveType
     Object.values($schema.models).forEach((impl) => {
       if (impl.isInterface || !impl.interfaces?.includes(iface.name)) return;
       Object.values(impl.fields).forEach((f) => { iface.fields[f.name] ??= f; });
-      iface.typeMap[impl.directives?.model?.typeKey ?? impl.name] = impl.name;
+      iface.typeMap[impl.directives?.model?.typeValue ?? impl.name] = impl.name;
     });
 
     // Field set just changed — rebuild the interface's fields-derived structures (transformers,
@@ -573,19 +573,19 @@ function parseSchema(config, typeDefs) {
     // shape that was frozen pre-aggregation.
     iface.buildDerived($schema);
 
-    // oneOf interfaces receive a polymorphic wrapper input ({ <typeKey>: {...} }) rather than the
+    // oneOf interfaces receive a polymorphic wrapper input ({ <typeValue>: {...} }) rather than the
     // fat field shape. Override create/update with a dispatcher: unwrap the single key, route the
-    // inner value through the CONCRETE model's transformer, and stamp the discriminator (= typeKey)
+    // inner value through the CONCRETE model's transformer, and stamp the typeField (= typeValue)
     // so the stored doc is a flat concrete doc that __resolveType can map on read. validate/toDriver
     // need no special-casing — they run on the already-flattened concrete doc via aggregated fields.
     if (iface.oneOf) {
       const dispatch = (crud, v, args) => {
         if (!Util.isPlainObject(v)) return v;
-        const [typeKey, inner] = Object.entries(v)[0] || [];
-        const concrete = $schema.models[iface.typeMap[typeKey]];
+        const [typeValue, inner] = Object.entries(v)[0] || [];
+        const concrete = $schema.models[iface.typeMap[typeValue]];
         if (!concrete || !Util.isPlainObject(inner)) return v;
         const out = concrete.transformers[crud].transform(inner, args);
-        out[iface.discriminator] = typeKey;
+        out[iface.typeField] = typeValue;
         return out;
       };
 

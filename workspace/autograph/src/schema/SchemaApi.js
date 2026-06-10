@@ -97,7 +97,7 @@ function generateApi(schema) {
       })}
 
       ${createModels.map((model) => {
-        // Polymorphic interface input: @oneOf keyed by each implementer's typeKey -> its own input.
+        // Polymorphic interface input: @oneOf keyed by each implementer's typeValue -> its own input.
         if (model.oneOf) {
           return `
             input ${model}InputCreate @oneOf {
@@ -263,10 +263,10 @@ function generateApi(schema) {
               },
             });
             // Interface models also need a __resolveType so GraphQL can pick the concrete type for
-            // interface-typed fields. The discriminator field (default "type") holds the value that
+            // interface-typed fields. The typeField (default "type") holds the value that
             // maps to a concrete type via typeMap. Seeded here (the last writer of resolvers[model])
             // so it merges with the field resolvers above instead of being clobbered by them.
-          }, model.isInterface ? { __resolveType: doc => model.typeMap[doc[model.discriminator]] } : {}),
+          }, model.isInterface ? { __resolveType: doc => model.typeMap[doc[model.typeField]] } : {}),
         });
       }, {}),
       // AG15 — Subscription payload field resolvers (currently disabled).

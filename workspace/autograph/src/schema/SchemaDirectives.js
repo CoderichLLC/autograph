@@ -24,8 +24,8 @@ module.exports = function createFrameworkTypeDefs(directives) {
       decorate: AutoGraphMixed # Decorator (default: "default")
       embed: Boolean # Mark this an embedded model (default false)
       persist: Boolean # Persist this model (default true)
-      discriminator: String # (interface) field holding the concrete-type discriminator value (default "type")
-      typeKey: AutoGraphMixed # (implementer) discriminator value that maps to this concrete type (default: the type name)
+      typeField: String # (interface) field holding the concrete-type discriminator value (default "type")
+      typeValue: AutoGraphMixed # (implementer) discriminator value that maps to this concrete type (default: the type name)
       oneOf: Boolean # (interface) generate a @oneOf polymorphic input instead of a fat union input
 
       authz: AutoGraphAuthzEnum # Access level used for authorization (default: private)

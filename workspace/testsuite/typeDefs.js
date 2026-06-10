@@ -153,18 +153,18 @@ module.exports = `
   # Embedded interface + implementers. Each implementer
   # adds its own field that does NOT exist on the interface — exercising field aggregation and the
   # write-path round-trip (implementer-only fields must survive serialize, not be stripped).
-  interface Critter @model(embed: true, discriminator: "kind") {
+  interface Critter @model(embed: true, typeField: "kind") {
     kind: String!
     name: String!
   }
 
-  type Dog implements Critter @model(embed: true, typeKey: "k9") {
+  type Dog implements Critter @model(embed: true, typeValue: "k9") {
     kind: String!
     name: String!
     barkVolume: Int
   }
 
-  type Feline implements Critter @model(embed: true, typeKey: "cat") {
+  type Feline implements Critter @model(embed: true, typeValue: "cat") {
     kind: String!
     name: String!
     livesLeft: Int
@@ -176,20 +176,20 @@ module.exports = `
   }
 
   # oneOf variant: the interface opts into @oneOf, so its input is a polymorphic wrapper keyed by
-  # each implementer's typeKey ({ k9: {...} } | { cat: {...} }). On write the runtime must unwrap
-  # the single key, route the inner value through the concrete model, and stamp the discriminator.
-  interface Varmint @model(embed: true, discriminator: "kind", oneOf: true) {
+  # each implementer's typeValue ({ k9: {...} } | { cat: {...} }). On write the runtime must unwrap
+  # the single key, route the inner value through the concrete model, and stamp the typeField.
+  interface Varmint @model(embed: true, typeField: "kind", oneOf: true) {
     kind: String!
     name: String!
   }
 
-  type Hound implements Varmint @model(embed: true, typeKey: "k9") {
+  type Hound implements Varmint @model(embed: true, typeValue: "k9") {
     kind: String!
     name: String!
     barkVolume: Int
   }
 
-  type Tabby implements Varmint @model(embed: true, typeKey: "cat") {
+  type Tabby implements Varmint @model(embed: true, typeValue: "cat") {
     kind: String!
     name: String!
     livesLeft: Int
