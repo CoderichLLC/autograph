@@ -596,6 +596,17 @@ function parseSchema(config, typeDefs) {
       ['create', 'update'].forEach((crud) => {
         iface.transformers[crud] = { transform: (value, args) => Util.map(value, v => dispatch(crud, v, args)) };
       });
+
+      // validate MUST also dispatch to the concrete model. The interface aggregates EVERY implementer's
+      // fields *with their required flags*, so validating the flattened doc against the aggregated
+      // interface shape over-validates — e.g. a `careMap` create would be required to supply
+      // `linkItem.label` (TextComponent). create/update already stamped the typeField on the flat doc,
+      // so route by that; fall back to the aggregated transformer when the type is unknown.
+      const baseValidate = iface.transformers.validate;
+      iface.transformers.validate = { transform: (value, args) => Util.map(value, (v) => {
+        const concrete = Util.isPlainObject(v) ? $schema.models[iface.typeMap[v[iface.typeField]]] : null;
+        return concrete ? concrete.transformers.validate.transform(v, args) : baseValidate.transform(v, args);
+      }) };
     }
   });
 
