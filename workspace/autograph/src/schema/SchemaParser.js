@@ -561,6 +561,10 @@ function parseSchema(config, typeDefs) {
     iface.typeField = iface.directives?.model?.typeField || 'type';
     iface.oneOf = Boolean(iface.directives?.model?.oneOf); // emit a @oneOf input instead of a fat union
     iface.typeMap = {}; // typeValue -> concrete (implementer) type name, for __resolveType
+    // Snapshot the interface's OWN fields BEFORE aggregation. Aggregated implementer fields exist on
+    // the interface MODEL (for inputs/pipelines/defaults) but NOT on the interface GraphQL TYPE, so
+    // GQL field-resolvers must be scoped to own fields only (SchemaApi); implementers emit their own.
+    iface.ownFields = new Set(Object.keys(iface.fields));
     Object.values($schema.models).forEach((impl) => {
       if (impl.isInterface || !impl.interfaces?.includes(iface.name)) return;
       Object.values(impl.fields).forEach((f) => { iface.fields[f.name] ??= f; });

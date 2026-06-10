@@ -249,7 +249,12 @@ function generateApi(schema) {
       } : {}),
       ...readModels.reduce((prev, model) => {
         return Object.assign(prev, {
-          [model]: Object.values(model.fields).filter(field => field.model?.isEntity && field.crud?.includes('r')).reduce((prev2, field) => {
+          // For interface models, `model.fields` includes implementer fields aggregated for
+          // input/pipeline purposes — but those live on the concrete GraphQL types, not the interface
+          // type. Scope interface field-resolvers to the interface's OWN fields; concrete types emit
+          // the rest. (Without this, an entity-typed variant field e.g. `imageTile` would be emitted
+          // as `Interface.imageTile` and makeExecutableSchema rejects it as not-in-schema.)
+          [model]: Object.values(model.fields).filter(field => field.model?.isEntity && field.crud?.includes('r') && (!model.isInterface || model.ownFields?.has(field.name))).reduce((prev2, field) => {
             // Hot path: this resolver fires per FK/embedded entity field per doc. Inlining the
             // `doc.$.lookup(field)` chain avoids one Proxy allocation and one wasted QueryResolver
             // allocation (the proxy creates `match(model).id(doc.id)` but the lookup branch never

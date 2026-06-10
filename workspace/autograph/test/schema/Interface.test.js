@@ -314,3 +314,24 @@ describe('Interface field inheritance', () => {
     expect($schema.models.Critter.typeMap).toMatchObject({ k9: 'Pup', feline: 'Kitty' });
   });
 });
+
+// Regression: a PERSISTED (key'd) interface whose variant declares an ENTITY-reference field.
+// The interface model aggregates that field (for inputs/pipelines), but it is NOT on the interface
+// GraphQL type — so its field resolver must be emitted on the CONCRETE type only, never the interface.
+// Before the fix, SchemaApi emitted `Comp.tile` from the aggregated field set and makeExecutableSchema
+// threw "Comp.tile defined in resolvers, but not in schema".
+describe('persisted interface with entity-reference variant field', () => {
+  const td = `
+    interface Comp @model(key: "comp") { id: ID! type: CompType! }
+    enum CompType { map item }
+    type CompMap implements Comp @model(typeValue: "map") { tile: CompItem }
+    type CompItem implements Comp @model(typeValue: "item") { label: String }
+  `;
+
+  test('variant entity-field resolver is on the concrete type, not the interface; schema builds', () => {
+    const obj = new Schema({}).merge(td).api().toObject();
+    expect(obj.resolvers.CompMap).toHaveProperty('tile'); // concrete type owns the relation resolver
+    expect(obj.resolvers.Comp).not.toHaveProperty('tile'); // interface must NOT (tile isn't an interface field)
+    expect(() => makeExecutableSchema(obj)).not.toThrow(); // threw before the fix
+  });
+});
