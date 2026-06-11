@@ -597,16 +597,33 @@ function parseSchema(config, typeDefs) {
         iface.transformers[crud] = { transform: (value, args) => Util.map(value, v => dispatch(crud, v, args)) };
       });
 
-      // validate MUST also dispatch to the concrete model. The interface aggregates EVERY implementer's
-      // fields *with their required flags*, so validating the flattened doc against the aggregated
-      // interface shape over-validates — e.g. a `careMap` create would be required to supply
-      // `linkItem.label` (TextComponent). create/update already stamped the typeField on the flat doc,
-      // so route by that; fall back to the aggregated transformer when the type is unknown.
-      const baseValidate = iface.transformers.validate;
-      iface.transformers.validate = { transform: (value, args) => Util.map(value, (v) => {
-        const concrete = Util.isPlainObject(v) ? $schema.models[iface.typeMap[v[iface.typeField]]] : null;
-        return concrete ? concrete.transformers.validate.transform(v, args) : baseValidate.transform(v, args);
-      }) };
+      // validate AND toDriver must also dispatch to the concrete model. The interface aggregates EVERY
+      // implementer's fields, and when two variants declare the SAME field name with DIFFERENT types
+      // (e.g. careMap.title: MultiLang! vs scheduledAppointments.title: TextComponent!), the aggregated
+      // field keeps whichever was parsed first. Running validate/toDriver against that aggregated shape
+      // then either over-validates (sibling required fields) or mis-serializes the value into storage
+      // (the MultiLang title gets mangled to {} by the TextComponent serializer). create/update already
+      // stamped the typeField on the flat doc, so route both phases by that; fall back to the aggregated
+      // transformer when the type is unknown.
+      ['validate', 'toDriver', 'deserialize'].forEach((phase) => {
+        const base = iface.transformers[phase];
+        iface.transformers[phase] = { transform: (value, args) => Util.map(value, (v) => {
+          const concrete = Util.isPlainObject(v) ? $schema.models[iface.typeMap[v[iface.typeField]]] : null;
+          return concrete ? concrete.transformers[phase].transform(v, args) : base.transform(v, args);
+        }) };
+      });
+
+      // docTransform is the embedded-deserialization path (called by Resolver.toResultSet). It
+      // recurses through embedded fields using each field's own model.docTransform, so the
+      // aggregated interface field wins instead of the concrete variant's. Route through the
+      // concrete model's docTransform so shared field names with different embedded types each
+      // get the right deserializer (e.g. config: TextThing vs config: ListThing).
+      const baseDocTransform = iface.docTransform;
+      iface.docTransform = (doc, args, selection) => {
+        if (!Util.isPlainObject(doc)) return baseDocTransform(doc, args, selection);
+        const concrete = $schema.models[iface.typeMap[doc[iface.typeField]]];
+        return concrete ? concrete.docTransform(doc, args, selection) : baseDocTransform(doc, args, selection);
+      };
     }
   });
 
