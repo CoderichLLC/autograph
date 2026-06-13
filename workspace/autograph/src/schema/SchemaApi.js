@@ -41,11 +41,20 @@ function generateApi(schema) {
   const createModels = Object.values(schema.models).filter(model => [model.crud, model.scope].join()?.includes('c'));
   const updateModels = Object.values(schema.models).filter(model => [model.crud, model.scope].join()?.includes('u'));
 
+  // A @oneOf interface owns the polymorphic API surface; its implementers are reachable ONLY
+  // through it — write via the interface's @oneOf input, read via find<Interface>(where: { type }).
+  // Implementers must still emit their Input{Create,Update} (the @oneOf references them) and keep
+  // their field resolvers, but they get NO standalone operations, where/sort inputs, or connection
+  // types. (Their `type` discriminator is read-only and stamped only by the interface's oneOf
+  // dispatch, so a standalone concrete create couldn't satisfy it anyway.)
+  const isOneOfImplementer = model => (model.interfaces || []).some(name => schema.models[name]?.oneOf);
+
   // These are for defining schema queries/mutations
   const entityModels = Object.values(schema.models).filter(model => model.isEntity);
-  const queryModels = entityModels.filter(model => model.crud?.includes('r'));
-  const mutationModels = entityModels.filter(model => ['c', 'u', 'd'].some(el => model.crud?.includes(el)));
-  const subscriptionModels = entityModels.filter(model => model.crud?.includes('s'));
+  const readApiModels = readModels.filter(model => !isOneOfImplementer(model));
+  const queryModels = entityModels.filter(model => model.crud?.includes('r') && !isOneOfImplementer(model));
+  const mutationModels = entityModels.filter(model => ['c', 'u', 'd'].some(el => model.crud?.includes(el)) && !isOneOfImplementer(model));
+  const subscriptionModels = entityModels.filter(model => model.crud?.includes('s') && !isOneOfImplementer(model));
 
   return {
     typeDefs: `
@@ -71,8 +80,10 @@ function generateApi(schema) {
         }
       `)}
 
-      ${readModels.map((model) => {
-        const fields = Object.values(model.fields).filter(field => field.crud?.includes('r'));
+      ${readApiModels.map((model) => {
+        // Interface models aggregate implementer fields (for inputs/pipelines); scope the
+        // where/sort inputs to the interface's OWN fields so sibling-subtype fields don't leak in.
+        const fields = Object.values(model.fields).filter(field => field.crud?.includes('r') && (!model.isInterface || model.ownFields?.has(field.name)));
 
         // Note: connection fields (`@field(connection: true)`) are rewritten in place on the
         // user's existing type by Schema#rewriteConnections, called from .api() before this

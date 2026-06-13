@@ -335,3 +335,68 @@ describe('persisted interface with entity-reference variant field', () => {
     expect(() => makeExecutableSchema(obj)).not.toThrow(); // threw before the fix
   });
 });
+
+// Generated API SURFACE for a PERSISTED @oneOf interface. The interface owns the whole polymorphic
+// API: ONE CRUD set on the interface, NONE on its implementers — they're reachable only through it
+// (write via the @oneOf input; read via find<Interface>(where: { type })). Implementers must still
+// emit their Input{Create,Update} (the @oneOf references them) but get no standalone operations,
+// where/sort inputs, or connection types. The interface's where/sort are scoped to its OWN fields
+// so sibling-variant fields don't leak in. (Mirrors the real-world dashboard component tree.)
+describe('persisted @oneOf interface — generated API surface', () => {
+  const td = `
+    interface Gadget @model(key: "gadget", oneOf: true) {
+      id: ID! @field(key: "_id")
+      type: GadgetType! @field(crud: r)
+      label: String!
+    }
+    enum GadgetType { sprocket cog }
+    type Sprocket implements Gadget @model(typeValue: "sprocket") { teeth: Int }
+    type Cog implements Gadget @model(typeValue: "cog") { ratio: Float }
+  `;
+
+  let executable;
+  beforeAll(() => { executable = makeExecutableSchema(new Schema({}).merge(td).api().toObject()); });
+
+  test('the interface owns a single CRUD set; implementers expose none', () => {
+    const mutations = executable.getMutationType().getFields();
+    expect(mutations).toHaveProperty('createGadget');
+    expect(mutations).toHaveProperty('updateGadget');
+    expect(mutations).toHaveProperty('deleteGadget');
+    expect(mutations).not.toHaveProperty('createSprocket');
+    expect(mutations).not.toHaveProperty('updateCog');
+    expect(mutations).not.toHaveProperty('deleteSprocket');
+
+    const queries = executable.getQueryType().getFields();
+    expect(queries).toHaveProperty('getGadget');
+    expect(queries).toHaveProperty('findGadget');
+    expect(queries).not.toHaveProperty('getSprocket');
+    expect(queries).not.toHaveProperty('findCog');
+  });
+
+  test('implementers still emit Input{Create,Update} referenced by the @oneOf', () => {
+    const create = executable.getType('GadgetInputCreate');
+    expect(create.isOneOf).toBe(true);
+    expect(create.getFields()).toHaveProperty('sprocket');
+    expect(create.getFields()).toHaveProperty('cog');
+    expect(String(create.getFields().sprocket.type)).toBe('SprocketInputCreate');
+    expect(executable.getType('SprocketInputCreate').getFields()).toHaveProperty('teeth');
+    expect(executable.getType('CogInputUpdate').getFields()).toHaveProperty('ratio');
+  });
+
+  test('the interface InputWhere is scoped to its own fields (no cross-variant aggregation)', () => {
+    const where = executable.getType('GadgetInputWhere').getFields();
+    expect(where).toHaveProperty('type'); // own (the discriminator — backs find(where: { type }))
+    expect(where).toHaveProperty('label'); // own
+    expect(where).not.toHaveProperty('teeth'); // Sprocket-only — must not leak onto the interface
+    expect(where).not.toHaveProperty('ratio'); // Cog-only
+  });
+
+  test('implementers emit no standalone where/sort/connection types', () => {
+    ['Sprocket', 'Cog'].forEach((impl) => {
+      expect(executable.getType(`${impl}InputWhere`)).toBeUndefined();
+      expect(executable.getType(`${impl}InputSort`)).toBeUndefined();
+      expect(executable.getType(`${impl}Connection`)).toBeUndefined();
+      expect(executable.getType(`${impl}Edge`)).toBeUndefined();
+    });
+  });
+});
