@@ -86,3 +86,32 @@ describe('@oneOf variant validation', () => {
     expect(read.config).toEqual({ items: ['a', 'b'] });
   });
 });
+
+/**
+ * The @oneOf discriminator is framework-owned: stamped from the wrapper key, dropped from inputs
+ * (crud:r), and — crucially — guarded by an auto-applied `immutable` validate rule so it cannot be
+ * MORPHED on update. crud:r only governs the generated GraphQL surface; the resolver path below has
+ * no such gate, so without `immutable` an update wrapped under a different variant key would silently
+ * re-stamp the discriminator and partial-merge into a half-morphed doc. This proves it's rejected.
+ */
+describe('@oneOf discriminator immutability', () => {
+  test('updating under the SAME variant key succeeds (discriminator unchanged)', async () => {
+    const created = await resolver.match('Comp').save({ withTitle: { position: 10, title: 'Orig' } });
+    const updated = await resolver.match('Comp').id(created.id).save({ withTitle: { title: 'Renamed' } });
+    expect(updated.type).toBe('withTitle');
+    expect(updated.title).toBe('Renamed');
+  });
+
+  test('updating under a DIFFERENT variant key is rejected (cannot morph the discriminator)', async () => {
+    const created = await resolver.match('Comp').save({ withTitle: { position: 11, title: 'Orig' } });
+    // withTitle -> withText would re-stamp `type` and merge WithText fields onto a WithTitle doc.
+    await expect(
+      resolver.match('Comp').id(created.id).save({ withText: { position: 11, label: { text: 'Nope' } } }),
+    ).rejects.toThrow(/immutable/);
+
+    // And the stored doc is untouched: still the original variant.
+    const read = await resolver.match('Comp').id(created.id).one();
+    expect(read.type).toBe('withTitle');
+    expect(read.title).toBe('Orig');
+  });
+});

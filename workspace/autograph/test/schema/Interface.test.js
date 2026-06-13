@@ -343,10 +343,12 @@ describe('persisted interface with entity-reference variant field', () => {
 // where/sort inputs, or connection types. The interface's where/sort are scoped to its OWN fields
 // so sibling-variant fields don't leak in. (Mirrors the real-world dashboard component tree.)
 describe('persisted @oneOf interface — generated API surface', () => {
+  // Note: `type` declares NO @field(crud: r) — a @oneOf interface auto-marks its discriminator
+  // read-only (it's stamped from the @oneOf key), so it drops out of inputs on its own.
   const td = `
     interface Gadget @model(key: "gadget", oneOf: true) {
       id: ID! @field(key: "_id")
-      type: GadgetType! @field(crud: r)
+      type: GadgetType!
       label: String!
     }
     enum GadgetType { sprocket cog }
@@ -373,22 +375,27 @@ describe('persisted @oneOf interface — generated API surface', () => {
     expect(queries).not.toHaveProperty('findCog');
   });
 
-  test('implementers still emit Input{Create,Update} referenced by the @oneOf', () => {
+  test('only `input` is reshaped by @oneOf: polymorphic, keyed by typeValue, branches = union(interface + own)', () => {
     const create = executable.getType('GadgetInputCreate');
     expect(create.isOneOf).toBe(true);
     expect(create.getFields()).toHaveProperty('sprocket');
     expect(create.getFields()).toHaveProperty('cog');
     expect(String(create.getFields().sprocket.type)).toBe('SprocketInputCreate');
-    expect(executable.getType('SprocketInputCreate').getFields()).toHaveProperty('teeth');
+
+    const sprocketCreate = executable.getType('SprocketInputCreate').getFields();
+    expect(sprocketCreate).toHaveProperty('label'); // inherited interface field (union)
+    expect(sprocketCreate).toHaveProperty('teeth'); // own
+    expect(sprocketCreate).not.toHaveProperty('type'); // discriminator auto read-only -> excluded from input
     expect(executable.getType('CogInputUpdate').getFields()).toHaveProperty('ratio');
   });
 
-  test('the interface InputWhere is scoped to its own fields (no cross-variant aggregation)', () => {
+  test('where/sort stay FAT regardless of @oneOf (aggregated union of all implementer fields)', () => {
     const where = executable.getType('GadgetInputWhere').getFields();
-    expect(where).toHaveProperty('type'); // own (the discriminator — backs find(where: { type }))
-    expect(where).toHaveProperty('label'); // own
-    expect(where).not.toHaveProperty('teeth'); // Sprocket-only — must not leak onto the interface
-    expect(where).not.toHaveProperty('ratio'); // Cog-only
+    expect(where).toHaveProperty('type'); // discriminator stays queryable -> backs find(where: { type })
+    expect(where).toHaveProperty('label'); // interface own
+    expect(where).toHaveProperty('teeth'); // Sprocket variant — aggregated onto the fat where
+    expect(where).toHaveProperty('ratio'); // Cog variant — aggregated onto the fat where
+    expect(executable.getType('GadgetInputSort').getFields()).toHaveProperty('teeth'); // sort is fat too
   });
 
   test('implementers emit no standalone where/sort/connection types', () => {

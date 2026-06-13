@@ -81,9 +81,11 @@ function generateApi(schema) {
       `)}
 
       ${readApiModels.map((model) => {
-        // Interface models aggregate implementer fields (for inputs/pipelines); scope the
-        // where/sort inputs to the interface's OWN fields so sibling-subtype fields don't leak in.
-        const fields = Object.values(model.fields).filter(field => field.crud?.includes('r') && (!model.isInterface || model.ownFields?.has(field.name)));
+        // `where`/`sort` are FAT for an interface: the field set is the aggregated union of all
+        // implementer fields (only `input` is reshaped by @oneOf). readApiModels has already
+        // dropped the oneOf IMPLEMENTERS, so the per-subtype where/sort/connection types are not
+        // emitted — the interface's fat where covers querying the whole polymorphic collection.
+        const fields = Object.values(model.fields).filter(field => field.crud?.includes('r'));
 
         // Note: connection fields (`@field(connection: true)`) are rewritten in place on the
         // user's existing type by Schema#rewriteConnections, called from .api() before this

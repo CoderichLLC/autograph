@@ -583,6 +583,25 @@ function parseSchema(config, typeDefs) {
     // so the stored doc is a flat concrete doc that __resolveType can map on read. validate/toDriver
     // need no special-casing — they run on the already-flattened concrete doc via aggregated fields.
     if (iface.oneOf) {
+      // The discriminator is derived from the @oneOf key, never user-supplied. Two guards, at two
+      // different layers, because crud governs ONLY the generated GraphQL surface — it is never
+      // consulted on the programmatic resolver.save() path:
+      //   1. crud='r' drops it from the generated inputs so a GraphQL client can't supply it (the
+      //      dispatch below stamps it from the typeValue). A fat/non-oneOf interface keeps its
+      //      discriminator writable: there's no key to derive it from, so it must come from input.
+      //   2. 'immutable' on the validate pipeline guards the UPDATE path on EVERY surface (GraphQL
+      //      and programmatic): an update wrapped under a different typeValue would otherwise re-stamp
+      //      the discriminator and partial-merge into a half-morphed doc. immutable compares the
+      //      stamped value against the stored doc and rejects the variant switch (a delete+create job).
+      //      It is a no-op on create (no prior value), so it does not block legitimate creation.
+      [iface, ...Object.values($schema.models).filter(m => !m.isInterface && m.interfaces?.includes(iface.name))].forEach((m) => {
+        const typeField = m.fields[iface.typeField];
+        if (!typeField) return;
+        typeField.crud = 'r';
+        if (!typeField.pipelines.validate.includes('immutable')) typeField.pipelines.validate.push('immutable');
+        m.buildDerived($schema); // field pipeline changed — rebuild transformers so validate picks up 'immutable'
+      });
+
       const dispatch = (crud, v, args) => {
         if (!Util.isPlainObject(v)) return v;
         const [typeValue, inner] = Object.entries(v)[0] || [];
