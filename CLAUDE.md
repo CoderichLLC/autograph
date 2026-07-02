@@ -68,7 +68,7 @@ GraphQL Schema (typeDefs with directives)
 
 - `workspace/autograph/src/data/DataLoader.js` — Smart batch merging. Groups queries by structural fingerprint (op, sort, limit, skip, select), finds clusters that differ in exactly one where-key, and collapses them into a single `$in` driver call chunked at 500.
 
-- `workspace/autograph/src/data/TransactionScope.js` — Identity-based per-data-source transaction bookkeeping (session map, serialization queue, cache-invalidation thunk routing). `workspace/autograph/src/data/TransactionContext.js` — thin `AsyncLocalStorage` wrapper propagating "the currently ambient scope" to nested/sibling calls. See Transactions.
+- `workspace/autograph/src/data/TransactionScope.js` — Identity-based per-data-source transaction bookkeeping (session map, per-session serialization queue, settle-state, cache-invalidation thunk routing). There is no ambient-context mechanism (`AsyncLocalStorage` was tried and removed) — scopes propagate by explicit reference-threading through the resolver you hold. `TransactionScope.run(session, fn)` is the static front door that serializes **every** physical driver call (reads and writes) carrying a session. See Transactions.
 
 - `workspace/mongo-driver/src/MongoDriver.js` — MongoDB 6.x driver adapter. Uses aggregation pipelines for all queries (including finds). Supports `$lookup` joins for populated fields.
 
@@ -106,6 +106,7 @@ Full event lifecycle per request:
 
 ```
 preQuery / preMutation → validate → postQuery / postMutation → preResponse → postResponse
+                                       ⋯ transaction truly settles ⋯ → postCommit | postRollback
 ```
 
 ```js
@@ -117,7 +118,35 @@ emitter.on('postMutation',({ schema, context, resolver, query }) => { ... });
 emitter.on('validate',    ({ schema, context, resolver, query }) => { ... });
 emitter.on('preResponse', ({ schema, context, resolver, query }) => { ... });
 emitter.on('postResponse',({ schema, context, resolver, query }) => { ... });
+emitter.on('postCommit',  ({ schema, context, resolver, query }) => { ... }); // mutations only
+emitter.on('postRollback',({ schema, context, resolver, query }) => { ... }); // mutations only
 ```
+
+**`postCommit` / `postRollback` — the durable-outcome events.** `pre/postMutation` bracket the
+*write* (both run inside any ambient transaction and share its fate); `postCommit`/`postRollback`
+bracket the *transaction*. `postCommit` fires once per mutation when its write is truly durable —
+after the carrying transaction's real commit (a `*Many`/RI wrap's own commit, or the host's
+end-of-request `resolver.commit()` under `autoTransaction`), or immediately after the
+`postResponse` phase for a write no transaction carried. `postRollback` is the compensation hook —
+the write succeeded but was then undone by its transaction rolling back. Use `postMutation` for
+anything that must share the mutation's fate (atomic follow-up writes via `event.resolver`,
+shaping `query.result`) or complete before the response; use `postCommit` only for irreversible
+external side effects (email, webhooks, queue publishes). Fire-and-forget semantics: they cannot
+shape the response, listener failures are isolated (never rejecting `commit()` or the mutation),
+and under `autoTransaction` a `postCommit` write through `event.resolver` throws (its scope has
+settled) — start a fresh unit with `event.resolver.transaction()` instead.
+
+**Failure semantics are role-graded** (see TRANSACTIONS.md §4.15). `preMutation`/`validate`
+failures abort the write (`PreOperationError`). A `postMutation` failure — the *participant*
+phase — **aborts the whole transaction** when one carries the write (a plain `throw` is the abort
+signal, same as every DB trigger/ORM convention; opt into tolerance with your own `try/catch`);
+when nothing carries the write it is already durable, and the failure surfaces as
+`PostOperationError` with `.result`. `preResponse`/`postResponse` failures — the *presenter*
+phase — are always `PostOperationError` (data committed, presentation failed; never
+rollback-worthy). `postCommit`/`postRollback` failures are isolated and cannot affect anything.
+Note: async **basic** (arity < 2) listeners are fire-and-forget on every event — their rejections
+are deterministically swallowed (never an unhandled rejection); use the next-style (arity ≥ 2)
+form when a hook's async failure must mean something.
 
 `query` is the single source of truth. Key properties:
 
@@ -208,10 +237,10 @@ class MyDriver {
 
 ### Transactions
 
-Two independent mechanisms, both built on `TransactionScope`/`TransactionContext`:
+Two independent mechanisms, both built on `TransactionScope`:
 
 - **Manual** — `resolver.transaction({ isolated = true, coupled = true })` / `.commit()` / `.rollback()`. An explicit "break out into my own transaction" demarcation. `isolated` clones the resolver (its own DataLoader cache); `coupled` (default) offers whatever's currently ambient to the driver as a parent and accepts whatever relationship comes back — pass `coupled: false` to force a wholly independent transaction regardless of driver capability.
-- **Automatic, always-on** — RI cascades (`onDelete: cascade/nullify/restrict`) and `*Many` batch ops (`createMany`/`updateMany`/`pushMany`/`pullMany`/`spliceMany`/`deleteMany`) are unconditionally wrapped in their own scope in `QueryResolver.js` (`#withTransaction`), regardless of the flag below — autograph is both the opener and definitive closer of these bounded operations, so no external signal is needed.
+- **Automatic, always-on** — RI cascades (`onDelete: cascade/nullify/restrict`) and `*Many` batch ops (`createMany`/`updateMany`/`pushMany`/`pullMany`/`spliceMany`/`deleteMany`) are unconditionally wrapped in their own scope in `QueryResolver.js` (via `resolver.withTransaction()` — the same public API a manual caller uses), regardless of the flag below — autograph is both the opener and definitive closer of these bounded operations, so no external signal is needed.
 - **Automatic, opt-in** — `new Resolver({ autoTransaction: true })` gives the resolver its own root scope at construction (cheap — no driver session until the first write). Every operation for that resolver's lifetime (i.e. the whole request, given the one-`Resolver`-per-request convention) shares it once bound. Left opt-in because `Resolver` is also used in contexts with no "end of request" to hook (scripts, admin tools, REPL, background jobs) — the host **must** call `resolver.commit()`/`.rollback()` at a deterministic completion point (e.g. an Apollo Server `willSendResponse`/`didEncounterErrors` plugin) when this is enabled; there is no timing-heuristic auto-commit.
 
 A scope only actually calls `client.transaction()` for data sources whose `supports` array includes `'transactions'` — sources that don't participate run exactly as if no scope existed. See `TransactionScope.js` for the identity-based coupled/independent mechanism.
@@ -243,9 +272,12 @@ function nextId() {
 
 - Not all mutations go through `$aggregateQuery` in MongoDriver (loses `$project`)
 - `debug` flag is not always propagated through `findMany`, `pullMany`, etc.
-- `Resolver` gives no explicit "settled" state after `.commit()`/`.rollback()` — a stale write
-  issued against an already-closed scope fails with a raw driver error (e.g. Mongo "session
-  ended") rather than a clear AG-level one. Flagged as a follow-up robustness item, not yet fixed.
+- ~~`Resolver` gives no explicit "settled" state after `.commit()`/`.rollback()`~~ — fixed:
+  `TransactionScope` now tracks `state` (`open`/`committed`/`rolledBack`); commit/rollback are
+  idempotent (memoized), a stale **write** against a settled scope rejects with a clear AG-level
+  error, and a **read** through a settled scope degrades to a plain sessionless read of committed
+  state (needed because docs returned from a transaction lazily resolve populated fields through
+  the same, now-settled resolver during response serialization).
 - **`.where({ field: { $in: [...] } })` reads return nothing, even when matching documents exist**
   (model- and field-agnostic — reproduces on any model/field, not specific to any particular
   mutation path). Root cause (via code trace, not yet fixed): `Query.js#finalize` flattens `where`
@@ -259,8 +291,8 @@ function nextId() {
 
 ## Release 0.16 Goals
 
-- ~~Re-introduce transactions with explicit `TransactionScope`~~ — done (`TransactionScope.js` +
-  `TransactionContext.js`); see Transactions above.
+- ~~Re-introduce transactions with explicit `TransactionScope`~~ — done (`TransactionScope.js`);
+  see Transactions above.
 - `createMany`/`updateMany` as true driver-level batch operations (not N serial `createOne` calls)
   — still N serial calls today, just now atomically wrapped, not batched at the driver level.
 - Enforce `dataSources.supports` capability flags (`transactions`, `joins`, `batches`, `referentialIntegrity`)

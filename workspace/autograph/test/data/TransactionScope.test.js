@@ -167,6 +167,192 @@ describe('TransactionScope', () => {
     });
   });
 
+  describe('settle-state — commit()/rollback() are idempotent, stale use fails loudly', () => {
+    test('double commit() only touches the driver handle once (memoized settlement)', async () => {
+      const { client, handles } = createMockClient();
+      const scope = new TransactionScope();
+      await scope.getSession(client);
+
+      await scope.commit();
+      await scope.commit();
+      expect(handles[0].commit).toHaveBeenCalledTimes(1);
+      expect(scope.state).toBe('committed');
+    });
+
+    test('rollback() after commit() is a no-op — the transaction\'s fate is already sealed', async () => {
+      const { client, handles } = createMockClient();
+      const scope = new TransactionScope();
+      await scope.getSession(client);
+
+      await scope.commit();
+      await scope.rollback();
+      expect(handles[0].rollback).not.toHaveBeenCalled();
+      expect(scope.state).toBe('committed');
+    });
+
+    test('getSession() against a settled scope rejects with a clear AG-level error, not a raw driver one', async () => {
+      const { client } = createMockClient();
+      const scope = new TransactionScope();
+      await scope.getSession(client);
+      await scope.commit();
+
+      await expect(scope.getSession(client)).rejects.toThrow(/already committed/);
+    });
+
+    test('enqueue() against a settled scope throws a clear AG-level error', async () => {
+      const { client } = createMockClient();
+      const scope = new TransactionScope();
+      await scope.getSession(client);
+      await scope.rollback();
+
+      expect(() => scope.enqueue(client, () => Promise.resolve())).toThrow(/already rolledBack/);
+    });
+
+    test('peekSession() hands out nothing once settled — a settled scope has no session to offer', async () => {
+      const { client } = createMockClient();
+      const scope = new TransactionScope();
+      const session = await scope.getSession(client);
+      expect(scope.peekSession(client)).toBe(session);
+
+      await scope.commit();
+      expect(scope.peekSession(client)).toBeUndefined();
+    });
+
+    test('joining (coupled) a parent that has already settled rejects clearly', async () => {
+      const { client } = createMockClient();
+      const parentScope = new TransactionScope();
+      await parentScope.getSession(client);
+      await parentScope.commit();
+
+      const childScope = new TransactionScope({ parent: parentScope });
+      await expect(childScope.getSession(client)).rejects.toThrow(/already committed/);
+    });
+  });
+
+  describe('addSettled — outcome-aware, deduped, isolated', () => {
+    test('settled callbacks receive the outcome (commit vs rollback)', async () => {
+      const { client } = createMockClient();
+      const outcomes = [];
+
+      const committed = new TransactionScope();
+      await committed.getSession(client);
+      committed.addSettled(client, o => outcomes.push(o));
+      await committed.commit();
+
+      const rolledBack = new TransactionScope();
+      await rolledBack.getSession(client);
+      rolledBack.addSettled(client, o => outcomes.push(o));
+      await rolledBack.rollback();
+
+      expect(outcomes).toEqual(['commit', 'rollback']);
+    });
+
+    test('dedupes by key — N writes to one model need only one settle-time cache clear', async () => {
+      const { client } = createMockClient();
+      const scope = new TransactionScope();
+      await scope.getSession(client);
+
+      const fn = jest.fn();
+      scope.addSettled(client, fn, 'clear:Person');
+      scope.addSettled(client, fn, 'clear:Person');
+      scope.addSettled(client, fn, 'clear:Book');
+      await scope.commit();
+
+      expect(fn).toHaveBeenCalledTimes(2); // Person once, Book once
+    });
+
+    test('runs immediately (with the outcome) if the owner has already settled — its condition is already met', async () => {
+      const { client } = createMockClient();
+      const scope = new TransactionScope();
+      await scope.getSession(client);
+      await scope.commit();
+
+      const fn = jest.fn();
+      scope.addSettled(client, fn);
+      expect(fn).toHaveBeenCalledWith('commit');
+    });
+
+    test('a throwing settled callback never turns a successful commit into a rejected commit()', async () => {
+      const { client } = createMockClient();
+      const scope = new TransactionScope();
+      await scope.getSession(client);
+      scope.addSettled(client, () => { throw new Error('settled callback failure'); });
+
+      await expect(scope.commit()).resolves.toBeUndefined();
+    });
+  });
+
+  describe('run() — the physical front door serializes EVERY sessioned call (reads and writes)', () => {
+    // Regression: sessioned reads (DataLoader dispatches, *Many pre-image #gets, FK-validation
+    // reads) used to bypass the enqueue() queue and race in-flight writes on the same session —
+    // MongoDB supports exactly one in-flight operation per session. run() routes any sessioned
+    // call through the owning scope's queue; sessionless calls pass straight through.
+    const overlappingProbe = () => {
+      let active = 0;
+      let maxActive = 0;
+      const probe = () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        return new Promise((r) => { setTimeout(r, 5); }).then(() => { active -= 1; });
+      };
+      return { probe, max: () => maxActive };
+    };
+
+    test('sessioned calls via run() never overlap each other or enqueue()d writes', async () => {
+      const { client } = createMockClient();
+      const scope = new TransactionScope();
+      const session = await scope.getSession(client);
+      const { probe, max } = overlappingProbe();
+
+      await Promise.all([
+        TransactionScope.run(session, probe), // a "read"
+        scope.enqueue(client, probe), // a "write"
+        TransactionScope.run(session, probe), // another "read"
+      ]);
+
+      expect(max()).toBe(1);
+    });
+
+    test('a coupled child\'s sessioned calls serialize through the same (owner\'s) queue', async () => {
+      const { client } = createMockClient();
+      const parentScope = new TransactionScope();
+      const parentSession = await parentScope.getSession(client);
+      const childScope = new TransactionScope({ parent: parentScope });
+      const childSession = await childScope.getSession(client); // same physical session (coupled)
+      const { probe, max } = overlappingProbe();
+
+      await Promise.all([
+        TransactionScope.run(parentSession, probe),
+        TransactionScope.run(childSession, probe),
+        childScope.enqueue(client, probe),
+      ]);
+
+      expect(max()).toBe(1);
+    });
+
+    test('sessionless calls pass straight through — still genuinely parallel', async () => {
+      const { probe, max } = overlappingProbe();
+      await Promise.all([TransactionScope.run(undefined, probe), TransactionScope.run(undefined, probe)]);
+      expect(max()).toBe(2);
+    });
+
+    test('an unknown (caller-provided) session no scope owns passes through rather than failing', async () => {
+      const foreignSession = {};
+      await expect(TransactionScope.run(foreignSession, () => Promise.resolve('ok'))).resolves.toBe('ok');
+    });
+
+    test('run() against a settled owner rejects — never throws synchronously', async () => {
+      const { client } = createMockClient();
+      const scope = new TransactionScope();
+      const session = await scope.getSession(client);
+      await scope.commit();
+
+      let pending;
+      expect(() => { pending = TransactionScope.run(session, () => Promise.resolve()); }).not.toThrow();
+      await expect(pending).rejects.toThrow(/already committed/);
+    });
+  });
+
   describe('tagSession (regression)', () => {
     // Used by DataLoader's batch-merge fingerprint to keep a session-bound read from being merged
     // into the same driver call as a session-less or differently-sessioned one. Must never expose

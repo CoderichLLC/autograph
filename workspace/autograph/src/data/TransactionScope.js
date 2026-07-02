@@ -15,9 +15,12 @@ module.exports = class TransactionScope {
   parent;
   independent;
   eager; // if true, reads bind a session too (getSession), not just writes — see Resolver#resolve
+  #state = 'open'; // 'open' | 'committed' | 'rolledBack' — set exactly once, synchronously, by commit()/rollback()
+  #settlement; // memoized commit()/rollback() promise — repeat calls return it rather than re-settling
   #pending = new Map(); // client -> Promise<Entry>, claimed synchronously — see #claim
   #entries = new Map(); // client -> Entry ({ handle, coupled, queue }), populated once claimed
   #settled = []; // callbacks to run once this client's session is truly, finally sealed — see addSettled
+  #settledKeys = new Set(); // dedupe keys for addSettled — N writes to one model need only one clear thunk
 
   // Tags a session object with a small, stable, JSON-safe id — never the raw session itself
   // (MongoDB's ClientSession has circular references that would blow up JSON.stringify). Used by
@@ -33,10 +36,48 @@ module.exports = class TransactionScope {
     return this.#tags.get(session);
   }
 
+  // session -> { scope, client }: which scope owns this session's serialization queue. Registered
+  // at claim time by the scope that opened a real (non-coupled) handle; first-owner-wins so a
+  // hypothetical savepoint driver that returns a distinct handle wrapping the SAME session object
+  // still funnels every physical call through one queue. Keyed weakly — dies with the session.
+  static #owners = new WeakMap();
+
+  /**
+   * The front door for EVERY physical driver call that carries a session — reads and writes alike.
+   * A MongoDB session supports exactly one in-flight operation at a time; writes were always
+   * serialized through their scope's queue, but sessioned reads (DataLoader dispatches, *Many
+   * pre-image #get's, FK-validation reads) used to bypass it and race the writes — an intermittent,
+   * latency-dependent violation of the driver contract that an in-memory test server never shows.
+   * Sessionless calls (or a session no scope knows about, e.g. caller-provided) pass straight through.
+   */
+  static run(session, fn) {
+    const owner = session ? TransactionScope.#owners.get(session) : undefined;
+    if (!owner) return fn();
+    try {
+      return owner.scope.enqueue(owner.client, fn);
+    } catch (e) {
+      return Promise.reject(e); // e.g. the owning scope already settled — reject, never throw sync
+    }
+  }
+
   constructor({ parent = null, independent = false, eager = false } = {}) {
     this.parent = parent;
     this.independent = independent;
     this.eager = eager;
+  }
+
+  /**
+   * 'open' until commit()/rollback() is called on this scope, then 'committed'/'rolledBack' —
+   * settled scopes refuse new sessions/operations (loud AG-level error instead of a raw driver
+   * "session ended" error) and hand out no sessions via peekSession (a read through a settled
+   * scope degrades to a plain, committed-state read — see Resolver#resolve).
+   */
+  get state() {
+    return this.#state;
+  }
+
+  #assertOpen(action) {
+    if (this.#state !== 'open') throw new Error(`TransactionScope already ${this.#state}; cannot ${action} — this transaction has settled`);
   }
 
   // client.transaction() returns a HANDLE — { session, commit(), rollback() } — not the raw
@@ -48,12 +89,14 @@ module.exports = class TransactionScope {
   // N .save() calls via Promise.all); without claiming synchronously, each would see "no entry
   // yet" and open its own separate, independently-committed Mongo transaction.
   #claim(client) {
+    this.#assertOpen('open a session'); // also guards joining a parent that has already settled (via #getHandle)
     if (!this.#pending.has(client)) {
       this.#pending.set(client, (async () => {
         const parentHandle = (this.parent && !this.independent) ? await this.parent.#getHandle(client) : undefined;
         const handle = await client.transaction(parentHandle);
         const entry = { handle, coupled: handle === parentHandle, queue: Promise.resolve() };
         this.#entries.set(client, entry);
+        if (!entry.coupled && !TransactionScope.#owners.has(handle.session)) TransactionScope.#owners.set(handle.session, { scope: this, client });
         return entry;
       })());
     }
@@ -77,14 +120,17 @@ module.exports = class TransactionScope {
   // Opportunistic, non-claiming lookup for reads: if a write earlier in this scope (or an
   // ancestor it's coupled to) already bound a session for this client, reuse it (read-your-own-
   // writes within the transaction) — but never trigger a new client.transaction() just to serve
-  // a read that would otherwise need none.
+  // a read that would otherwise need none. A settled scope has no session to offer.
   peekSession(client) {
+    if (this.#state !== 'open') return undefined;
     return this.#entries.get(client)?.handle.session ?? this.parent?.peekSession(client);
   }
 
-  // Every physical driver call funnels through here so a shared (coupled) session never sees two
-  // concurrent operations. Coupled clients delegate to whoever actually owns that session's queue.
+  // Every physical driver call funnels through here (via the static run() front door, or directly
+  // for writes) so a shared (coupled) session never sees two concurrent operations. Coupled
+  // clients delegate to whoever actually owns that session's queue.
   enqueue(client, fn) {
+    this.#assertOpen('enqueue an operation');
     const entry = this.#entry(client);
     if (entry.coupled) return this.parent.enqueue(client, fn);
     entry.queue = entry.queue.then(fn, fn);
@@ -98,30 +144,63 @@ module.exports = class TransactionScope {
   // lands in the window between that write and the session's real commit can cache a pre-commit
   // view that would otherwise never get invalidated. Routes per-client, same as enqueue — a scope
   // can be coupled for one client and independent for another.
-  addSettled(client, fn) {
+  //
+  // fn receives the outcome ('commit' | 'rollback') when it eventually runs. `key`, if given,
+  // dedupes: N writes to the same model only need one settle-time cache clear, not N.
+  // If the true owner has already settled, fn runs immediately — its condition is already met.
+  addSettled(client, fn, key) {
+    if (this.#state !== 'open') return fn(this.#state === 'committed' ? 'commit' : 'rollback');
     const entry = this.#entry(client);
-    if (entry?.coupled) return this.parent.addSettled(client, fn);
+    if (entry?.coupled) return this.parent.addSettled(client, fn, key);
+    if (key !== undefined) {
+      if (this.#settledKeys.has(key)) return undefined;
+      this.#settledKeys.add(key);
+    }
     this.#settled.push(fn);
     return undefined;
   }
 
-  async commit() {
-    const entries = await Promise.all([...this.#pending.values()]);
+  // Idempotent: the first call settles; repeat calls (commit-after-commit, rollback-after-commit —
+  // e.g. a coupled child propagating rollback to a parent that a withTransaction wrapper also
+  // settles) return the same memoized settlement rather than re-running settled callbacks or
+  // re-touching driver handles.
+  commit() {
+    if (this.#state !== 'open') return this.#settlement;
+    this.#state = 'committed';
+    this.#settlement = this.#settle('commit');
+    return this.#settlement;
+  }
+
+  rollback() {
+    if (this.#state !== 'open') return this.#settlement;
+    this.#state = 'rolledBack';
+    this.#settlement = this.#settle('rollback');
+    return this.#settlement;
+  }
+
+  async #settle(outcome) {
+    // allSettled on the claims: a claim that failed to even open (client.transaction rejected)
+    // has nothing to settle, and its rejection already surfaced at the call site that triggered
+    // it — it must not resurface here.
+    const claims = await Promise.allSettled([...this.#pending.values()]);
+    const entries = claims.filter(c => c.status === 'fulfilled').map(c => c.value);
+
     // allSettled, not all: we only need to know every enqueued operation has *finished*, not that
     // they all succeeded — a caller's own failed write already rejected their own call site; that
     // rejection must not also make commit()/rollback() throw a stale, unrelated error here.
     await Promise.allSettled(entries.map(e => e.queue));
-    await Promise.all(entries.filter(e => !e.coupled).map(e => e.handle.commit()));
-    await Promise.all(this.#settled.map(fn => fn()));
-  }
 
-  async rollback() {
-    const entries = await Promise.all([...this.#pending.values()]);
-    await Promise.allSettled(entries.map(e => e.queue));
-    // Coupled means this scope shares a physical session with an ancestor — MongoDB has no
-    // savepoints, so there is nothing partial to undo; the whole shared transaction must abort.
-    if (entries.some(e => e.coupled)) await this.parent.rollback();
-    await Promise.all(entries.filter(e => !e.coupled).map(e => e.handle.rollback()));
-    await Promise.all(this.#settled.map(fn => fn()));
+    if (outcome === 'commit') {
+      await Promise.all(entries.filter(e => !e.coupled).map(e => e.handle.commit()));
+    } else {
+      // Coupled means this scope shares a physical session with an ancestor — MongoDB has no
+      // savepoints, so there is nothing partial to undo; the whole shared transaction must abort.
+      if (entries.some(e => e.coupled)) await this.parent.rollback();
+      await Promise.all(entries.filter(e => !e.coupled).map(e => e.handle.rollback()));
+    }
+
+    // Settled callbacks are isolated (allSettled): the transaction's fate is already sealed above;
+    // a throwing callback must never turn a successful commit into a rejected commit() promise.
+    await Promise.allSettled(this.#settled.map(fn => Promise.resolve().then(() => fn(outcome))));
   }
 };

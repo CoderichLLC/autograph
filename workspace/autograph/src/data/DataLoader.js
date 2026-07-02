@@ -163,10 +163,13 @@ module.exports = class Loader {
     return clusters;
   }
 
+  // Every execute below goes through TransactionScope.run: a sessioned read must be serialized
+  // through the same per-session queue as that session's writes (MongoDB allows exactly one
+  // in-flight operation per session). Sessionless reads pass straight through, zero overhead.
   static #runSingle(client, batch) {
     const plan = client.prepare(batch.$query);
     if (batch.$query.flags?.debug) inspect(plan);
-    return client.execute(plan).then(data => [{ data, ...batch }]);
+    return TransactionScope.run(batch.$query.options?.session, () => client.execute(plan)).then(data => [{ data, ...batch }]);
   }
 
   // Execute one merged query for a cluster, then distribute results back to each original batch
@@ -191,7 +194,7 @@ module.exports = class Loader {
     if (allValues.length < 3) {
       return Promise.all(batches.map((b) => {
         const plan = client.prepare(b.$query);
-        return client.execute(plan).then(data => ({ data, ...b }));
+        return TransactionScope.run(b.$query.options?.session, () => client.execute(plan)).then(data => ({ data, ...b }));
       }));
     }
 
@@ -204,7 +207,12 @@ module.exports = class Loader {
     for (let i = 0; i < allValues.length; i += CHUNK_SIZE) chunks.push(allValues.slice(i, i + CHUNK_SIZE));
     const chunkPlans = chunks.map(values => client.prepare({ ...batches[0].$query, op: 'findMany', where: { ...sharedWhere, [batchKey]: { $in: values } } }));
 
-    return Promise.all(chunkPlans.map(plan => client.execute(plan))).then((docsByChunk) => {
+    // The structural fingerprint includes the session tag, so every batch in this cluster shares
+    // one session (or none). With a session, TransactionScope.run serializes the chunks through
+    // that session's queue — Promise.all here only collects; it no longer implies parallel
+    // operations on one session.
+    const session = batches[0].$query.options?.session;
+    return Promise.all(chunkPlans.map(plan => TransactionScope.run(session, () => client.execute(plan)))).then((docsByChunk) => {
       // Dedupe across chunks by id. When the fanout key is an array-valued field (e.g.,
       // NetworkPlace.ancestors), a doc whose array spans multiple chunks is returned by each.
       // Set-based dedupe later compares by reference and can't collapse those JS-distinct

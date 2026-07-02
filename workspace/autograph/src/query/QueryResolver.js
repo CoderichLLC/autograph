@@ -5,17 +5,23 @@ const { PostOperationError } = require('../service/ErrorService');
 
 // Runs a fan-out of independent per-element mutations (createMany/updateMany/etc's elements) to
 // completion regardless of individual failures — never lets Promise.all's "first rejection wins"
-// race mask a genuine write failure behind an unrelated element's PostOperationError (a post-write
-// hook failure, which must not trigger a rollback — see Resolver#withTransaction). Any real
-// failure anywhere in the batch still rolls back everything, exactly as before; a batch where the
-// only failures are PostOperationErrors commits (every write succeeded) and surfaces them to the
-// caller as one PostOperationError (aggregated if there's more than one).
+// race mask a genuine failure behind an unrelated element's PostOperationError (a presenter-phase
+// preResponse/postResponse failure — the element's data is complete and correct, only its
+// presentation broke — which must not trigger a rollback; see Resolver#withTransaction). Any real
+// failure anywhere in the batch — including a participant (postMutation) failure, which arrives
+// unwrapped — still rolls back everything; a batch where the only failures are
+// PostOperationErrors commits (every element's data is complete) and surfaces them to the caller
+// as one PostOperationError (aggregated if there's more than one).
 const settleMany = async (promises) => {
   const settled = await Promise.allSettled(promises);
   const real = settled.find(s => s.status === 'rejected' && !(s.reason instanceof PostOperationError));
   if (real) throw real.reason;
 
-  const values = settled.filter(s => s.status === 'fulfilled').map(s => s.value);
+  // Positionally aligned with the input. An element rejected with a PostOperationError DID commit
+  // its write (only its post-write hook failed) — its written result belongs in the recovery
+  // payload (.result) just as much as a fully-clean element's does, or a caller reconciling
+  // "what is actually in the database now" would undercount.
+  const values = settled.map(s => (s.status === 'fulfilled' ? s.value : s.reason.result));
   const postFailures = settled.filter(s => s.status === 'rejected').map(s => s.reason.data);
   if (postFailures.length === 1) throw new PostOperationError(postFailures[0], values);
   if (postFailures.length > 1) throw new PostOperationError(new AggregateError(postFailures), values);
@@ -130,9 +136,7 @@ module.exports = class QueryResolver extends QueryBuilder {
         });
       }
       case 'deleteOne': {
-        return this.#get(query).then((doc) => {
-          return this.#resolveReferentialIntegrity(doc, txn => txn.resolve(query.clone({ doc })).then(() => doc));
-        });
+        return this.#resolveReferentialIntegrity(query);
       }
       case 'deleteMany': {
         return this.#resolver.withTransaction((txn) => {
@@ -155,9 +159,9 @@ module.exports = class QueryResolver extends QueryBuilder {
     return resolver.resolve(query.clone({ op: 'findMany', key: `find${this.#model.name}`, crud: 'read', isMutation: false }));
   }
 
-  // The sole entry point for "does this delete need transactional demarcation" — the cascade walk
-  // AND whatever the caller wants to happen after it (the actual delete) are both part of the same
-  // wrapped `run`, so there's no separate dance at the call site to keep in sync with this decision.
+  // The sole entry point for deleteOne — the pre-image read, the cascade walk, AND the actual
+  // delete are all part of the same wrapped `run`, so there's no separate dance at the call site
+  // to keep in sync with the "does this delete need transactional demarcation" decision.
   //
   // RI cascades are self-contained: autograph itself is both the opener and the definitive closer
   // of this unit of work (unlike a whole GraphQL request, whose end AG cannot observe), so it's
@@ -165,20 +169,24 @@ module.exports = class QueryResolver extends QueryBuilder {
   // is the exact same public method a manual caller uses — always `{ isolated: true }` (its
   // default), since this can be triggered from code sharing a resolver instance with concurrent
   // siblings (e.g. two postMutation hooks on the same event) and must never mutate that shared
-  // instance's own scope. `andThen` always receives whichever resolver ends up being used —
-  // the transactional clone if wrapped, or `this.#resolver` unchanged if not — so callers never
-  // need to know which case they're in.
-  #resolveReferentialIntegrity(doc, andThen = () => doc) {
+  // instance's own scope.
+  #resolveReferentialIntegrity(query) {
     // Sequential, not Promise.allSettled+settleMany like the *Many fan-outs above — each step
     // targets a different model/rule, order isn't independent the way batch elements are, so it
     // stays a walk. But it still can't use a plain stop-at-first-rejection chain: a
-    // PostOperationError from an early step (its write already succeeded, only its post-write
-    // hook failed) must not abort the walk — doing so would leave LATER cascade steps never even
-    // attempted, yet still committed as if the cascade were complete (see
-    // Resolver#withTransaction's commit-on-PostOperationError). So: catch a PostOperationError per
-    // step, stash it, keep walking; a real failure still stops the walk immediately (rollback is
-    // correct there — no reason to keep going). Aggregated at the end, same as settleMany.
+    // PostOperationError from an early step (its data is complete, only its presenter-phase
+    // preResponse/postResponse hook failed) must not abort the walk — doing so would leave LATER
+    // cascade steps never even attempted, yet still committed as if the cascade were complete
+    // (see Resolver#withTransaction's commit-on-PostOperationError). So: catch a
+    // PostOperationError per step, stash it, keep walking; a real failure — including a
+    // participant (postMutation) failure, which arrives unwrapped — still stops the walk
+    // immediately (rollback is correct there). Aggregated at the end, same as settleMany.
     const run = async (txn) => {
+      // Pre-image read INSIDE the wrapped scope (eager — this read binds the session), so the
+      // cascade's where clauses, the restrict counts, and the delete itself all see one
+      // consistent view. Reading it before/outside the transaction left a window where the doc
+      // could change between the read and the cascade computed from it.
+      const doc = await this.#get(query, txn);
       const postFailures = [];
 
       for (const { model, field, isArray, path } of this.#model.referentialIntegrity) {
@@ -209,7 +217,7 @@ module.exports = class QueryResolver extends QueryBuilder {
 
       let result;
       try {
-        result = await andThen(txn);
+        result = await txn.resolve(query.clone({ doc })).then(() => doc);
       } catch (e) {
         if (!(e instanceof PostOperationError)) throw e;
         postFailures.push(e.data);

@@ -197,10 +197,17 @@ class Emitter extends EventEmitter {
     if (basicFuncs.length === 0 && nextFuncs.length === 0) return Promise.resolve();
 
     return new Promise((resolve, reject) => {
-      // Basic functions run first; if they return a value they abort the flow of execution
+      // Basic functions run first; if they return a value they abort the flow of execution.
+      // An ASYNC basic listener is fire-and-forget by design (its promise is deliberately not
+      // awaited and never short-circuits) — but its rejection must still be attached to a handler:
+      // a discarded rejected promise is an unhandled rejection, which is fatal on modern Node.
+      // Deterministically swallowed (not raced into emit's own promise, which would surface the
+      // failure only when it happened to lose a timing race — worse than never). A listener that
+      // wants its async failure to MEAN something must use the next-style (arity >= 2) form.
       basicFuncs.forEach((fn) => {
         const value = fn(data);
-        if (value !== undefined && !(value instanceof Promise)) throw new AbortEarlyError(value);
+        if (value instanceof Promise) { value.catch(() => {}); return; }
+        if (value !== undefined) throw new AbortEarlyError(value);
       });
 
       // Next functions are async and control the timing of the next phase

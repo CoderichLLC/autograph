@@ -194,7 +194,13 @@ module.exports = class Resolver {
    * @returns {Resolver} - the resolver to call .match()/.commit()/.rollback() on
    */
   transaction({ isolated = true, coupled = true } = {}) {
-    const parent = this.#transactionScope;
+    // A settled scope is no longer "ambient" — a new transaction started after commit()/rollback()
+    // is a fresh top-level unit, not a child of something that no longer exists.
+    const parent = this.#transactionScope?.state === 'open' ? this.#transactionScope : undefined;
+    // Replacing an ACTIVE scope in place would orphan it: this resolver's commit()/rollback()
+    // would from then on reach only the new (coupled, no-op-commit) child, leaving the original
+    // transaction unreachable and uncommitted until the driver's own timeout aborts it.
+    if (!isolated && parent) throw new Error('Resolver already has an active transaction scope; transaction({ isolated: false }) would orphan it. Use isolated: true (the default), or settle the current transaction first.');
     const target = isolated ? this.clone() : this;
     // eager: true — an explicit transaction() call (this method, unlike autoTransaction's
     // implicit whole-request root scope) binds a real session on its FIRST operation, read or
@@ -251,18 +257,22 @@ module.exports = class Resolver {
       await txn.commit();
       return result;
     } catch (e) {
-      // The underlying write(s) already succeeded — only a post-write hook failed (see
-      // PostOperationError in ErrorService.js / Resolver#createSystemEvent). There is nothing to
-      // undo; commit anyway and surface it to the caller. Thrown as-is (not unwrapped to `.data`)
-      // so callers get the same shape here as for a plain, non-wrapped mutation's own
-      // PostOperationError — `.data` for the original cause, `.result` for what was actually
-      // written despite the error (settleMany/#resolveReferentialIntegrity populate `.result` with
-      // everything that succeeded across the whole batch/cascade, not just one element).
+      // The underlying write(s) already succeeded — only a PRESENTER-phase hook (preResponse/
+      // postResponse) failed, or a write on a source that doesn't support transactions had a
+      // post-phase failure (see the role-graded post* phase in #createSystemEvent; a participant
+      // (postMutation) failure on a carried write arrives here UNWRAPPED and takes the rollback
+      // path below). There is nothing to undo; commit anyway and surface it to the caller. Thrown
+      // as-is (not unwrapped to `.data`) so callers get the same shape here as for a plain,
+      // non-wrapped mutation's own PostOperationError — `.data` for the original cause, `.result`
+      // for what was actually written despite the error (settleMany/#resolveReferentialIntegrity
+      // populate `.result` positionally across the whole batch/cascade, not just one element).
       if (e instanceof PostOperationError) {
         await txn.commit();
         throw Boom.boomify(e);
       }
-      await txn.rollback();
+      // Never let a secondary rollback failure (e.g. a session the original error already aborted
+      // server-side) mask the root cause — the original rejection is what the caller can act on.
+      await txn.rollback().catch(() => {});
       throw e;
     }
   }
@@ -309,7 +319,9 @@ module.exports = class Resolver {
         const executed = useScope
           ? useScope.getSession(client).then((session) => {
             driverQuery.options = { ...driverQuery.options, session };
-            return useScope.enqueue(client, dispatch);
+            // TransactionScope.run routes to whichever scope actually OWNS this session's queue —
+            // the single serialization front door shared with sessioned reads (see DataLoader).
+            return TransactionScope.run(session, dispatch);
           })
           : dispatch();
 
@@ -323,7 +335,8 @@ module.exports = class Resolver {
           // immediate clear and the transaction's real, final commit — caching a pre-commit view
           // that would otherwise never get invalidated. Clear again once this write's session is
           // truly, finally sealed (a no-op until then if nothing re-caches it in the meantime).
-          if (useScope) useScope.addSettled(client, () => this.clear(model));
+          // Keyed so N writes to one model register one settle-time clear, not N.
+          if (useScope) useScope.addSettled(client, () => this.clear(model), `clear:${model}`);
 
           // Return results
           if (crud === 'delete') return doc;
@@ -352,7 +365,13 @@ module.exports = class Resolver {
           return this.#queryPlanner.resolve(model, tquery, rq => this.#dataLoaders[model].resolve(rq));
         };
 
-        if (!scope) return dispatch();
+        // A SETTLED scope degrades reads to plain (committed-state, sessionless) reads rather
+        // than erroring: docs returned from a transaction lazily resolve their populated fields
+        // through the same (cloned, now-settled) resolver during response serialization — after
+        // withTransaction/commit() already sealed the session. Writes stay strict (getSession on
+        // a settled scope throws a clear AG-level error) — a stale write is a caller bug; a
+        // post-commit read of committed state is not.
+        if (!scope || scope.state !== 'open') return dispatch();
         const { supports, client } = this.#schema.models[model].source;
         if (!supports.includes('transactions')) return dispatch();
 
@@ -545,6 +564,9 @@ module.exports = class Resolver {
       && !Emitter.hasListenersFor(`post${type}`, qModel, qKey)
       && !Emitter.hasListenersFor('preResponse', qModel, qKey)
       && !Emitter.hasListenersFor('postResponse', qModel, qKey)
+      // Mutations only: postCommit/postRollback need the full path (an event object to emit with,
+      // and the settled registration below). Reads keep their 4-lookup hot path.
+      && (type === 'Query' || (!Emitter.hasListenersFor('postCommit', qModel, qKey) && !Emitter.hasListenersFor('postRollback', qModel, qKey)))
     ) {
       return Promise.resolve(thunk(tquery)).then((result) => {
         query.result = result;
@@ -581,19 +603,73 @@ module.exports = class Resolver {
     const result = resultEarly !== undefined ? resultEarly : await Promise.resolve(thunk(tquery)).catch((e) => { throw Boom.boomify(e); });
     query.result = result;
 
-    // post* phase: postMutation/preResponse/postResponse, all AFTER the write already succeeded.
-    // A failure here must NEVER be treated as rollback-worthy — the data is already correct and
-    // durable-within-the-transaction; undoing it because a side-effect hook failed would destroy
-    // good work. Wrapped in PostOperationError so Resolver#withTransaction's commit-decision logic
-    // can recognize it, commit anyway, and re-throw the original cause to the caller. postMutation
-    // always runs; preResponse/postResponse each run only if the previous stage didn't already
-    // short-circuit with an explicit return value (unchanged from prior behavior).
+    // Whether a transaction scope carried this write — the same condition the write's dispatch
+    // used in resolve(). Decides two things below: where postCommit/postRollback fire (at the
+    // scope's true settle vs the end of this lifecycle), and what a postMutation failure means
+    // (abort the unit vs surface-but-keep an already-durable write).
+    const carried = type === 'Mutation' && resultEarly === undefined
+      && Boolean(this.#transactionScope) && this.#schema.models[qModel].source.supports.includes('transactions');
+
+    // postCommit / postRollback — the durable-outcome events. Uniform contract: postCommit means
+    // "this write is durable" (the transaction it rode in truly, finally committed — or it never
+    // rode in one and was durable the moment the driver returned); postRollback means "this write
+    // was undone" (compensation hook). Both are fire-and-forget by nature: there is no caller
+    // left to veto or shape anything, so listener failures are isolated — they can never reject a
+    // commit() or a mutation that already succeeded. Registered only when the write actually
+    // executed (a preMutation short-circuit writes nothing — there is no durable outcome to
+    // announce). Granularity matches postMutation: per query — a *Many batch or RI cascade emits
+    // one event per element/step, at the moment the whole unit's fate is sealed.
+    let emitDurable; // set when NO transaction scope carried this write (durable right now)
+    if (type === 'Mutation' && resultEarly === undefined
+      && (Emitter.hasListenersFor('postCommit', qModel, qKey) || Emitter.hasListenersFor('postRollback', qModel, qKey))) {
+      const emitSettled = eventName => Promise.resolve().then(() => Emitter.emit(eventName, event)).catch(() => {});
+      if (carried) {
+        // Defer to the session's true settle. Under autoTransaction that's the host's
+        // end-of-request commit; for an RI/*Many wrap it's the wrapper's own commit after every
+        // element's full lifecycle.
+        this.#transactionScope.addSettled(this.#schema.models[qModel].source.client, outcome => emitSettled(outcome === 'commit' ? 'postCommit' : 'postRollback'));
+      } else {
+        // No transaction carried this write — it is already durable. Emitted at the END of the
+        // post* phase below (not here), so postCommit always fires after postMutation/preResponse/
+        // postResponse in both the transactional and non-transactional paths.
+        emitDurable = () => emitSettled('postCommit');
+      }
+    }
+
+    // post* phase, role-graded (see TRANSACTIONS.md §4.15):
+    //
+    // postMutation is the PARTICIPANT phase — the hook is part of the unit of work (audit rows,
+    // denormalized counters, derived writes, deferred invariant checks), so its failure means the
+    // unit is INCOMPLETE. When a transaction carried the write, the failure propagates unwrapped
+    // and ABORTS the unit — the same treatment as a failure of the write itself. (A hook that
+    // prefers best-effort tolerance opts out with its own try/catch; a hook whose failure should
+    // never abort anything is an observer and belongs in postCommit.) When nothing carried the
+    // write, it is already durable and physically cannot be undone — the failure surfaces as
+    // PostOperationError with `.result` so the caller knows both facts. A PostOperationError
+    // passing through here (e.g. a nested mutation inside the hook that failed only its own
+    // presenter phase) stays a PostOperationError — that nested write IS complete; only its
+    // presentation failed.
+    let shortCircuited = false;
     try {
-      let early = await Emitter.emit(`post${type}`, event);
+      const early = await Emitter.emit(`post${type}`, event);
       if (early !== undefined) {
         query.result = early;
-      } else {
-        early = await Emitter.emit('preResponse', event);
+        shortCircuited = true;
+      }
+    } catch (e) {
+      if (carried) throw Boom.boomify(e);
+      const err = Boom.boomify(e instanceof PostOperationError ? e : new PostOperationError(e, query.result));
+      if (emitDurable) await emitDurable(); // the bare write is durable regardless — announce it
+      throw err;
+    }
+
+    // preResponse/postResponse are the PRESENTER phase — the data is correct and committed (or
+    // committing); only the presentation failed. Never rollback-worthy: always PostOperationError,
+    // so Resolver#withTransaction commits anyway and re-throws. Each stage runs only if the
+    // previous one didn't already short-circuit with an explicit return value (unchanged).
+    try {
+      if (!shortCircuited) {
+        let early = await Emitter.emit('preResponse', event);
         if (early !== undefined) {
           query.result = early;
         } else {
@@ -601,9 +677,14 @@ module.exports = class Resolver {
           if (early !== undefined) query.result = early;
         }
       }
+      if (emitDurable) await emitDurable();
       return query.result;
     } catch (e) {
-      throw Boom.boomify(e instanceof PostOperationError ? e : new PostOperationError(e, query.result));
+      const err = Boom.boomify(e instanceof PostOperationError ? e : new PostOperationError(e, query.result));
+      // A presenter failure is not a data failure — the write is still durable, so the
+      // durable-outcome event still fires (its listeners are isolated; this cannot mask `err`).
+      if (emitDurable) await emitDurable();
+      throw err;
     }
   }
 

@@ -225,6 +225,20 @@ that scope's `enqueue()` queue — satisfying Mongo's "one operation at a time p
 without the caller having to know or care. Order between siblings is whatever order they happened
 to enqueue in; autograph does not attempt to impose a deterministic order beyond that.
 
+**Reads too, not just writes.** The first implementation only serialized mutations; sessioned
+*reads* (DataLoader dispatches, `*Many` pre-image `#get`s, FK-validation reads, merged-`$in`
+chunk fan-outs) bypassed the queue and could race an in-flight write on the same session — an
+intermittent, latency-dependent violation of the driver contract that an in-memory test server
+never exhibits. Fixed with `TransactionScope.run(session, fn)`, a static front door backed by a
+session → owning-scope registry (populated at claim time, `WeakMap`-keyed so it dies with the
+session): **every** physical driver call that carries a session — the mutation dispatch in
+`Resolver#resolve` and all three execute sites in `DataLoader` — now funnels through the owner's
+queue. Sessionless calls (or a caller-provided session no scope knows about) pass straight
+through with no overhead. The DataLoader batch-merge fingerprint already includes the session tag,
+so a merged cluster is uniformly one-session (or none) by construction, and its chunked `$in`
+sub-queries serialize through the same queue instead of running `Promise.all`-parallel against
+one session.
+
 ### 4.4 `autoTransaction` — the opt-in gate for the *whole request*
 
 ```js
@@ -530,6 +544,8 @@ A host wires this from a lifecycle point that runs after the operation is parsed
 resolver dispatches — Apollo Server's `didResolveOperation` is exactly that point:
 
 ```js
+const { PostOperationError } = require('@coderich/autograph');
+
 plugins: [{
   async requestDidStart() {
     return {
@@ -540,7 +556,12 @@ plugins: [{
       },
       async willSendResponse({ contextValue, errors }) {
         const { resolver } = contextValue.autograph;
-        await (errors?.length ? resolver.rollback() : resolver.commit());
+        // Only a NON-PostOperationError is rollback-worthy. A PostOperationError means the write
+        // itself already durably succeeded and only a post-write hook failed — rolling back on it
+        // would violate the §4.12 invariant (a post-write hook failure must never undo a
+        // successful write). GraphQL wraps thrown errors, so check originalError too.
+        const fatal = errors?.some(e => !((e.originalError ?? e) instanceof PostOperationError));
+        await (fatal ? resolver.rollback() : resolver.commit());
       },
     };
   },
@@ -574,6 +595,13 @@ many concurrent sessions as they can send requests — a resource-exhaustion vec
 nicety.
 
 ### 4.12 `PostOperationError` / `PreOperationError` — a post-write hook failure must never undo a successful write
+
+> **Partially superseded by §4.15.** The automatic commit-anyway classification this section
+> describes now applies to the *presenter* phase (`preResponse`/`postResponse`) and to writes no
+> transaction carried (already durable — nothing to undo). `postMutation` — the *participant*
+> phase — aborts the unit on failure as of §4.15. The narrative below is kept as the historical
+> record of how the classification was derived; §4.15 explains why `postCommit`'s introduction
+> changed the correct default for `postMutation` specifically.
 
 A separate, more severe bug surfaced from asking where commit/rollback actually happen relative to
 the Emitter lifecycle (§4.4/§5's ordering was never the issue — see the restated open question at
@@ -636,21 +664,144 @@ never actually be removed by its original function reference — it silently sta
 forever. Fixed by setting `wrapper.listener = listener` in `#createWrapper`, matching the existing
 memoize-wrapper pattern.
 
-**Restating the still-open "least surprise" question from a few turns earlier, since it's genuinely
-separate from the fix above and remains unresolved:** `postMutation` (and `preResponse`/
-`postResponse`) necessarily fire *before* the transaction commits, for both `*Many`/RI (commit only
-happens after every element's *entire* lifecycle, including its own post-phase, has run — that's
-what batch atomicity requires) and `autoTransaction` (commit only happens at the host's explicit,
-end-of-request `resolver.commit()` call). This is not a bug — the `PostOperationError` fix above
-proves it isn't one, since a post-write failure can no longer cause any data loss regardless of
-commit timing — but it does mean **no current Emitter event fires *after* the true, final commit**.
-A hook that performs an irreversible side effect (sending an email, calling an external API) has no
-way to know the underlying transaction has actually, finally settled — it might still be running
-before a `*Many`/RI batch's own commit, or (under `autoTransaction`) arbitrarily long before the
-host's own end-of-request commit call. `TransactionScope` already has the mechanism this would need
-internally (`addSettled` — a callback deferred until a client's session is truly, finally sealed);
-it just isn't exposed to end-user hook code today. Whether to add that — and what the API surface
-for it should look like — is still open.
+**The "least surprise" question this section originally left open — no event fired after the true,
+final commit — is now resolved: see §4.14 (`postCommit`/`postRollback`).** `postMutation` (and
+`preResponse`/`postResponse`) necessarily fire *before* the transaction commits, for both `*Many`/RI
+(commit only happens after every element's *entire* lifecycle, including its own post-phase, has
+run — that's what batch atomicity requires) and `autoTransaction` (commit only happens at the
+host's explicit, end-of-request `resolver.commit()` call). That ordering is not a bug and cannot be
+changed: commit is *causally downstream* of `postMutation` completing, so an event that fires after
+the true commit is necessarily a different event, not a re-timed `postMutation`.
+
+### 4.14 `postCommit` / `postRollback` — the durable-outcome events
+
+`pre/postMutation` bracket the **write**; `postCommit`/`postRollback` bracket the **transaction**.
+Built directly on `addSettled` (outcome-aware since §4.13 #3) — the internal mechanism this always
+needed, now surfaced as ordinary Emitter events:
+
+- **Uniform contract: `postCommit` = "this write is durable."** For a write carried by a scope,
+  it fires when the *owning* session truly, finally seals — a `*Many`/RI wrap's own commit, or the
+  host's end-of-request `resolver.commit()` under `autoTransaction` (a batch nested inside a bigger
+  ambient transaction correctly waits for the *bigger* one — `addSettled`'s coupled routing). For a
+  write no transaction carried, it is already durable when the driver returns, and `postCommit`
+  fires at the end of that mutation's own post-phase — so in every path, `postCommit` fires after
+  `postMutation`/`preResponse`/`postResponse`.
+- **`postRollback` is the compensation hook** — the write succeeded but its transaction then rolled
+  back. A write that itself failed emits neither (nothing durable, nothing to compensate); a
+  `preMutation` short-circuit emits neither (nothing was written).
+- **Granularity matches `postMutation`**: per query — one event per batch element / cascade step,
+  each carrying the same `event`/`query` object its lifecycle events saw (`query.result`
+  populated).
+- **Fire-and-forget by construction.** There is no caller left to veto or shape anything: listener
+  failures are isolated (`allSettled` in `TransactionScope#settle`; an isolated catch on the
+  non-transactional path) and can never reject `commit()` or a mutation that already succeeded. A
+  `postCommit` failure can only be logged by the listener itself.
+- **Writes from inside these hooks are new units of work.** Under `autoTransaction` the scope has
+  settled by the time `postCommit` fires, so `event.resolver.match(...).save(...)` rejects with the
+  settled-scope error — deliberately: an "after the transaction" write cannot join that
+  transaction. Use `event.resolver.transaction()` (a settled scope is not offered as a parent —
+  §4.13 #7) for an explicit fresh unit.
+- **Hot-path unchanged for reads**: the `#createSystemEvent` bypass only consults the two new
+  listener indexes for mutations.
+- A `PostOperationError` and `postCommit` compose as expected: a mutation whose presenter hook
+  failed (or whose bare, uncarried write had any post-phase failure) still emits `postCommit` —
+  the write itself is durable. A *participant* (`postMutation`) failure on a carried write aborts
+  the unit instead (§4.15), so those emit `postRollback` — the compensation event — not
+  `postCommit`.
+
+**When to use which** (the migration rule is short and checkable): a hook belongs in `postMutation`
+if it must share the mutation's fate or complete before the response — atomic follow-up writes
+(audit rows, denormalized counters via `event.resolver`), shaping `query.result`. It belongs in
+`postCommit` only if it is an irreversible *external* side effect — email, webhook, queue publish —
+that must not announce something a rollback could still undo. Most existing hooks stay where they
+are.
+
+### 4.13 Post-review hardening (second pass over the shipped design)
+
+A deep review of the finished branch surfaced one genuine correctness gap and several robustness
+items, all now fixed:
+
+1. **Sessioned reads raced sessioned writes** — the serialization queue (§4.3) only covered
+   mutations. Fixed with `TransactionScope.run(session, fn)` + a static session→owner registry;
+   §4.3 now describes the full mechanism. This was invisible to every test suite because
+   `mongodb-memory-server`'s near-zero latency never let the race materialize — exactly the
+   local-vs-production gap §4.7 warns about.
+2. **Settle-state** (`TransactionScope.state`): `commit()`/`rollback()` are idempotent (memoized
+   settlement — a coupled child propagating rollback to a parent that a `withTransaction` wrapper
+   also settles no longer double-touches driver handles); a stale *write* against a settled scope
+   rejects with a clear AG-level error instead of a raw driver "session ended"; a *read* through a
+   settled scope degrades to a plain sessionless read of committed state — necessary because docs
+   returned from a transaction lazily resolve populated fields through the same (cloned,
+   now-settled) resolver during response serialization, after the session sealed. `peekSession`
+   on a settled scope returns nothing; a settled scope is no longer offered as a parent by
+   `resolver.transaction()`.
+3. **Settled callbacks are outcome-aware and isolated**: `addSettled(client, fn, key)` passes
+   `'commit' | 'rollback'` to `fn`, dedupes by `key` (N writes to one model register one
+   settle-time cache clear), runs immediately if the owner already settled, and is wrapped in
+   `allSettled` so a throwing callback can never turn a successful commit into a rejected
+   `commit()` promise. This is the groundwork a future `postCommit`/`postRollback` event needs.
+4. **`deleteOne`'s pre-image read moved inside its RI transaction** — the cascade `where` clauses,
+   restrict counts, and the delete itself now see one consistent view (the same fix §4.6 already
+   gave `*Many`'s find-then-write pattern).
+5. **`settleMany`'s recovery payload is positionally complete**: an element whose write committed
+   but whose post-write hook failed now appears in the aggregated `PostOperationError.result`
+   (aligned by input position) — previously only fully-clean elements did, so a caller reconciling
+   against the database undercounted.
+6. **`withTransaction` no longer masks the root cause** when `rollback()` itself also fails (e.g.
+   a session the original failure already aborted server-side).
+7. **`transaction({ isolated: false })` refuses to orphan an active scope** (it would have made
+   the original transaction unreachable through `resolver.commit()`, leaving it to die by driver
+   timeout), and a settled scope is treated as "nothing ambient" rather than offered as a parent.
+8. **§4.11's recommended host plugin is `PostOperationError`-aware** — the earlier version rolled
+   back on *any* GraphQL error, which under `autoTransaction` would have undone a durable write
+   because a side-effect hook failed, violating §4.12's own invariant.
+
+### 4.15 Abort-by-default — the post-phase is role-graded, and each phase's failure semantic derives from its role
+
+§4.12's commit-anyway classification was calibrated against what `postMutation` *contained* at the
+time: notifications, logging, side effects — **observers**. §4.14 gives observers a proper home
+(`postCommit`), which re-sorts `postMutation`'s population down to **participants**: hooks that are
+part of the unit of work itself (audit rows, denormalized counters, derived writes, deferred
+invariant checks). For a participant, a failure means *the unit is incomplete* — and committing an
+incomplete unit is silent corruption. So the default flipped, landing on a scheme where every
+phase's failure behavior follows from its role:
+
+| phase | role | on throw |
+|---|---|---|
+| `preMutation` / `validate` | gatekeeper | abort — the write never happens (`PreOperationError`) |
+| `postMutation` | **participant** | **abort the unit** — propagates unwrapped, same as a write failure; if NO transaction carried the write it is already durable and physically cannot be undone, so the failure surfaces as `PostOperationError` with `.result` (honest fallback) |
+| `preResponse` / `postResponse` | presenter | `PostOperationError` — data complete and committed, only presentation failed; never rollback-worthy |
+| `postCommit` / `postRollback` | observer | isolated — structurally cannot affect anything |
+
+Why abort-by-default won, in brief:
+
+- **Every precedent agrees.** A Postgres AFTER trigger that raises aborts the transaction; Rails
+  `after_save` raising rolls back the save (the tolerant hook is `after_commit`); Django and
+  Hibernate are the same shape. Commit-anyway-inside-the-transaction was the exotic choice, made
+  before a post-commit hook existed here.
+- **Zero new API.** Abort = plain `throw` (what every trigger/ORM convention taught); tolerance =
+  the hook's own `try/catch` (explicit, visible, per-hook); "failure should never abort anything" =
+  the hook belongs in `postCommit`. The rejected `RollbackError` escalation class (considered when
+  the default was commit-anyway) never needs to exist — both behaviors are ordinary JavaScript.
+- **Fail-closed where it matters.** Under commit-anyway, forgetting an escalation mechanism on an
+  integrity-critical hook silently commits an incomplete unit (an unaudited change, a drifted
+  counter) — discovered at the compliance review. Under abort-by-default, the dangerous mistake is
+  loud: a rolled-back batch is a retry; a silently incomplete one is corruption.
+- **Nuance that falls out for free:** a `PostOperationError` *passing through* a `postMutation`
+  hook (a nested mutation inside the hook that failed only its own presenter phase) stays a
+  `PostOperationError` — that nested write IS complete; only its presentation failed. The type
+  itself carries the correct decision through every layer.
+
+Both of §4.12's original regression bugs remain fixed, each by its proper mechanism: (1) a bare
+single mutation whose hook throws still surfaces `PostOperationError` with the durable `.result`
+(the no-transaction fallback row — byte-for-byte the §4.12 behavior); (2) a side-effect hook that
+must not roll back unrelated batch elements now does that by *being an observer in `postCommit`*,
+where it structurally cannot — and if the failing hook was actually a participant, rolling back
+the batch was correct all along.
+
+**The 0.16 migration sentence:** move your observers to `postCommit`/`postRollback`; whatever
+remains in `postMutation` will abort the transaction if it throws — which is exactly why it's
+still there.
 
 Walking the actual lifecycle end to end, in order:
 
@@ -703,9 +854,10 @@ Walking the actual lifecycle end to end, in order:
 - Should autograph ship an official Apollo Server plugin wrapping the `commit()`/`rollback()`
   contract (§4.7)? Recommendation: document first, ship a plugin once the core mechanism is proven
   in a real deployment.
-- Should a scope expose an explicit "settled" state and throw a clear, AG-level error if
-  `getSession()`/`enqueue()` is called against it afterward, rather than letting a stale coupled
-  write hit an already-ended session directly? Still open — worth adding as a robustness item.
+- ~~Should a scope expose an explicit "settled" state...~~ Done (§4.13): `TransactionScope.state`
+  (`open`/`committed`/`rolledBack`), idempotent memoized `commit()`/`rollback()`, clear AG-level
+  errors on stale writes, graceful sessionless degradation for post-settle reads.
+- ~~Should a `postCommit`/`postRollback` Emitter event be exposed...~~ Done (§4.14).
 
 ## 7. Implementation notes (historical — the phased plan this replaced is complete)
 
