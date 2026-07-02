@@ -256,7 +256,14 @@ module.exports = class PostgresDriver {
 
   disconnect() { return this.#pool.end(); }
 
-  transaction() {
+  // No real SAVEPOINT support yet — when offered a parent handle (an ambient scope this call is
+  // nested under), hand it back unchanged rather than silently opening a second, unrelated
+  // transaction. TransactionScope reacts to that identity (handle === parentHandle) to know this
+  // is a coupled/shared-fate relationship. A future revision could implement real nested
+  // transactions via SAVEPOINT/RELEASE SAVEPOINT and return a distinct handle instead.
+  transaction(parentHandle) {
+    if (parentHandle) return Promise.resolve(parentHandle);
+
     return new Promise((resolve, reject) => {
       this.#pool.connect().then((client) => {
         client.query('BEGIN').then(() => {
@@ -318,8 +325,16 @@ module.exports = class PostgresDriver {
   // Without a session: exclude all IDs pending in active transactions.
   // Within a session: include own pending; exclude IDs that were pending in other txns at start (snapshot).
   #filterPending(rows, session) {
-    if (this.#allPendingIds.size === 0) return rows;
     const ctx = session ? this.#txnContexts.get(session) : null;
+    // The global early-exit below is only valid when THIS session has no exclusions of its own to
+    // enforce. A session's `exclusions` snapshot (ids pending in other sessions when it began) and
+    // `postSnapshotIds` (ids committed by others since) must keep hiding those ids for its entire
+    // lifetime — even after the global pending set empties out because the excluded write
+    // elsewhere has since committed. Without this, a transaction that reads only (see
+    // TestSuite.js "multi txn (isolated snapshots)") would lose its own snapshot the moment
+    // whatever it's supposed to keep hiding finishes committing.
+    const hasOwnExclusions = ctx && (ctx.exclusions.size > 0 || ctx.postSnapshotIds.size > 0);
+    if (this.#allPendingIds.size === 0 && !hasOwnExclusions) return rows;
     return rows.filter((row) => {
       const { _id: id } = row;
       if (!id) return true;

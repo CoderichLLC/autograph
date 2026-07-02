@@ -2,6 +2,7 @@ const get = require('lodash.get');
 const Util = require('@coderich/util');
 const DataLoader = require('dataloader');
 const { inspect } = require('../service/AppService');
+const TransactionScope = require('./TransactionScope');
 
 module.exports = class Loader {
   #model;
@@ -106,6 +107,7 @@ module.exports = class Loader {
       before: $query.before,
       after: $query.after,
       whereKeys: Object.keys($query.where || {}).sort(),
+      session: TransactionScope.tagSession($query.options?.session),
     }));
   }
 

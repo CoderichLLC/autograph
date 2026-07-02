@@ -6,7 +6,7 @@ const QueryPlanner = require('../query/QueryPlanner');
 const Emitter = require('./Emitter');
 const Loader = require('./Loader');
 const DataLoader = require('./DataLoader');
-const Transaction = require('./Transaction');
+const TransactionScope = require('./TransactionScope');
 const Pipeline = require('./Pipeline');
 const { inspect, buildSelectionTree } = require('../service/AppService');
 const { $QUERY, $RAW } = require('../service/Symbols');
@@ -20,15 +20,32 @@ module.exports = class Resolver {
   #dataLoaders;
   #queryPlanner; // lazy — created on first read (needs `this` fully constructed)
   #docClasses = {}; // Per-(resolver, model) Class cache — prototype hosts $, $model, $save, $lookup
-  #sessions = []; // Holds nested 2D array of transactions
+  #transactionScope; // Active TransactionScope this resolver falls back to when nothing more specific is ambient
 
-  constructor({ schema, xschema, context }) {
+  // `register: false` is for clone()'s use only — a clone (isolated transaction, or an internal
+  // *Many/RI auto-wrap) is a temporary, scoped resolver the caller holds a direct reference to
+  // (`txn`) and is expected to use explicitly, never through `context.autograph.resolver`. Without
+  // this, every clone's construction would silently and permanently repoint
+  // context.autograph.resolver at itself — including for any *Many/RI wrap, so effectively any
+  // mutation — leaving custom resolvers/hooks that read `context.autograph.resolver` fresh (not a
+  // captured `event.resolver` snapshot) pointed at an orphaned clone, for the rest of the request.
+  //
+  // `dataLoaders`, if provided (clone()'s use), is SHARED by reference rather than rebuilt fresh —
+  // DataLoaders are a per-request cache, not a per-transaction one; a clone that rebuilt its own
+  // meant every isolated transaction (i.e. every RI/*Many auto-wrap) paid for cold cache misses on
+  // data the calling resolver may have already fetched moments earlier, for no correctness benefit
+  // — transactional read visibility is governed entirely by which DB session a query uses (see
+  // TransactionScope#peekSession), not by which DataLoader instance served it. Sharing also means
+  // `this.clear(model)` (already called unconditionally after every write) transparently
+  // invalidates the calling resolver's view too, immediately — no separate propagation needed.
+  constructor({ schema, xschema, context, autoTransaction = false, register = true, dataLoaders }) {
     this.#schema = schema.parse?.() || schema;
     this.#xschema = xschema;
     this.#context = context;
-    this.#dataLoaders = this.#createDataLoaders();
+    this.#dataLoaders = dataLoaders ?? this.#createDataLoaders();
+    this.#transactionScope = autoTransaction ? new TransactionScope() : undefined;
     this.model = this.match; // Alias
-    Util.set(this.#context, `${this.#schema.namespace}.resolver`, this);
+    if (register) Util.set(this.#context, `${this.#schema.namespace}.resolver`, this);
   }
 
   getSchema() {
@@ -68,6 +85,8 @@ module.exports = class Resolver {
       schema: this.#schema,
       xschema: this.#xschema,
       context: this.#context,
+      register: false,
+      dataLoaders: this.#dataLoaders,
     });
   }
 
@@ -89,15 +108,26 @@ module.exports = class Resolver {
    * Create and execute a query for a provided model.
    *
    * @param {string|object} model - The name (string) or model (object) you wish to query
-   * @returns {QueryResolver|QueryResolverTransaction} - An API to build and execute a query
+   * @returns {QueryResolver} - An API to build and execute a query
    */
   match(model) {
-    return this.#sessions.at(-1)?.at(-1)?.match(model) ?? new QueryResolver({
+    return new QueryResolver({
       resolver: this,
       schema: this.#schema,
       context: this.#context,
       query: { model: `${model}` },
     });
+  }
+
+  /**
+   * This resolver's own TransactionScope, if any — set once, either by `autoTransaction` at
+   * construction, or by a prior `.transaction()`/`.withTransaction()` call on this exact
+   * reference, and never mutated again after that. Read directly (no ambient lookup) by
+   * `resolve()` and by QueryResolver's RI/*Many auto-wrap when it calls `.withTransaction()` on
+   * this resolver to find its parent.
+   */
+  get transactionScope() {
+    return this.#transactionScope;
   }
 
   /**
@@ -115,92 +145,89 @@ module.exports = class Resolver {
   }
 
   /**
-   * Start a new transaction.
+   * Start (or join) a transaction — an explicit "break out into my own transaction" demarcation.
    *
-   * @param {boolean} isolated - Create the transaction in isolation (new resolver)
-   * @param {Resolver} parent - The parent resolver that created this transaction
-   * @returns {Resolver} - A Resolver instance to construct queries in a transaction
+   * There is no ambient/implicit context here: "join" means calling `.transaction()` on whichever
+   * resolver reference you already have (this resolver, or a `txn` returned by an earlier
+   * `.transaction()`/`.withTransaction()` call) — that reference's own `#transactionScope` is the
+   * parent. This mirrors how `resolver.match()` itself works: always through an explicit reference,
+   * never a hidden global.
+   *
+   * @param {object} options
+   * @param {boolean} options.isolated - Run in a cloned resolver (default true). The clone shares
+   *   this resolver's DataLoaders (a per-request cache, not a per-transaction one — see clone())
+   *   but gets its own `#transactionScope` field. Always clone for anything that might run
+   *   concurrently with sibling code sharing this same resolver instance (e.g. two postMutation
+   *   hooks on the same event) — mutating this resolver's own `#transactionScope` in place
+   *   (isolated: false) is only safe when you know nothing else concurrently holds this exact
+   *   reference.
+   * @param {boolean} options.coupled - Offer this resolver's own scope as parent, accepting
+   *   whatever relationship the driver hands back (default true) — on MongoDB that's always the
+   *   same physical session, so rolling back propagates to the parent. Pass false to force a
+   *   wholly independent transaction, unrelated to this resolver's own scope.
+   * @returns {Resolver} - the resolver to call .match()/.commit()/.rollback() on
    */
-  transaction(isolated = true, parent = this) {
-    if (isolated) return this.clone().transaction(false, parent);
-
-    const currSession = this.#sessions.at(-1);
-    const currTransaction = currSession?.at(-1);
-    const realTransaction = new Transaction({ resolver: this, schema: this.#schema, context: this.#context });
-    const thunks = currTransaction ? currSession.thunks : []; // If in a transaction, piggy back off session
-
-    // If we're already in a transaction; add the "real" transaction to the existing session
-    // We do this because a "session" holds a group of transactions all bound to the same resolver
-    // Therefore this transaction should resolve when THAT resolver is committed or rolled back
-    if (currTransaction) currSession.push(realTransaction);
-
-    // In the case where we are currently in a transaction we need to create a hybrid transaction
-    // This transaction is part "real" transaction and part "current" transaction...
-    // This transaction ultimately calls currSession.pop() to remove itself (all transactions do)
-    const hybridTransaction = {
-      match: (...args) => currTransaction?.match(...args), // Bound to current transaction
-      commit: () => Promise.resolve(currSession.pop()), // DO NOT COMMIT! It's fate to commit is in "currSession"!
-      rollback: () => realTransaction.rollback().then(() => currSession.pop()), // REALLY, we need to rollback()
-    };
-
-    // In ALL cases we MUST create a new session with either the real or hybrid transaction!
-    // It is THIS transaction API that is used when resolver.match() is called
-    // Additional attributes are defined for use in order to clear data loader cache during transactions
-    this.#sessions.push(Object.defineProperties([currTransaction ? hybridTransaction : realTransaction], {
-      parent: { value: parent }, // The parent resolver
-      thunks: { value: thunks }, // Cleanup functions to run after session is completed (references parent)
-    }));
-
-    return this;
+  transaction({ isolated = true, coupled = true } = {}) {
+    const parent = this.#transactionScope;
+    const target = isolated ? this.clone() : this;
+    // eager: true — an explicit transaction() call (this method, unlike autoTransaction's
+    // implicit whole-request root scope) binds a real session on its FIRST operation, read or
+    // write, not just its first write. You asked for a transaction; a plain BEGIN in any database
+    // starts a real one whether or not you end up writing — reads through it get real
+    // snapshot-isolated visibility for its whole lifetime, not just read-your-own-writes bolted
+    // onto whatever a write happened to bind. See Resolver#resolve's use of scope.eager.
+    target.#transactionScope = new TransactionScope({ parent: coupled ? parent : null, independent: !coupled, eager: true });
+    return target;
   }
 
   /**
-   * Auto run (commit or rollback) the current transaction based on the outcome of a provided promise.
-   *
-   * @param {Promise} promise - A promise to resolve that determines the fate of the current transaction
-   * @returns {*} - The promise resolution
-   */
-  run(promise) {
-    return promise.catch((e) => {
-      return this.rollback().then(() => Promise.reject(e));
-    }).then((results) => {
-      return this.commit().then(() => results);
-    });
-  }
-
-  /**
-   * Commit the current transaction.
+   * Commit this resolver's active transaction, if any. A no-op if `autoTransaction` was never
+   * enabled and `.transaction()` was never called (the common case for read-only requests).
    */
   commit() {
-    let op = 'commit';
-    const errors = [];
-    const session = this.#sessions.pop()?.reverse();
-
-    // All transactions bound to this resolver are to be committed
-    return Util.promiseChain(session.map(transaction => () => {
-      return transaction[op]().catch((e) => {
-        op = 'rollback';
-        errors.push(e);
-        return transaction[op]().catch(ee => errors.push(ee));
-      });
-    })).then(() => {
-      return errors.length ? Promise.reject(errors) : Promise.all(session.thunks.map(thunk => thunk()));
-    });
+    return this.#transactionScope ? this.#transactionScope.commit() : Promise.resolve();
   }
 
   /**
-   * Rollback the current transaction
+   * Roll back this resolver's active transaction, if any.
    */
   rollback() {
-    const errors = [];
-    const session = this.#sessions.pop()?.reverse();
+    return this.#transactionScope ? this.#transactionScope.rollback() : Promise.resolve();
+  }
 
-    // All transactions bound to this resolver are to be rolled back
-    return Util.promiseChain(session.map(transaction => () => {
-      return transaction.rollback().catch(e => errors.push(e));
-    })).then(() => {
-      return errors.length ? Promise.reject(errors) : Promise.all(session.thunks.map(thunk => thunk()));
-    });
+  /**
+   * Convenience wrapper around .transaction()/.commit()/.rollback() for the common case: run
+   * `fn` against a transactional resolver, commit if it resolves, roll back and rethrow if it
+   * rejects. Equivalent to the manual pattern:
+   *
+   *   const txn = resolver.transaction(options);
+   *   try { const result = await fn(txn); await txn.commit(); return result; }
+   *   catch (e) { await txn.rollback(); throw e; }
+   *
+   * Prefer `.transaction()` directly when you need custom error handling (e.g. deciding NOT to
+   * roll back on a specific caught error) — this helper always rolls back on any rejection.
+   *
+   * This is also exactly what QueryResolver's internal RI/*Many auto-wrap calls — autograph
+   * manages its own transactions through the same public API a manual caller uses, not a separate
+   * mechanism. It always passes `{ isolated: true }` for the reason noted on `.transaction()`
+   * above: the auto-wrap can be triggered from code sharing a resolver instance with concurrent
+   * siblings (e.g. two postMutation hooks on the same event), so it must never mutate that shared
+   * instance's own `#transactionScope` — cloning is what makes that safe.
+   *
+   * @param {Function} fn - (txnResolver) => Promise<*>
+   * @param {object} options - Same as .transaction()'s options ({ isolated, coupled })
+   * @returns {*} - fn's resolved value
+   */
+  async withTransaction(fn, options) {
+    const txn = this.transaction(options);
+    try {
+      const result = await fn(txn);
+      await txn.commit();
+      return result;
+    } catch (e) {
+      await txn.rollback();
+      throw e;
+    }
   }
 
   /**
@@ -211,24 +238,55 @@ module.exports = class Resolver {
    * @param {Query} query - The query to resolve
    * @returns {*} - The resolved query result
    */
+  // async (even though nothing here is awaited): #createSystemEvent's $query.transform(false)
+  // can throw synchronously on a bad transformer — needs the implicit try/catch an async function
+  // wraps its body in, or a synchronous throw would propagate as a thrown exception out of
+  // resolve() instead of a rejected promise, unlike every other error path here.
   async resolve(query) {
-    let thunk;
     const { doc, model, crud, isMutation, flags } = query.toObject();
-    const currSession = this.#sessions.at(-1);
+
+    // This resolver's own scope, set once (by `autoTransaction` at construction, or by a prior
+    // .transaction() call) and never mutated again after that — safe to read directly, no ambient
+    // lookup needed. Anything that wants a *different* scope (RI/*Many's auto-wrap, a manual
+    // nested transaction) gets there by calling .transaction()/.withTransaction() on the specific
+    // resolver reference it holds, the same way any caller would — see QueryResolver's #withTransaction usage.
+    const scope = this.#transactionScope;
+
+    let thunk;
 
     if (isMutation) {
       thunk = (tquery) => {
-        const { client } = this.#schema.models[model].source;
+        const { client, supports } = this.#schema.models[model].source;
         const driverQuery = tquery.toDriver().toObject();
-        const plan = client.prepare(driverQuery);
-        if (driverQuery.flags?.debug) inspect(plan);
+        // Only a data source that actually advertises transaction support participates in this
+        // resolver's scope — `autoTransaction`/`.transaction()` express intent, not capability a
+        // given source doesn't have.
+        const useScope = scope && supports.includes('transactions') ? scope : undefined;
 
-        return client.execute(plan).then((results) => {
-          // We clear the cache immediately (regardless if we're in transaction or not)
+        const dispatch = () => {
+          const plan = client.prepare(driverQuery);
+          if (driverQuery.flags?.debug) inspect(plan);
+          return client.execute(plan);
+        };
+
+        const executed = useScope
+          ? useScope.getSession(client).then((session) => {
+            driverQuery.options = { ...driverQuery.options, session };
+            return useScope.enqueue(client, dispatch);
+          })
+          : dispatch();
+
+        return executed.then((results) => {
+          // Clones share DataLoaders with whatever resolver they were cloned from (see clone()),
+          // so this transparently invalidates every reader's view too, immediately — no separate
+          // propagation needed for isolated transactions.
           this.clear(model);
 
-          // If we're in a transaction, we clear the cache of all sessions when this session resolves
-          currSession?.thunks.push(...this.#sessions.map(s => () => s.parent.clear(model)));
+          // But a read through the shared cache can still land in the window between this
+          // immediate clear and the transaction's real, final commit — caching a pre-commit view
+          // that would otherwise never get invalidated. Clear again once this write's session is
+          // truly, finally sealed (a no-op until then if nothing re-caches it in the meantime).
+          if (useScope) useScope.addSettled(client, () => this.clear(model));
 
           // Return results
           if (crud === 'delete') return doc;
@@ -252,8 +310,26 @@ module.exports = class Resolver {
           }
         }
 
-        this.#queryPlanner ??= new QueryPlanner(this.#schema, this);
-        return this.#queryPlanner.resolve(model, tquery, rq => this.#dataLoaders[model].resolve(rq));
+        const dispatch = () => {
+          this.#queryPlanner ??= new QueryPlanner(this.#schema, this);
+          return this.#queryPlanner.resolve(model, tquery, rq => this.#dataLoaders[model].resolve(rq));
+        };
+
+        if (!scope) return dispatch();
+        const { supports, client } = this.#schema.models[model].source;
+        if (!supports.includes('transactions')) return dispatch();
+
+        // scope.eager (explicit transaction()/withTransaction() — manual, or the internal
+        // RI/*Many auto-wrap): binds a session on first use, read or write, so it gets a real,
+        // snapshot-isolated view for its whole lifetime. Otherwise (autoTransaction's implicit
+        // whole-request root scope): reads only reuse a session a write already bound (read-your-
+        // own-writes) — never trigger one themselves, so a read-only request stays free.
+        const sessionPromise = scope.eager ? scope.getSession(client) : Promise.resolve(scope.peekSession(client));
+
+        return sessionPromise.then((session) => {
+          if (session) tquery.toObject().options = { ...tquery.toObject().options, session };
+          return dispatch();
+        });
       };
     }
 
@@ -317,7 +393,7 @@ module.exports = class Resolver {
 
     // toString is intentionally NOT on the prototype — see toResultSet for the reason.
     // We stash one shared instance here so per-doc defineProperty reuses the same function.
-    Doc.docToString = function () { return `${model}`; };
+    Doc.docToString = function docToString() { return `${model}`; };
 
     Object.defineProperties(Doc.prototype, {
       $model: { value: model },

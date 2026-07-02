@@ -187,4 +187,31 @@ describe('Query', () => {
       expect(clone.toObject()).toMatchObject({ input: { name: 'rich' }, args: { id: 1 } });
     });
   });
+
+  describe('toCacheKey (regression)', () => {
+    // Bug: DataLoaders are shared across a whole request, including with every isolated
+    // transaction cloned from it (see Resolver#clone). Two otherwise-identical reads — one issued
+    // with a transaction's session attached (see Resolver#resolve's peekSession use), one without
+    // — computed the SAME cache key, so a transactional read's result leaked into the shared
+    // front-door DataLoader cache and was returned to a plain, non-transactional read for the same
+    // query (and vice versa). Fixed by folding a stable session tag into the cache key.
+    test('an otherwise-identical query with a session attached gets a different cache key than one without', async () => {
+      // .clone() shares everything except the overridden fields — this isolates the comparison to
+      // `options.session` alone. Using three separately-constructed queries here would be a false
+      // test: the "id" field's generator produces a fresh, non-deterministic ObjectId suffix per
+      // call (it embeds a timestamp + random/counter bytes), which would make the keys differ for
+      // a reason that has nothing to do with sessions.
+      const base = await factory('Person').id(1).one().transform();
+      const keyNoSession = base.toCacheKey();
+
+      const queryA = base.clone({ options: { session: { fake: 'session-a' } } });
+      const keySessionA = queryA.toCacheKey();
+
+      const queryB = base.clone({ options: { session: { fake: 'session-b' } } });
+      const keySessionB = queryB.toCacheKey();
+
+      expect(keySessionA).not.toBe(keyNoSession);
+      expect(keySessionA).not.toBe(keySessionB);
+    });
+  });
 });

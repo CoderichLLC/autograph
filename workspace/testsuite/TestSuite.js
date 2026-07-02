@@ -733,67 +733,67 @@ module.exports = () => describe('TestSuite', () => {
     });
   });
 
-  // describe('Transactions (auto)', () => {
-  //   test('multi-update', async () => {
-  //     expect(await resolver.match('Person').where({}).save({ status: 'online' })).toMatchObject([{ status: 'online' }, { status: 'online' }]);
-  //     expect(await resolver.match('Person').many()).toMatchObject([{ status: 'online' }, { status: 'online' }]);
-  //     await resolver.match('Person').where({ status: 'online' }).save({ status: 'offline' });
-  //     expect(await resolver.match('Person').many()).toMatchObject([{ status: 'offline' }, { status: 'offline' }]);
-  //     await expect(resolver.match('Chapter').save({ name: 'chapter1' }, { name: 'chapter2' })).rejects.toThrow(/required/gi);
-  //   });
+  describe('Transactions (auto)', () => {
+    test('multi-update', async () => {
+      expect(await resolver.match('Person').where({}).save({ status: 'online' })).toMatchObject([{ status: 'online' }, { status: 'online' }]);
+      expect(await resolver.match('Person').many()).toMatchObject([{ status: 'online' }, { status: 'online' }]);
+      await resolver.match('Person').where({ status: 'online' }).save({ status: 'offline' });
+      expect(await resolver.match('Person').many()).toMatchObject([{ status: 'offline' }, { status: 'offline' }]);
+      await expect(resolver.match('Chapter').save({ name: 'chapter1' }, { name: 'chapter2' })).rejects.toThrow(/required/gi);
+    });
 
-  //   test('multi-push-pull', async () => {
-  //     // push
-  //     await resolver.match('Art').save([{ name: 'Art1' }, { name: 'Art2' }]);
-  //     await resolver.match('Art').where({}).push('bids', 69.99, '109.99');
-  //     expect(await resolver.match('Art').many()).toMatchObject([{ bids: [69.99, 109.99] }, { bids: [69.99, 109.99] }]);
+    test('multi-push-pull', async () => {
+      // push
+      await resolver.match('Art').save([{ name: 'Art1' }, { name: 'Art2' }]);
+      await resolver.match('Art').where({}).push('bids', 69.99, '109.99');
+      expect(await resolver.match('Art').many()).toMatchObject([{ bids: [69.99, 109.99] }, { bids: [69.99, 109.99] }]);
 
-  //     // pull
-  //     await resolver.match('Art').where({}).pull('bids', '69.99');
-  //     expect(await resolver.match('Art').many()).toMatchObject([{ bids: [109.99] }, { bids: [109.99] }]);
-  //   });
+      // pull
+      await resolver.match('Art').where({}).pull('bids', '69.99');
+      expect(await resolver.match('Art').many()).toMatchObject([{ bids: [109.99] }, { bids: [109.99] }]);
+    });
 
-  //   test('multi-create rolls back on partial validation failure', async () => {
-  //     await expect(resolver.match('Person').save([
-  //       { name: 'AtomicCreate1', emailAddress: 'atomic1@example.com' },
-  //       { name: 'AtomicCreate2', emailAddress: 'not-an-email' }, // fails @field(validate: email)
-  //     ])).rejects.toThrow();
-  //     expect(await resolver.match('Person').where({ name: 'AtomicCreate1' }).one()).toBeNull();
-  //   });
+    test('multi-create rolls back on partial validation failure', async () => {
+      await expect(resolver.match('Person').save([
+        { name: 'AtomicCreate1', emailAddress: 'atomic1@example.com' },
+        { name: 'AtomicCreate2', emailAddress: 'not-an-email' }, // fails @field(validate: email)
+      ])).rejects.toThrow();
+      expect(await resolver.match('Person').where({ name: 'AtomicCreate1' }).one()).toBeNull();
+    });
 
-  //   test('multi-create rolls back on partial uniqueness violation', async () => {
-  //     // Seed one record so the second of the pair below collides on the unique name index.
-  //     const seed = await resolver.match('Person').save({ name: 'AtomicSeed', emailAddress: 'atomicseed@example.com' });
-  //     expect(seed.id).toBeDefined();
+    test('multi-create rolls back on partial uniqueness violation', async () => {
+      // Seed one record so the second of the pair below collides on the unique name index.
+      const seed = await resolver.match('Person').save({ name: 'AtomicSeed', emailAddress: 'atomicseed@example.com' });
+      expect(seed.id).toBeDefined();
 
-  //     await expect(resolver.match('Person').save([
-  //       { name: 'AtomicCreate3', emailAddress: 'atomic3@example.com' },
-  //       { name: 'AtomicSeed', emailAddress: 'atomic4@example.com' }, // duplicate name → index violation
-  //     ])).rejects.toThrow(/duplicate/gi);
-  //     expect(await resolver.match('Person').where({ name: 'AtomicCreate3' }).one()).toBeNull();
+      await expect(resolver.match('Person').save([
+        { name: 'AtomicCreate3', emailAddress: 'atomic3@example.com' },
+        { name: 'AtomicSeed', emailAddress: 'atomic4@example.com' }, // duplicate name → index violation
+      ])).rejects.toThrow(/duplicate/gi);
+      expect(await resolver.match('Person').where({ name: 'AtomicCreate3' }).one()).toBeNull();
 
-  //     // Cleanup so subsequent tests aren't affected by AtomicSeed
-  //     await resolver.match('Person').id(seed.id).delete();
-  //   });
+      // Cleanup so subsequent tests aren't affected by AtomicSeed
+      await resolver.match('Person').id(seed.id).delete();
+    });
 
-  //   test('multi-update rolls back on partial validation failure', async () => {
-  //     // Seed two records, then attempt updateMany where one would fail validation.
-  //     const [a, b] = await resolver.match('Person').save([
-  //       { name: 'AtomicUpdA', emailAddress: 'updA@example.com' },
-  //       { name: 'AtomicUpdB', emailAddress: 'updB@example.com' },
-  //     ]);
+    test('multi-update rolls back on partial validation failure', async () => {
+      // Seed two records, then attempt updateMany where one would fail validation.
+      const [a, b] = await resolver.match('Person').save([
+        { name: 'AtomicUpdA', emailAddress: 'updA@example.com' },
+        { name: 'AtomicUpdB', emailAddress: 'updB@example.com' },
+      ]);
 
-  //     // Update both: the second will fail validation (invalid email format).
-  //     await expect(resolver.match('Person').where({ name: ['AtomicUpdA', 'AtomicUpdB'] }).save({ emailAddress: 'not-an-email' })).rejects.toThrow();
+      // Update both: the second will fail validation (invalid email format).
+      await expect(resolver.match('Person').where({ name: ['AtomicUpdA', 'AtomicUpdB'] }).save({ emailAddress: 'not-an-email' })).rejects.toThrow();
 
-  //     // Verify NEITHER record was updated — both retain their original emailAddress.
-  //     const after = await resolver.match('Person').where({ name: ['AtomicUpdA', 'AtomicUpdB'] }).many();
-  //     expect(after.map(p => p.emailAddress).sort()).toEqual(['updA@example.com', 'updB@example.com']);
+      // Verify NEITHER record was updated — both retain their original emailAddress.
+      const after = await resolver.match('Person').where({ name: ['AtomicUpdA', 'AtomicUpdB'] }).many();
+      expect(after.map(p => p.emailAddress).sort()).toEqual(['updA@example.com', 'updB@example.com']);
 
-  //     // Cleanup
-  //     await resolver.match('Person').id([a.id, b.id]).delete();
-  //   });
-  // });
+      // Cleanup
+      await resolver.match('Person').id([a.id, b.id]).delete();
+    });
+  });
 
   describe('Transactions (manual)', () => {
     test('single txn (commit)', async () => {
@@ -949,7 +949,7 @@ module.exports = () => describe('TestSuite', () => {
       await resolver.match('PlainJane').id(pj.id).save({}); // Bug where deleted role would fail FK constraint when trying to update/save parent record
     });
 
-    test.skip('delete rolls back cascades when a restrict throws mid-walk', async () => {
+    test('delete rolls back cascades when a restrict throws mid-walk', async () => {
       // Setup: A is a Person referenced via Person.section.persons (cascade-pull) and
       // A also authored a Book with a Chapter (Book.author cascade → Book.remove() →
       // Chapter.book restrict throws). Person.section.persons cascade fires BEFORE
@@ -1210,86 +1210,86 @@ module.exports = () => describe('TestSuite', () => {
     });
   });
 
-  // describe('Cascading postMutation hooks (auto-wrap re-entry)', () => {
-  //   // Reproduces the Spitfire-style pattern that infinite-cascades through hybridTransaction.match:
-  //   //
-  //   //   1. Multiple postMutation hooks listen to the same model. Emitter.emit dispatches them via
-  //   //      Promise.all → each fn runs in microtask succession on the SAME event.
-  //   //   2. Each hook opens a *Many write → transaction(false) pushes a new session.
-  //   //   3. The SECOND hook's wrap opens while the first wrap is still on this.#sessions → it
-  //   //      nests, creating a hybridTransaction and (in the buggy version) sharing the outer's
-  //   //      postCommit array.
-  //   //   4. With shared postCommit, the inner commit fires the queued entries, those hooks open
-  //   //      yet more nested wraps, which also share the same array, which re-fire the entries…
-  //   //      stack overflow inside hybridTransaction.match.
-  //   //
-  //   // Each session must own its own postCommit list. Placed last so afterAll can remove listeners
-  //   // before the next test file picks up the suite.
-  //   const seen = { hookA: 0, hookB: 0, colorChain: 0 };
-  //   let hookA;
-  //   let hookB;
-  //   let colorChain;
+  describe('Cascading postMutation hooks (auto-wrap re-entry)', () => {
+    // Reproduces the Spitfire-style pattern that infinite-cascades through hybridTransaction.match:
+    //
+    //   1. Multiple postMutation hooks listen to the same model. Emitter.emit dispatches them via
+    //      Promise.all → each fn runs in microtask succession on the SAME event.
+    //   2. Each hook opens a *Many write → transaction(false) pushes a new session.
+    //   3. The SECOND hook's wrap opens while the first wrap is still on this.#sessions → it
+    //      nests, creating a hybridTransaction and (in the buggy version) sharing the outer's
+    //      postCommit array.
+    //   4. With shared postCommit, the inner commit fires the queued entries, those hooks open
+    //      yet more nested wraps, which also share the same array, which re-fire the entries…
+    //      stack overflow inside hybridTransaction.match.
+    //
+    // Each session must own its own postCommit list. Placed last so afterAll can remove listeners
+    // before the next test file picks up the suite.
+    const seen = { hookA: 0, hookB: 0, colorChain: 0 };
+    let hookA;
+    let hookB;
+    let colorChain;
 
-  //   beforeAll(async () => {
-  //     // TWO hooks on Person → Emitter Promise.all dispatches both in microtask succession,
-  //     // each opens its own *Many wrap → second nests on first (hybridTransaction created).
-  //     hookA = async (event, next) => {
-  //       seen.hookA++;
-  //       await event.resolver.match('Color').where({}).save({ type: 'red' });
-  //       next();
-  //     };
-  //     hookB = async (event, next) => {
-  //       seen.hookB++;
-  //       await event.resolver.match('Art').where({}).save({ name: 'cascadeArt' });
-  //       next();
-  //     };
-  //     // Hook on the INNER-op model (Color). Each Color updateOne inside wrap1 will defer its
-  //     // postMutation onto the (shared, when buggy) postCommit. When the wrap commits and fires
-  //     // the queue, this hook opens ANOTHER *Many wrap on PlainJane — which (because the outer
-  //     // wrap is still in the stack chain through hybridTransaction) nests, joins the shared
-  //     // postCommit, pushes more entries, and on its commit re-fires the SAME entries →
-  //     // exponential cascade through hybridTransaction.match.
-  //     colorChain = async (event, next) => {
-  //       seen.colorChain++;
-  //       // Bounded counter: prevents an actual infinite loop if the wiring lets it slip through.
-  //       if (seen.colorChain < 20) {
-  //         await event.resolver.match('PlainJane').where({}).save({ name: 'cascadePJ' });
-  //       }
-  //       next();
-  //     };
-  //     Emitter.onModels('postMutation', ['Person'], hookA);
-  //     Emitter.onModels('postMutation', ['Person'], hookB);
-  //     Emitter.onModels('postMutation', ['Color'], colorChain);
+    beforeAll(async () => {
+      // TWO hooks on Person → Emitter Promise.all dispatches both in microtask succession,
+      // each opens its own *Many wrap → second nests on first (hybridTransaction created).
+      hookA = async (event, next) => {
+        seen.hookA++;
+        await event.resolver.match('Color').where({}).save({ type: 'red' });
+        next();
+      };
+      hookB = async (event, next) => {
+        seen.hookB++;
+        await event.resolver.match('Art').where({}).save({ name: 'cascadeArt' });
+        next();
+      };
+      // Hook on the INNER-op model (Color). Each Color updateOne inside wrap1 will defer its
+      // postMutation onto the (shared, when buggy) postCommit. When the wrap commits and fires
+      // the queue, this hook opens ANOTHER *Many wrap on PlainJane — which (because the outer
+      // wrap is still in the stack chain through hybridTransaction) nests, joins the shared
+      // postCommit, pushes more entries, and on its commit re-fires the SAME entries →
+      // exponential cascade through hybridTransaction.match.
+      colorChain = async (event, next) => {
+        seen.colorChain++;
+        // Bounded counter: prevents an actual infinite loop if the wiring lets it slip through.
+        if (seen.colorChain < 20) {
+          await event.resolver.match('PlainJane').where({}).save({ name: 'cascadePJ' });
+        }
+        next();
+      };
+      Emitter.onModels('postMutation', ['Person'], hookA);
+      Emitter.onModels('postMutation', ['Person'], hookB);
+      Emitter.onModels('postMutation', ['Color'], colorChain);
 
-  //     // Seed targets so the *Many writes have docs to touch.
-  //     await resolver.match('Color').save({ type: 'blue' });
-  //     await resolver.match('Art').save({ name: 'cascadeArtSeed' });
-  //     await resolver.match('PlainJane').save({ name: 'cascadePJSeed' });
-  //   });
+      // Seed targets so the *Many writes have docs to touch.
+      await resolver.match('Color').save({ type: 'blue' });
+      await resolver.match('Art').save({ name: 'cascadeArtSeed' });
+      await resolver.match('PlainJane').save({ name: 'cascadePJSeed' });
+    });
 
-  //   afterAll(async () => {
-  //     Emitter.removeListener('postMutation', hookA);
-  //     Emitter.removeListener('postMutation', hookB);
-  //     Emitter.removeListener('postMutation', colorChain);
-  //     await resolver.match('Color').where({}).remove();
-  //     await resolver.match('Art').where({}).remove();
-  //     await resolver.match('PlainJane').where({}).remove();
-  //   });
+    afterAll(async () => {
+      Emitter.removeListener('postMutation', hookA);
+      Emitter.removeListener('postMutation', hookB);
+      Emitter.removeListener('postMutation', colorChain);
+      await resolver.match('Color').where({}).remove();
+      await resolver.match('Art').where({}).remove();
+      await resolver.match('PlainJane').where({}).remove();
+    });
 
-  //   test('parallel hooks + inner-op hook chain do not infinitely cascade', async () => {
-  //     seen.hookA = 0;
-  //     seen.hookB = 0;
-  //     seen.colorChain = 0;
+    test('parallel hooks + inner-op hook chain do not infinitely cascade', async () => {
+      seen.hookA = 0;
+      seen.hookB = 0;
+      seen.colorChain = 0;
 
-  //     const saved = await resolver.match('Person').save({ name: 'CascadeNested', emailAddress: 'cascadenested@example.com' });
-  //     expect(saved.id).toBeDefined();
-  //     // Each Person->hook fires exactly once; the chained colorChain should fire once per
-  //     // distinct Color-update event, not exponentially.
-  //     expect(seen.hookA).toBe(1);
-  //     expect(seen.hookB).toBe(1);
-  //     expect(seen.colorChain).toBeLessThan(20); // ceiling — bug would race past this
+      const saved = await resolver.match('Person').save({ name: 'CascadeNested', emailAddress: 'cascadenested@example.com' });
+      expect(saved.id).toBeDefined();
+      // Each Person->hook fires exactly once; the chained colorChain should fire once per
+      // distinct Color-update event, not exponentially.
+      expect(seen.hookA).toBe(1);
+      expect(seen.hookB).toBe(1);
+      expect(seen.colorChain).toBeLessThan(20); // ceiling — bug would race past this
 
-  //     await resolver.match('Person').id(saved.id).delete();
-  //   });
-  // });
+      await resolver.match('Person').id(saved.id).delete();
+    });
+  });
 });

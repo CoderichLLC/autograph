@@ -1,5 +1,6 @@
 const Util = require('@coderich/util');
 const { isGlob, globToRegex, mergeDeep, JSONParse } = require('../service/AppService');
+const TransactionScope = require('../data/TransactionScope');
 
 // Deep "merged" view: input first, falls through to doc — recursively for plain objects.
 // READ-ONLY. Writes/deletes throw with a hint pointing at `query.input` as the correct
@@ -49,6 +50,13 @@ const createMergedProxy = (input, doc) => new Proxy(input, {
 // - crud:  always 'read' inside a loader (constant), distinguishes pre/post Mutation events
 // - id:    merged into `where` by QueryBuilder.id() on reads (redundant), explicit on mutations
 // - input: undefined on reads (skipped by stringify), required to distinguish mutations
+// - session: DataLoaders are shared across a whole request, including with every isolated
+//   transaction cloned from it (see Resolver#clone) — an otherwise-identical read issued with a
+//   transaction's session attached (see Resolver#resolve's peekSession use) must not share a cache
+//   entry with the same read issued without one (or with a *different* session), or a transactional
+//   read's result leaks into a plain read that should never have been able to see it (or vice
+//   versa). Tagged via TransactionScope.tagSession — never the raw session, which for MongoDB has
+//   circular references that would blow up JSON.stringify.
 const computeCacheKey = q => JSON.stringify({
   model: q.model,
   crud: q.crud,
@@ -64,6 +72,7 @@ const computeCacheKey = q => JSON.stringify({
   after: q.after,
   first: q.first,
   last: q.last,
+  session: TransactionScope.tagSession(q.options?.session),
 });
 
 module.exports = class Query {

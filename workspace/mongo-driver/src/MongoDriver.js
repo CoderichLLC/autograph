@@ -97,7 +97,15 @@ module.exports = class MongoDriver {
     return this.collection(name);
   }
 
-  transaction() {
+  // MongoDB has no savepoint primitive — a session supports exactly one active transaction, so
+  // there is no such thing as a "child" session. When offered a parent handle ({ session, commit,
+  // rollback }), we simply hand it back unchanged: TransactionScope reacts to that identity
+  // (handle === parentHandle) to know this is a coupled/shared-fate relationship, not a real
+  // nested transaction. Never invoked with a parent unless something ambient already exists
+  // (`autoTransaction`, a manual transaction, or an RI/*Many wrap) — see TransactionScope#getHandle.
+  transaction(parentHandle) {
+    if (parentHandle) return Promise.resolve(parentHandle);
+
     return this.#connection.then((client) => {
       let closed = false;
       const session = client.startSession(this.#config.session);

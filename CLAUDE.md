@@ -56,7 +56,7 @@ GraphQL Schema (typeDefs with directives)
 
 - `workspace/autograph/src/schema/Schema.js` — Parses GraphQL SDL, processes directives, merges typeDefs, decorates models. The "big picture" is that `Schema` converts raw GraphQL AST into an internal `$schema` object with pre-computed pipeline functions per field.
 
-- `workspace/autograph/src/data/Resolver.js` — Entry point for all data access. `resolver.match(model)` returns a `QueryResolver`. Manages DataLoaders per model, transaction sessions, and sets itself at `context.autograph.resolver`.
+- `workspace/autograph/src/data/Resolver.js` — Entry point for all data access. `resolver.match(model)` returns a `QueryResolver`. Manages DataLoaders per model, sets itself at `context.autograph.resolver`, and exposes `.transaction()`/`.commit()`/`.rollback()` (see Transactions).
 
 - `workspace/autograph/src/query/QueryResolver.js` — Fluent builder that accumulates query state then executes via the driver. Extends `QueryBuilder`.
 
@@ -68,7 +68,7 @@ GraphQL Schema (typeDefs with directives)
 
 - `workspace/autograph/src/data/DataLoader.js` — Smart batch merging. Groups queries by structural fingerprint (op, sort, limit, skip, select), finds clusters that differ in exactly one where-key, and collapses them into a single `$in` driver call chunked at 500.
 
-- `workspace/autograph/src/data/Transaction.js` — Transaction coordinator across multiple data sources. Currently incomplete — see Known Issues.
+- `workspace/autograph/src/data/TransactionScope.js` — Identity-based per-data-source transaction bookkeeping (session map, serialization queue, cache-invalidation thunk routing). `workspace/autograph/src/data/TransactionContext.js` — thin `AsyncLocalStorage` wrapper propagating "the currently ambient scope" to nested/sibling calls. See Transactions.
 
 - `workspace/mongo-driver/src/MongoDriver.js` — MongoDB 6.x driver adapter. Uses aggregation pipelines for all queries (including finds). Supports `$lookup` joins for populated fields.
 
@@ -180,9 +180,15 @@ class MyDriver {
   disconnect() { ... }   // called in afterAll
 
   // Required only if dataSource.supports includes 'transactions'.
-  // Must return: { session, commit(), rollback() }
-  // session is forwarded to every plan via query.options.session.
-  transaction() { ... }
+  // Called with no argument to open a brand-new top-level transaction: must return
+  // { session, commit(), rollback() } (session is forwarded to every plan via query.options.session).
+  // Called WITH a parentSession when TransactionScope is joining an already-ambient transaction —
+  // if your driver can't nest (e.g. MongoDB: a session supports exactly one active transaction),
+  // return parentSession unchanged; TransactionScope detects that identity and treats it as a
+  // coupled/shared-fate relationship (rollback propagates to whoever owns the real session; commit
+  // is a no-op there). A driver that DOES support real nested transactions (e.g. Postgres
+  // SAVEPOINT) should return a distinct handle instead.
+  transaction(parentSession) { ... }
 }
 ```
 
@@ -202,9 +208,13 @@ class MyDriver {
 
 ### Transactions
 
-`Transaction.js` checks `supports.includes('transactions')` before calling `client.transaction()`. If `'transactions'` is not in the `supports` array, autograph substitutes a no-op `{ commit: () => null, rollback: () => null }` with **no session** — meaning `query.options?.session` will always be `undefined` and every plan runs outside a transaction, silently.
+Two independent mechanisms, both built on `TransactionScope`/`TransactionContext`:
 
-`transaction()` must return `{ session, commit(), rollback() }`. The `session` value is merged into `query.options` by `QueryResolverTransaction` and forwarded to `prepare()` for every query within that transaction.
+- **Manual** — `resolver.transaction({ isolated = true, coupled = true })` / `.commit()` / `.rollback()`. An explicit "break out into my own transaction" demarcation. `isolated` clones the resolver (its own DataLoader cache); `coupled` (default) offers whatever's currently ambient to the driver as a parent and accepts whatever relationship comes back — pass `coupled: false` to force a wholly independent transaction regardless of driver capability.
+- **Automatic, always-on** — RI cascades (`onDelete: cascade/nullify/restrict`) and `*Many` batch ops (`createMany`/`updateMany`/`pushMany`/`pullMany`/`spliceMany`/`deleteMany`) are unconditionally wrapped in their own scope in `QueryResolver.js` (`#withTransaction`), regardless of the flag below — autograph is both the opener and definitive closer of these bounded operations, so no external signal is needed.
+- **Automatic, opt-in** — `new Resolver({ autoTransaction: true })` gives the resolver its own root scope at construction (cheap — no driver session until the first write). Every operation for that resolver's lifetime (i.e. the whole request, given the one-`Resolver`-per-request convention) shares it once bound. Left opt-in because `Resolver` is also used in contexts with no "end of request" to hook (scripts, admin tools, REPL, background jobs) — the host **must** call `resolver.commit()`/`.rollback()` at a deterministic completion point (e.g. an Apollo Server `willSendResponse`/`didEncounterErrors` plugin) when this is enabled; there is no timing-heuristic auto-commit.
+
+A scope only actually calls `client.transaction()` for data sources whose `supports` array includes `'transactions'` — sources that don't participate run exactly as if no scope existed. See `TransactionScope.js` for the identity-based coupled/independent mechanism.
 
 ### ObjectId shim (non-MongoDB drivers)
 
@@ -231,21 +241,22 @@ function nextId() {
 
 ## Known Issues (from `workspace/autograph/notes`)
 
-- Transactions are currently removed — complex race condition issues
-- `$magic` methods have potential race conditions in nested transactions
 - Not all mutations go through `$aggregateQuery` in MongoDriver (loses `$project`)
-- Failing tests may blow up Jest due to circular references (related to transaction removal)
 - `debug` flag is not always propagated through `findMany`, `pullMany`, etc.
+- `Resolver` gives no explicit "settled" state after `.commit()`/`.rollback()` — a stale write
+  issued against an already-closed scope fails with a raw driver error (e.g. Mongo "session
+  ended") rather than a clear AG-level one. Flagged as a follow-up robustness item, not yet fixed.
 
-## Release 0.15 Goals
+## Release 0.16 Goals
 
-- Remove all remaining deprecations (`getModels`/`getModel`, `@field(transform:...)`, legacy `gqlScope`/`dalScope`/`fieldScope` shims, `withResolvers` alias)
-- Break up `Schema.js` monolith (1,136 lines → `SchemaParser`, `SchemaApi`, `SchemaDirectives` + thin orchestrator)
-- Re-introduce transactions with explicit `TransactionScope` (no implicit session hopping on Resolver)
+- ~~Re-introduce transactions with explicit `TransactionScope`~~ — done (`TransactionScope.js` +
+  `TransactionContext.js`); see Transactions above.
 - `createMany`/`updateMany` as true driver-level batch operations (not N serial `createOne` calls)
+  — still N serial calls today, just now atomically wrapped, not batched at the driver level.
 - Enforce `dataSources.supports` capability flags (`transactions`, `joins`, `batches`, `referentialIntegrity`)
 - Route all MongoDriver mutations through `$aggregateQuery` so `$project` applies consistently
 - Fix `query.flags.debug` propagation (currently missing from cache hits and recursive mutation paths)
 - Embedded document pipeline events (`construct: 'createdBy'` etc. currently don't fire for embeds)
 - Rename `$field.fkField` → `$field.joinKey` for clarity (both `linkBy` and `fkField` default to `linkTo.pkField` but serve different purposes — `linkBy` is for virtual/reverse joins; `fkField`/`joinKey` is for persisted FK fields)
-- Tests overhaul: Scalar `@field()` coverage, fix Jest circular-reference crash, re-enable auto-transaction tests
+- Tests overhaul: Scalar `@field()` coverage, re-enable/expand transaction test coverage (manual,
+  coupled vs. independent, RI/`*Many` atomicity, sibling-hook race under one scope)

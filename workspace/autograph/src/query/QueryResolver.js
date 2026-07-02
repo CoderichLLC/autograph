@@ -35,7 +35,9 @@ module.exports = class QueryResolver extends QueryBuilder {
         return this.#resolver.resolve(query);
       }
       case 'createMany': {
-        return Promise.all(input.map(el => this.#resolver.match(this.#model.name).flags(flags).save(el)));
+        return this.#resolver.withTransaction((txn) => {
+          return Promise.all(input.map(el => txn.match(this.#model.name).flags(flags).save(el)));
+        });
       }
       case 'updateOne': {
         return this.#get(query).then((doc) => {
@@ -43,8 +45,10 @@ module.exports = class QueryResolver extends QueryBuilder {
         });
       }
       case 'updateMany': {
-        return this.#find(query).then((docs) => {
-          return Promise.all(docs.map(doc => this.#resolver.match(this.#model.name).flags(flags).id(doc.id).save(input)));
+        return this.#resolver.withTransaction((txn) => {
+          return this.#find(query, txn).then((docs) => {
+            return Promise.all(docs.map(doc => txn.match(this.#model.name).flags(flags).id(doc.id).save(input)));
+          });
         });
       }
       case 'pushOne': {
@@ -59,8 +63,10 @@ module.exports = class QueryResolver extends QueryBuilder {
       }
       case 'pushMany': {
         const [[key, values]] = Object.entries(input);
-        return this.#find(query).then((docs) => {
-          return Promise.all(docs.map(doc => this.#resolver.match(this.#model.name).flags(flags).id(doc.id).push(key, values)));
+        return this.#resolver.withTransaction((txn) => {
+          return this.#find(query, txn).then((docs) => {
+            return Promise.all(docs.map(doc => txn.match(this.#model.name).flags(flags).id(doc.id).push(key, values)));
+          });
         });
       }
       case 'pullOne': {
@@ -76,8 +82,10 @@ module.exports = class QueryResolver extends QueryBuilder {
       }
       case 'pullMany': {
         const [[key, values]] = Object.entries(input);
-        return this.#find(query).then((docs) => {
-          return Promise.all(docs.map(doc => this.#resolver.match(this.#model.name).flags(flags).id(doc.id).pull(key, values)));
+        return this.#resolver.withTransaction((txn) => {
+          return this.#find(query, txn).then((docs) => {
+            return Promise.all(docs.map(doc => txn.match(this.#model.name).flags(flags).id(doc.id).pull(key, values)));
+          });
         });
       }
       case 'spliceOne': {
@@ -95,20 +103,22 @@ module.exports = class QueryResolver extends QueryBuilder {
       }
       case 'spliceMany': {
         const [[key, values]] = Object.entries(input);
-        return this.#find(query).then((docs) => {
-          return Promise.all(docs.map(doc => this.#resolver.match(this.#model.name).flags(flags).id(doc.id).splice(key, ...values)));
+        return this.#resolver.withTransaction((txn) => {
+          return this.#find(query, txn).then((docs) => {
+            return Promise.all(docs.map(doc => txn.match(this.#model.name).flags(flags).id(doc.id).splice(key, ...values)));
+          });
         });
       }
       case 'deleteOne': {
         return this.#get(query).then((doc) => {
-          return this.#resolveReferentialIntegrity(doc).then(() => {
-            return this.#resolver.resolve(query.clone({ doc })).then(() => doc);
-          });
+          return this.#resolveReferentialIntegrity(doc, txn => txn.resolve(query.clone({ doc })).then(() => doc));
         });
       }
       case 'deleteMany': {
-        return this.#find(query).then((docs) => {
-          return Promise.all(docs.map(doc => this.#resolver.match(this.#model.name).flags(flags).id(doc.id).delete()));
+        return this.#resolver.withTransaction((txn) => {
+          return this.#find(query, txn).then((docs) => {
+            return Promise.all(docs.map(doc => txn.match(this.#model.name).flags(flags).id(doc.id).delete()));
+          });
         });
       }
       default: {
@@ -117,18 +127,29 @@ module.exports = class QueryResolver extends QueryBuilder {
     }
   }
 
-  #get(query) {
-    return this.#resolver.match(this.#model.name).id(query.toObject().id).one({ required: true });
+  #get(query, resolver = this.#resolver) {
+    return resolver.match(this.#model.name).id(query.toObject().id).one({ required: true });
   }
 
-  #find(query) {
-    return this.#resolver.resolve(query.clone({ op: 'findMany', key: `find${this.#model.name}`, crud: 'read', isMutation: false }));
+  #find(query, resolver = this.#resolver) {
+    return resolver.resolve(query.clone({ op: 'findMany', key: `find${this.#model.name}`, crud: 'read', isMutation: false }));
   }
 
-  #resolveReferentialIntegrity(doc) {
-    const txn = this.#resolver;
-
-    return Util.promiseChain(this.#model.referentialIntegrity.map(({ model, field, isArray, path }) => () => {
+  // The sole entry point for "does this delete need transactional demarcation" — the cascade walk
+  // AND whatever the caller wants to happen after it (the actual delete) are both part of the same
+  // wrapped `run`, so there's no separate dance at the call site to keep in sync with this decision.
+  //
+  // RI cascades are self-contained: autograph itself is both the opener and the definitive closer
+  // of this unit of work (unlike a whole GraphQL request, whose end AG cannot observe), so it's
+  // safe to unconditionally wrap them, regardless of `autoTransaction`. `this.#resolver.withTransaction`
+  // is the exact same public method a manual caller uses — always `{ isolated: true }` (its
+  // default), since this can be triggered from code sharing a resolver instance with concurrent
+  // siblings (e.g. two postMutation hooks on the same event) and must never mutate that shared
+  // instance's own scope. `andThen` always receives whichever resolver ends up being used —
+  // the transactional clone if wrapped, or `this.#resolver` unchanged if not — so callers never
+  // need to know which case they're in.
+  #resolveReferentialIntegrity(doc, andThen = () => doc) {
+    const run = txn => Util.promiseChain(this.#model.referentialIntegrity.map(({ model, field, isArray, path }) => () => {
       const { onDelete, fkField } = field;
       const id = doc[fkField];
       const $path = path.join('.');
@@ -140,6 +161,10 @@ module.exports = class QueryResolver extends QueryBuilder {
         case 'restrict': return txn.match(model).where(where).count().then(count => (count ? Promise.reject(new Error('Restricted')) : count));
         default: throw new Error(`Unknown onDelete operator: '${onDelete}'`);
       }
-    }));
+    })).then(() => andThen(txn));
+
+    // Only pay for a transaction when there's an actual cascade to protect — a model with no
+    // @field(onDelete:) rules deletes exactly one document, already atomic on its own.
+    return this.#model.referentialIntegrity.length ? this.#resolver.withTransaction(run) : run(this.#resolver);
   }
 };
