@@ -298,4 +298,37 @@ describe('Emitter', () => {
       expect(fn).toBeCalledTimes(2);
     });
   });
+
+  describe('removeListener on onModels/onKeys registrations (regression)', () => {
+    // Bug: #createWrapper (backing onModels/onKeys/onceModels/onceKeys) built its own wrapper
+    // closure but never set `.listener` on it — the same convention wrapBasicMemoize/
+    // wrapNextMemoize already rely on so `removeListener(event, originalFn)` can find a wrapped
+    // listener via `l.listener === listener`. Without it, removeListener could never find or
+    // remove a hook registered via onModels/onKeys by its original function reference — the
+    // wrapper (and thus the hook) stayed registered forever, regardless of how many times the
+    // caller "removed" it.
+    test('a basic-style (arity < 2) onModels listener can be removed by its original function reference', async () => {
+      const fn = jest.fn(() => undefined);
+      Emitter.onModels('removeMeBasic', ['M'], fn);
+      Emitter.removeListener('removeMeBasic', fn);
+      await Emitter.emit('removeMeBasic', { resolver, query: { model: 'M', crud: 'read', op: 'findOne' } });
+      expect(fn).not.toHaveBeenCalled();
+    });
+
+    test('a next-style (arity >= 2) onModels listener can be removed by its original function reference', async () => {
+      const fn = jest.fn((event, next) => next());
+      Emitter.onModels('removeMeNext', ['M'], fn);
+      Emitter.removeListener('removeMeNext', fn);
+      await Emitter.emit('removeMeNext', { resolver, query: { model: 'M', crud: 'read', op: 'findOne' } });
+      expect(fn).not.toHaveBeenCalled();
+    });
+
+    test('an onKeys listener can be removed by its original function reference', async () => {
+      const fn = jest.fn(() => undefined);
+      Emitter.onKeys('removeMeKeys', ['someKey'], fn);
+      Emitter.removeListener('removeMeKeys', fn);
+      await Emitter.emit('removeMeKeys', { resolver, query: { key: 'someKey', crud: 'read', op: 'findOne' } });
+      expect(fn).not.toHaveBeenCalled();
+    });
+  });
 });

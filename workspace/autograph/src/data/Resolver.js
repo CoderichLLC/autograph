@@ -10,6 +10,7 @@ const TransactionScope = require('./TransactionScope');
 const Pipeline = require('./Pipeline');
 const { inspect, buildSelectionTree } = require('../service/AppService');
 const { $QUERY, $RAW } = require('../service/Symbols');
+const { PreOperationError, PostOperationError } = require('../service/ErrorService');
 
 const loaders = {};
 
@@ -131,6 +132,31 @@ module.exports = class Resolver {
   }
 
   /**
+   * Retroactively turn on `autoTransaction` (§4.4) for this exact resolver reference, as if
+   * `{ autoTransaction: true }` had been passed to the constructor. Idempotent — a no-op if this
+   * resolver already has a scope (from the constructor, or an earlier call to this method).
+   *
+   * For "operation mode": a consumer that constructs one `Resolver` per request but only wants
+   * *some* requests to be transactional (e.g. a GraphQL operation with more than one top-level
+   * mutation field, wanting all-or-nothing semantics across them) can call this from a hook that
+   * runs after the operation is known but before any resolver has dispatched — e.g. Apollo
+   * Server's `didResolveOperation`, which fires after parsing/validation and before execution.
+   * Counting top-level mutation fields is transport-specific and deliberately NOT autograph's
+   * job; this method is the one piece of surface area autograph needs to expose for a host to
+   * build that decision on top of.
+   *
+   * Calling this AFTER something has already dispatched through this resolver does not
+   * retroactively cover whatever already ran non-transactionally — same as `autoTransaction` at
+   * construction, only operations from this point forward participate.
+   *
+   * @returns {Resolver} - this resolver, for chaining
+   */
+  enableAutoTransaction() {
+    this.#transactionScope ??= new TransactionScope();
+    return this;
+  }
+
+  /**
    * Execute a user-defined loader (curry in context)
    */
   loader(name) {
@@ -225,6 +251,17 @@ module.exports = class Resolver {
       await txn.commit();
       return result;
     } catch (e) {
+      // The underlying write(s) already succeeded — only a post-write hook failed (see
+      // PostOperationError in ErrorService.js / Resolver#createSystemEvent). There is nothing to
+      // undo; commit anyway and surface it to the caller. Thrown as-is (not unwrapped to `.data`)
+      // so callers get the same shape here as for a plain, non-wrapped mutation's own
+      // PostOperationError — `.data` for the original cause, `.result` for what was actually
+      // written despite the error (settleMany/#resolveReferentialIntegrity populate `.result` with
+      // everything that succeeded across the whole batch/cascade, not just one element).
+      if (e instanceof PostOperationError) {
+        await txn.commit();
+        throw Boom.boomify(e);
+      }
       await txn.rollback();
       throw e;
     }
@@ -487,7 +524,10 @@ module.exports = class Resolver {
     }, {});
   }
 
-  #createSystemEvent($query, thunk = () => {}) {
+  // async: needed so a synchronous throw anywhere in this body (e.g. $query.transform(false),
+  // or a synchronously-throwing basic-style listener) converts to a rejection like every other
+  // error path here, rather than propagating as a thrown exception out of #createSystemEvent.
+  async #createSystemEvent($query, thunk = () => {}) {
     const tquery = $query.transform(false);
     const query = tquery.toObject();
     const type = query.isMutation ? 'Mutation' : 'Query';
@@ -519,29 +559,52 @@ module.exports = class Resolver {
     // object's hidden class stable since the property is part of the initial object literal.
     const event = { schema: this.#schema, context: this.#context, resolver: this, query, [$QUERY]: tquery };
 
-    return Emitter.emit(`pre${type}`, event).then(async (resultEarly) => {
-      if (resultEarly !== undefined) return resultEarly;
-
-      if (needsValidate) {
+    // pre* phase: preMutation + validate, both BEFORE the write. A failure here means the write
+    // never even happened — always rollback-worthy. Wrapped in PreOperationError purely so a
+    // pre-write failure is symmetrically identifiable by phase, same as PostOperationError below;
+    // the commit/rollback decision itself doesn't need to check for it — "anything that isn't a
+    // PostOperationError" already means rollback (see Resolver#withTransaction).
+    let resultEarly;
+    try {
+      resultEarly = await Emitter.emit(`pre${type}`, event);
+      if (resultEarly === undefined && needsValidate) {
         tquery.validate(); // sets async $thunks (e.g. ensureFK)
         await Promise.all([...query.input.$thunks]);
         await Emitter.emit('validate', event);
       }
+    } catch (e) {
+      throw Boom.boomify(e instanceof PreOperationError ? e : new PreOperationError(e));
+    }
 
-      return thunk(tquery);
-    }).then((result) => {
-      query.result = result;
-      return Emitter.emit(`post${type}`, event);
-    }).then((early) => {
-      if (early !== undefined) query.result = early;
-      return early !== undefined ? early : Emitter.emit('preResponse', event);
-    }).then((early) => {
-      if (early !== undefined) query.result = early;
-      return early !== undefined ? early : Emitter.emit('postResponse', event);
-    }).then((early) => {
-      if (early !== undefined) query.result = early;
+    // The actual write. Failures here propagate unwrapped, straight to the caller — always
+    // rollback-worthy by default; there's no hook to attribute the failure to.
+    const result = resultEarly !== undefined ? resultEarly : await Promise.resolve(thunk(tquery)).catch((e) => { throw Boom.boomify(e); });
+    query.result = result;
+
+    // post* phase: postMutation/preResponse/postResponse, all AFTER the write already succeeded.
+    // A failure here must NEVER be treated as rollback-worthy — the data is already correct and
+    // durable-within-the-transaction; undoing it because a side-effect hook failed would destroy
+    // good work. Wrapped in PostOperationError so Resolver#withTransaction's commit-decision logic
+    // can recognize it, commit anyway, and re-throw the original cause to the caller. postMutation
+    // always runs; preResponse/postResponse each run only if the previous stage didn't already
+    // short-circuit with an explicit return value (unchanged from prior behavior).
+    try {
+      let early = await Emitter.emit(`post${type}`, event);
+      if (early !== undefined) {
+        query.result = early;
+      } else {
+        early = await Emitter.emit('preResponse', event);
+        if (early !== undefined) {
+          query.result = early;
+        } else {
+          early = await Emitter.emit('postResponse', event);
+          if (early !== undefined) query.result = early;
+        }
+      }
       return query.result;
-    }).catch((e) => { throw Boom.boomify(e); });
+    } catch (e) {
+      throw Boom.boomify(e instanceof PostOperationError ? e : new PostOperationError(e, query.result));
+    }
   }
 
   static $loader(name, resolver, config) {

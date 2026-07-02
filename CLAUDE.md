@@ -246,6 +246,16 @@ function nextId() {
 - `Resolver` gives no explicit "settled" state after `.commit()`/`.rollback()` — a stale write
   issued against an already-closed scope fails with a raw driver error (e.g. Mongo "session
   ended") rather than a clear AG-level one. Flagged as a follow-up robustness item, not yet fixed.
+- **`.where({ field: { $in: [...] } })` reads return nothing, even when matching documents exist**
+  (model- and field-agnostic — reproduces on any model/field, not specific to any particular
+  mutation path). Root cause (via code trace, not yet fixed): `Query.js#finalize` flattens `where`
+  via `Util.flatten` before reconstructing it — an explicit `{ field: { $in: [...] } }` flattens to
+  the key `'field.$in'` with an array value (same as CLAUDE.md's documented `$ne` example above),
+  but `#finalize`'s reconstruction loop unconditionally wraps any array VALUE in `{ $in: value }`
+  regardless of whether the flattened KEY already ends in an operator — producing
+  `{ 'field.$in': { $in: [...] } }` (wrong field path, double-wrapped) instead of
+  `{ field: { $in: [...] } }`. Fix likely belongs in that reduce: skip the array→`$in` wrap when
+  the flattened key's last segment is already a `$`-prefixed operator.
 
 ## Release 0.16 Goals
 

@@ -334,6 +334,12 @@ class Emitter extends EventEmitter {
       }
       return next();
     };
+    // Without this, Emitter.removeListener(event, originalFn) can never find this wrapper —
+    // it's neither reference-equal to `listener` nor (absent this line) linked back to it via
+    // `.listener`, the same convention wrapBasicMemoize/wrapNextMemoize already rely on (see
+    // removeListener's `l === listener || l.listener === listener` match) — so a hook registered
+    // via onModels/onKeys/onceModels/onceKeys could never actually be removed again.
+    wrapper.listener = listener;
 
     // Register via super.on directly (not this.on) so we can record the filter info in the
     // per-(event, model|key) index instead of bumping the generic count. The model-aware

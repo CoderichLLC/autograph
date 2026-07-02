@@ -1,3 +1,7 @@
+const Emitter = require('../../src/data/Emitter');
+const Resolver = require('../../src/data/Resolver');
+const { PostOperationError } = require('../../src/service/ErrorService');
+
 describe('Resolver (transaction regressions)', () => {
   let resolver;
   let context;
@@ -241,6 +245,234 @@ describe('Resolver (transaction regressions)', () => {
       expect(afterUpdate.isDefault).toBe(true); // not the stale, primed copy
 
       await resolver.match('Color').id(color.id).delete();
+    });
+  });
+
+  describe('enableAutoTransaction() — retroactive "operation mode"', () => {
+    // Each test builds its own resolver (register: false, so it never hijacks
+    // context.autograph.resolver) rather than mutating the shared `global.resolver` — enabling
+    // autoTransaction on the shared instance would leak an unresolved transaction into every
+    // later test in this file, since nothing else would ever call .commit()/.rollback() on it.
+    const freshResolver = () => new Resolver({ schema: resolver.getSchema(), context, register: false });
+
+    test('is a no-op if the resolver already has a scope (from the constructor)', () => {
+      const withAuto = new Resolver({ schema: resolver.getSchema(), context, register: false, autoTransaction: true });
+      const original = withAuto.transactionScope;
+      expect(withAuto.enableAutoTransaction()).toBe(withAuto); // returns this, for chaining
+      expect(withAuto.transactionScope).toBe(original); // same scope object, not replaced
+    });
+
+    test('is idempotent — calling it twice does not discard an already-bound session', async () => {
+      const txnResolver = freshResolver();
+      txnResolver.enableAutoTransaction();
+      const created = await txnResolver.match('Person').save({ name: 'op-mode-idempotent', emailAddress: 'op-mode-idempotent@example.com' });
+      const scopeAfterFirstWrite = txnResolver.transactionScope;
+
+      txnResolver.enableAutoTransaction(); // second call — must not reset anything
+      expect(txnResolver.transactionScope).toBe(scopeAfterFirstWrite);
+      expect(await txnResolver.match('Person').id(created.id).one()).not.toBeNull(); // still sees its own write
+
+      await txnResolver.rollback();
+    });
+
+    // The scenario that motivated this: a GraphQL operation with multiple top-level mutation
+    // fields (fully spec-sequential) whose caller wants all-or-nothing semantics across them,
+    // without the host having decided autoTransaction: true for every request up front. A host
+    // integration would call this from something like Apollo's didResolveOperation — which runs
+    // after the operation is parsed/validated but before any resolver dispatches — once it's
+    // determined the operation's shape warrants it (e.g. more than one top-level mutation field).
+    test('makes two otherwise-independent sequential mutations atomic together', async () => {
+      const txnResolver = freshResolver();
+      txnResolver.enableAutoTransaction();
+
+      // Field "a" of the operation.
+      const first = await txnResolver.match('Person').save({ name: 'op-mode-batch', emailAddress: 'op-mode-batch-a@example.com' });
+
+      // Field "b" of the operation — fails (duplicate name, unique index).
+      await expect(
+        txnResolver.match('Person').save({ name: 'op-mode-batch', emailAddress: 'op-mode-batch-b@example.com' }),
+      ).rejects.toThrow(/duplicate/gi);
+
+      // Host's error path (e.g. Apollo's didEncounterErrors -> resolver.rollback()).
+      await txnResolver.rollback();
+
+      // Field "a"'s write must NOT have stuck either — that's the whole point of operation mode.
+      expect(await resolver.match('Person').id(first.id).one()).toBeNull();
+    });
+
+    test('commits both fields together when the whole operation succeeds', async () => {
+      const txnResolver = freshResolver();
+      txnResolver.enableAutoTransaction();
+
+      const a = await txnResolver.match('Person').save({ name: 'op-mode-success-a', emailAddress: 'op-mode-success-a@example.com' });
+      const b = await txnResolver.match('Person').save({ name: 'op-mode-success-b', emailAddress: 'op-mode-success-b@example.com' });
+      await txnResolver.commit();
+
+      expect(await resolver.match('Person').id(a.id).one()).not.toBeNull();
+      expect(await resolver.match('Person').id(b.id).one()).not.toBeNull();
+
+      await resolver.match('Person').id(a.id).delete();
+      await resolver.match('Person').id(b.id).delete();
+    });
+
+    test('calling it late does not retroactively cover a write that already ran non-transactionally', async () => {
+      const txnResolver = freshResolver();
+
+      const before = await txnResolver.match('Person').save({ name: 'op-mode-too-late', emailAddress: 'op-mode-too-late@example.com' });
+      txnResolver.enableAutoTransaction(); // enabled AFTER the first write already committed on its own
+
+      const after = await txnResolver.match('Person').save({ name: 'op-mode-too-late-2', emailAddress: 'op-mode-too-late-2@example.com' });
+      await txnResolver.rollback(); // only covers `after`
+
+      expect(await resolver.match('Person').id(before.id).one()).not.toBeNull(); // unaffected — already committed
+      expect(await resolver.match('Person').id(after.id).one()).toBeNull(); // rolled back
+
+      await resolver.match('Person').id(before.id).delete();
+    });
+  });
+
+  describe('PostOperationError — post-write hook failures never roll back an already-successful write (regression)', () => {
+    // Bug: postMutation/preResponse/postResponse rejections propagated through the exact same
+    // path as preMutation/write failures, so a side-effect hook (logging, notifications, etc)
+    // throwing could both (a) report the mutation as failed to the caller even though the write
+    // had already durably succeeded, and (b) inside a *Many/RI auto-wrap, roll back OTHER,
+    // unrelated elements that had nothing wrong with them. Fixed: Resolver#createSystemEvent wraps
+    // post-phase failures in PostOperationError; Resolver#withTransaction commits (not rolls back)
+    // on that specific type, still re-throwing it to the caller.
+    // Color has only 4 possible `type` values and other tests in this file create/leave some of
+    // them behind — filtering reads by type would pick up unrelated documents. Track exact
+    // doc IDs (or a before/after count of the WHOLE collection) instead of filtering by type.
+    test('a single mutation: the caller still sees the error, but the write is NOT undone', async () => {
+      const hook = async (event, next) => {
+        if (event.query.model === 'Color') throw new Error('side-effect failure');
+        next();
+      };
+      Emitter.onModels('postMutation', ['Color'], hook);
+
+      let caughtError;
+      try {
+        await resolver.match('Color').save({ type: 'blue' });
+      } catch (e) {
+        caughtError = e;
+      }
+      Emitter.removeListener('postMutation', hook);
+
+      expect(caughtError).toBeInstanceOf(PostOperationError);
+      expect(caughtError.data.message).toBe('side-effect failure');
+      expect(caughtError.result).toBeDefined(); // what was actually written, despite the error
+
+      const written = await resolver.match('Color').id(caughtError.result.id).one();
+      expect(written).not.toBeNull(); // the write stuck
+      await resolver.match('Color').id(caughtError.result.id).delete();
+    });
+
+    test('createMany: one element\'s postMutation failure does not roll back a different, successful element', async () => {
+      const before = await resolver.match('Color').where({}).many();
+
+      let callCount = 0;
+      const hook = async (event, next) => {
+        callCount += 1;
+        if (callCount === 2) throw new Error('side-effect failure on second element');
+        next();
+      };
+      Emitter.onModels('postMutation', ['Color'], hook);
+
+      let caughtError;
+      try {
+        await resolver.match('Color').save([{ type: 'red' }, { type: 'green' }]);
+      } catch (e) {
+        caughtError = e;
+      }
+      Emitter.removeListener('postMutation', hook);
+
+      expect(caughtError).toBeInstanceOf(PostOperationError);
+
+      const after = await resolver.match('Color').where({}).many();
+      expect(after.length).toBe(before.length + 2); // BOTH elements persisted — this is the fix
+
+      const beforeIds = new Set(before.map(b => `${b.id}`));
+      const added = after.filter(a => !beforeIds.has(`${a.id}`));
+      await Promise.all(added.map(a => resolver.match('Color').id(a.id).delete()));
+    });
+
+    test('createMany: a genuine failure on one element still rolls back everything, even when a different element also has a postMutation-only failure', async () => {
+      // Regression for the mixed-failure race: Promise.all would only ever surface whichever
+      // element's rejection happened to settle first. A preMutation failure is structurally always
+      // faster than a postMutation failure (the latter can't even start until its own write has
+      // completed) — so pairing "a preMutation failure" with "a postMutation failure" would pass
+      // even with plain Promise.all, by accident, proving nothing about the actual race. To force
+      // the real failure to be the SLOWER one (the only way Promise.all's "first wins" could
+      // plausibly pick the wrong one), this uses a genuine write-level failure (a duplicate name
+      // against Person's unique index) deliberately delayed via an artificial sleep in its own
+      // preMutation hook, racing against a different element's postMutation failure, which fires
+      // fast (immediately after its own successful write, no delay).
+      const before = await resolver.match('Person').where({}).many();
+      const existing = await resolver.match('Person').save({ name: 'race-real-failure', emailAddress: 'race-real-failure-0@example.com' });
+
+      const delayHook = async (event, next) => {
+        if (event.query.input?.name === 'race-real-failure') await new Promise((r) => { setTimeout(r, 50); });
+        next();
+      };
+      const postHook = async (event, next) => {
+        if (event.query.input?.name === 'race-post-failure') throw new Error('side-effect failure (must not mask the real one)');
+        next();
+      };
+      Emitter.onModels('preMutation', ['Person'], delayHook);
+      Emitter.onModels('postMutation', ['Person'], postHook);
+
+      let caughtError;
+      try {
+        await resolver.match('Person').save([
+          { name: 'race-real-failure', emailAddress: 'race-real-failure-1@example.com' }, // duplicate name -> real DB failure, delayed
+          { name: 'race-post-failure', emailAddress: 'race-post-failure@example.com' }, // succeeds its write, fails its post hook, fast
+        ]);
+      } catch (e) {
+        caughtError = e;
+      }
+      Emitter.removeListener('preMutation', delayHook);
+      Emitter.removeListener('postMutation', postHook);
+
+      expect(caughtError).not.toBeInstanceOf(PostOperationError); // the real (duplicate-key) failure wins, not masked
+
+      const after = await resolver.match('Person').where({}).many();
+      expect(after.length).toBe(before.length + 1); // only `existing` — the whole batch rolled back
+
+      await resolver.match('Person').id(existing.id).delete();
+    });
+
+    test('RI cascade: a postMutation failure on an early cascade step does not stop later steps, and the whole cascade still commits', async () => {
+      const author = await resolver.match('Person').save({ name: 'ri-post-author', emailAddress: 'ri-post-author@example.com' });
+      const friend = await resolver.match('Person').save({ name: 'ri-post-friend', emailAddress: 'ri-post-friend@example.com', friends: [author.id] });
+      const book = await resolver.match('Book').save({ name: 'RI Post Book', price: 9.99, author: author.id });
+
+      // Fires for the friends-cascade step (an update on Person) — fails AFTER that write succeeds.
+      const hook = async (event, next) => {
+        if (event.query.model === 'Person' && event.query.crud === 'update') throw new Error('side-effect failure on cascade step');
+        next();
+      };
+      Emitter.onModels('postMutation', ['Person'], hook);
+
+      let caughtError;
+      try {
+        await resolver.match('Person').id(author.id).delete();
+      } catch (e) {
+        caughtError = e;
+      }
+      Emitter.removeListener('postMutation', hook);
+
+      expect(caughtError).toBeInstanceOf(PostOperationError);
+
+      // The friends-cascade step's write actually took effect...
+      const friendAfter = await resolver.match('Person').id(friend.id).one();
+      expect(friendAfter.friends.map(f => `${f}`)).not.toContain(`${author.id}`);
+
+      // ...AND the walk continued past it: the book cascade (a later step) also completed...
+      expect(await resolver.match('Book').id(book.id).one()).toBeNull();
+
+      // ...AND the final delete itself committed.
+      expect(await resolver.match('Person').id(author.id).one()).toBeNull();
+
+      await resolver.match('Person').id(friend.id).delete();
     });
   });
 });

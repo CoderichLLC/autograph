@@ -501,7 +501,156 @@ test actually failed against the old code before restoring it.
     specifically because its cascade step is a pull/update, not an insert. Real Postgres would
     handle this correctly via native `ROLLBACK`.
 
-## 5. 100,000-foot overview: what happens automatically, session by session
+### 4.11 Operation mode — `enableAutoTransaction()` for a decision made *after* construction
+
+`autoTransaction` (§4.4) is a constructor-time boolean, decided once, when the resolver is built.
+In the standard Apollo integration that's typically a single, static choice for every request. A
+real use case surfaced this as too coarse: a caller sends one GraphQL operation with multiple
+top-level mutation fields (fully spec-legal — top-level mutation fields execute serially) and wants
+all-or-nothing semantics across them, without every request in the app paying for a transaction it
+doesn't need.
+
+**This does not require autograph to know anything about headers, auth, or HTTP** — the consuming
+application's own context factory already decides `autoTransaction` per request today, since it
+already constructs a fresh `Resolver` per request and already has the incoming request available at
+that point. What was missing was a way to make the decision *later* than construction, once the
+*shape of the operation itself* is known — e.g. "this operation has more than one top-level mutation
+field" — which isn't available at `context()` time in most Apollo lifecycles, only after
+parsing/validation.
+
+```js
+// Resolver.js
+enableAutoTransaction() {
+  this.#transactionScope ??= new TransactionScope(); // idempotent — no-op if already set
+  return this;
+}
+```
+
+A host wires this from a lifecycle point that runs after the operation is parsed but before any
+resolver dispatches — Apollo Server's `didResolveOperation` is exactly that point:
+
+```js
+plugins: [{
+  async requestDidStart() {
+    return {
+      async didResolveOperation({ operation, contextValue }) {
+        if (operation.operation === 'mutation' && operation.selectionSet.selections.length > 1) {
+          contextValue.autograph.resolver.enableAutoTransaction();
+        }
+      },
+      async willSendResponse({ contextValue, errors }) {
+        const { resolver } = contextValue.autograph;
+        await (errors?.length ? resolver.rollback() : resolver.commit());
+      },
+    };
+  },
+}]
+```
+
+Deliberately **not** autograph's job: counting top-level mutation fields (or any other
+transport/operation-shape heuristic) is Apollo/GraphQL-specific policy, not something the
+driver-agnostic core should hardcode an opinion about. `enableAutoTransaction()` is the one piece of
+surface area autograph needs to expose for a host to build that policy on top of — same relationship
+as the `commit()`/`rollback()` host contract in §4.7.
+
+Two things worth being explicit about:
+
+- **Idempotent, not additive.** Calling it when a scope already exists (from the constructor, or an
+  earlier call) is a no-op — it never discards an in-progress transaction or its already-bound
+  session.
+- **Not retroactive.** Calling it after something has already dispatched through this resolver does
+  not cover whatever already ran — same as `autoTransaction` at construction, only operations from
+  this point forward participate. In the recommended `didResolveOperation` usage this never bites,
+  since that hook runs before execution begins; it would bite if called from somewhere later in a
+  custom lifecycle after a resolver had already fired.
+
+If a caller-driven variant is wanted later (e.g. a trusted, authenticated client explicitly
+requesting transactional semantics for an otherwise single-mutation operation via a header), that's
+a decision entirely inside the consuming application's own context factory or `didResolveOperation`
+handler — same mechanism, just a different trigger condition. It should be gated behind
+authentication, not exposed to arbitrary callers: every write-containing transactional request holds
+a real DB session open for its duration, and a caller who can request that on demand can hold open as
+many concurrent sessions as they can send requests — a resource-exhaustion vector, not just a design
+nicety.
+
+### 4.12 `PostOperationError` / `PreOperationError` — a post-write hook failure must never undo a successful write
+
+A separate, more severe bug surfaced from asking where commit/rollback actually happen relative to
+the Emitter lifecycle (§4.4/§5's ordering was never the issue — see the restated open question at
+the end of this section): `postMutation`/`preResponse`/`postResponse` rejections propagated through
+the exact same path as `preMutation`/write failures. Concretely, verified by temporarily reverting
+each fix and confirming the regression tests fail for the right reason: (1) a single mutation whose
+`postMutation` hook threw made the caller see a rejection even though the write had already
+durably succeeded; (2) inside a `*Many`/RI auto-wrap, one element's `postMutation` failure rolled
+back *other, unrelated elements* that had nothing wrong with them.
+
+The fix, settled on after considering (and rejecting) two more invasive alternatives — restructuring
+`#createSystemEvent` into "all pre*, then all post*" phases across a whole batch/cascade, and a
+pair of explicit `AG.RollbackError`/`AG.NonFatalError` override classes for callers to throw — in
+favor of the simplest one: **classify by phase, automatically, with no override needed**, since the
+phase itself already tells you everything: nothing before the write can be undone without aborting
+it (rollback-worthy by construction); nothing after it can be a reason to undo a write that already
+succeeded (never rollback-worthy, by construction).
+
+- `Resolver#createSystemEvent` wraps any failure from `preMutation`/`validate` in `PreOperationError`
+  (symmetry only — nothing branches on this type specifically, "not a `PostOperationError`" already
+  means rollback) and any failure from `postMutation`/`preResponse`/`postResponse` in
+  `PostOperationError(cause, result)` — `result` is the write's already-successful value, preserved
+  even though this is an error. The actual write (`thunk(tquery)`) failing propagates unwrapped —
+  there's no hook to attribute it to.
+- `Resolver#withTransaction`'s catch checks `instanceof PostOperationError`: commits anyway (there's
+  nothing to undo) and re-throws the `PostOperationError` itself, unwrapped-to-`.data` deliberately
+  avoided — this keeps the shape identical to a plain, non-`*Many` mutation's own
+  `PostOperationError`, so callers get the same `.data`/`.result` regardless of which path they went
+  through.
+- For the `*Many` fan-out sites in `QueryResolver.js` (`createMany`/`updateMany`/etc.), a
+  `settleMany` helper replaces the naive `Promise.all` with `Promise.allSettled` + partitioning: any
+  non-`PostOperationError` rejection anywhere in the batch still rolls back everything (unchanged);
+  only-`PostOperationError` rejections commit, aggregated into one `PostOperationError` (an
+  `AggregateError` if there's more than one) carrying every element that actually succeeded. Plain
+  `Promise.all` would only ever surface whichever element's rejection settled *first* — a real
+  failure racing against an unrelated element's post-write failure could be masked, incorrectly
+  committing a batch that had a genuine problem in it. Verified with a deliberately-constructed race
+  (a real write-level failure artificially delayed past a different element's faster post-write
+  failure) — this only reproduces the bug when the real failure is forced to be the *slower* one;
+  pairing a `preMutation` failure with a `postMutation` failure doesn't exercise the race at all,
+  since a pre-write failure is structurally always faster (it never even reaches the write).
+- `#resolveReferentialIntegrity`'s cascade walk has the same risk in sequential form: it used to be
+  a `Util.promiseChain` (stops at the first rejection), so a `PostOperationError` from an early
+  cascade step would abort every *later* step — yet still commit (per the rule above), persisting an
+  **incomplete** cascade. Rewritten as an explicit sequential loop that catches a
+  `PostOperationError` per step, keeps walking, and aggregates at the end — a real failure still
+  stops the walk immediately (rollback is correct there; no reason to keep going).
+- `PreOperationError`/`PostOperationError` are exported from the package's public `index.js` so a
+  host can `instanceof`-check them in its own error handling if it wants to (e.g. distinguishing
+  "the mutation itself failed" from "the mutation succeeded, a side effect after it didn't" in a
+  GraphQL error-formatting layer) — not required, since AG's own commit/rollback logic already
+  handles the classification.
+
+**A separate bug surfaced while verifying this, unrelated to transactions:** `Emitter.onModels`/
+`onKeys`/`onceModels`/`onceKeys` build their own wrapper closure around a registered listener but
+never set `.listener` on it — the convention `removeListener(event, originalFn)` needs to find a
+wrapped listener via `l.listener === listener` (the same convention `wrapBasicMemoize`/
+`wrapNextMemoize` already followed). Without it, a hook registered via `onModels`/`onKeys` could
+never actually be removed by its original function reference — it silently stayed registered
+forever. Fixed by setting `wrapper.listener = listener` in `#createWrapper`, matching the existing
+memoize-wrapper pattern.
+
+**Restating the still-open "least surprise" question from a few turns earlier, since it's genuinely
+separate from the fix above and remains unresolved:** `postMutation` (and `preResponse`/
+`postResponse`) necessarily fire *before* the transaction commits, for both `*Many`/RI (commit only
+happens after every element's *entire* lifecycle, including its own post-phase, has run — that's
+what batch atomicity requires) and `autoTransaction` (commit only happens at the host's explicit,
+end-of-request `resolver.commit()` call). This is not a bug — the `PostOperationError` fix above
+proves it isn't one, since a post-write failure can no longer cause any data loss regardless of
+commit timing — but it does mean **no current Emitter event fires *after* the true, final commit**.
+A hook that performs an irreversible side effect (sending an email, calling an external API) has no
+way to know the underlying transaction has actually, finally settled — it might still be running
+before a `*Many`/RI batch's own commit, or (under `autoTransaction`) arbitrarily long before the
+host's own end-of-request commit call. `TransactionScope` already has the mechanism this would need
+internally (`addSettled` — a callback deferred until a client's session is truly, finally sealed);
+it just isn't exposed to end-user hook code today. Whether to add that — and what the API surface
+for it should look like — is still open.
 
 Walking the actual lifecycle end to end, in order:
 

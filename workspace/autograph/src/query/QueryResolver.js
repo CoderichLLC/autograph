@@ -1,6 +1,26 @@
 const get = require('lodash.get');
 const Util = require('@coderich/util');
 const QueryBuilder = require('./QueryBuilder');
+const { PostOperationError } = require('../service/ErrorService');
+
+// Runs a fan-out of independent per-element mutations (createMany/updateMany/etc's elements) to
+// completion regardless of individual failures — never lets Promise.all's "first rejection wins"
+// race mask a genuine write failure behind an unrelated element's PostOperationError (a post-write
+// hook failure, which must not trigger a rollback — see Resolver#withTransaction). Any real
+// failure anywhere in the batch still rolls back everything, exactly as before; a batch where the
+// only failures are PostOperationErrors commits (every write succeeded) and surfaces them to the
+// caller as one PostOperationError (aggregated if there's more than one).
+const settleMany = async (promises) => {
+  const settled = await Promise.allSettled(promises);
+  const real = settled.find(s => s.status === 'rejected' && !(s.reason instanceof PostOperationError));
+  if (real) throw real.reason;
+
+  const values = settled.filter(s => s.status === 'fulfilled').map(s => s.value);
+  const postFailures = settled.filter(s => s.status === 'rejected').map(s => s.reason.data);
+  if (postFailures.length === 1) throw new PostOperationError(postFailures[0], values);
+  if (postFailures.length > 1) throw new PostOperationError(new AggregateError(postFailures), values);
+  return values;
+};
 
 module.exports = class QueryResolver extends QueryBuilder {
   #model;
@@ -36,7 +56,7 @@ module.exports = class QueryResolver extends QueryBuilder {
       }
       case 'createMany': {
         return this.#resolver.withTransaction((txn) => {
-          return Promise.all(input.map(el => txn.match(this.#model.name).flags(flags).save(el)));
+          return settleMany(input.map(el => txn.match(this.#model.name).flags(flags).save(el)));
         });
       }
       case 'updateOne': {
@@ -47,7 +67,7 @@ module.exports = class QueryResolver extends QueryBuilder {
       case 'updateMany': {
         return this.#resolver.withTransaction((txn) => {
           return this.#find(query, txn).then((docs) => {
-            return Promise.all(docs.map(doc => txn.match(this.#model.name).flags(flags).id(doc.id).save(input)));
+            return settleMany(docs.map(doc => txn.match(this.#model.name).flags(flags).id(doc.id).save(input)));
           });
         });
       }
@@ -65,7 +85,7 @@ module.exports = class QueryResolver extends QueryBuilder {
         const [[key, values]] = Object.entries(input);
         return this.#resolver.withTransaction((txn) => {
           return this.#find(query, txn).then((docs) => {
-            return Promise.all(docs.map(doc => txn.match(this.#model.name).flags(flags).id(doc.id).push(key, values)));
+            return settleMany(docs.map(doc => txn.match(this.#model.name).flags(flags).id(doc.id).push(key, values)));
           });
         });
       }
@@ -84,7 +104,7 @@ module.exports = class QueryResolver extends QueryBuilder {
         const [[key, values]] = Object.entries(input);
         return this.#resolver.withTransaction((txn) => {
           return this.#find(query, txn).then((docs) => {
-            return Promise.all(docs.map(doc => txn.match(this.#model.name).flags(flags).id(doc.id).pull(key, values)));
+            return settleMany(docs.map(doc => txn.match(this.#model.name).flags(flags).id(doc.id).pull(key, values)));
           });
         });
       }
@@ -105,7 +125,7 @@ module.exports = class QueryResolver extends QueryBuilder {
         const [[key, values]] = Object.entries(input);
         return this.#resolver.withTransaction((txn) => {
           return this.#find(query, txn).then((docs) => {
-            return Promise.all(docs.map(doc => txn.match(this.#model.name).flags(flags).id(doc.id).splice(key, ...values)));
+            return settleMany(docs.map(doc => txn.match(this.#model.name).flags(flags).id(doc.id).splice(key, ...values)));
           });
         });
       }
@@ -117,7 +137,7 @@ module.exports = class QueryResolver extends QueryBuilder {
       case 'deleteMany': {
         return this.#resolver.withTransaction((txn) => {
           return this.#find(query, txn).then((docs) => {
-            return Promise.all(docs.map(doc => txn.match(this.#model.name).flags(flags).id(doc.id).delete()));
+            return settleMany(docs.map(doc => txn.match(this.#model.name).flags(flags).id(doc.id).delete()));
           });
         });
       }
@@ -149,19 +169,57 @@ module.exports = class QueryResolver extends QueryBuilder {
   // the transactional clone if wrapped, or `this.#resolver` unchanged if not — so callers never
   // need to know which case they're in.
   #resolveReferentialIntegrity(doc, andThen = () => doc) {
-    const run = txn => Util.promiseChain(this.#model.referentialIntegrity.map(({ model, field, isArray, path }) => () => {
-      const { onDelete, fkField } = field;
-      const id = doc[fkField];
-      const $path = path.join('.');
-      const where = field.isVirtual ? { [field.model.pkField]: get(doc, field.linkBy) } : { [$path]: id };
+    // Sequential, not Promise.allSettled+settleMany like the *Many fan-outs above — each step
+    // targets a different model/rule, order isn't independent the way batch elements are, so it
+    // stays a walk. But it still can't use a plain stop-at-first-rejection chain: a
+    // PostOperationError from an early step (its write already succeeded, only its post-write
+    // hook failed) must not abort the walk — doing so would leave LATER cascade steps never even
+    // attempted, yet still committed as if the cascade were complete (see
+    // Resolver#withTransaction's commit-on-PostOperationError). So: catch a PostOperationError per
+    // step, stash it, keep walking; a real failure still stops the walk immediately (rollback is
+    // correct there — no reason to keep going). Aggregated at the end, same as settleMany.
+    const run = async (txn) => {
+      const postFailures = [];
 
-      switch (onDelete) {
-        case 'cascade': return isArray ? txn.match(model).where(where).pull($path, id) : txn.match(model).where(where).remove();
-        case 'nullify': return isArray ? txn.match(model).where(where).splice($path, id, null) : txn.match(model).where(where).save({ [$path]: null });
-        case 'restrict': return txn.match(model).where(where).count().then(count => (count ? Promise.reject(new Error('Restricted')) : count));
-        default: throw new Error(`Unknown onDelete operator: '${onDelete}'`);
+      for (const { model, field, isArray, path } of this.#model.referentialIntegrity) {
+        const { onDelete, fkField } = field;
+        const id = doc[fkField];
+        const $path = path.join('.');
+        const where = field.isVirtual ? { [field.model.pkField]: get(doc, field.linkBy) } : { [$path]: id };
+
+        try {
+          // Sequential by necessity — each cascade step must see the effects of the ones before
+          // it, and the walk must fully finish (not bail on the first PostOperationError) before
+          // the caller can decide commit vs. rollback. See the comment on `run` above.
+          switch (onDelete) {
+            case 'cascade': await (isArray ? txn.match(model).where(where).pull($path, id) : txn.match(model).where(where).remove()); break; // eslint-disable-line no-await-in-loop
+            case 'nullify': await (isArray ? txn.match(model).where(where).splice($path, id, null) : txn.match(model).where(where).save({ [$path]: null })); break; // eslint-disable-line no-await-in-loop
+            case 'restrict': {
+              const count = await txn.match(model).where(where).count(); // eslint-disable-line no-await-in-loop
+              if (count) throw new Error('Restricted');
+              break;
+            }
+            default: throw new Error(`Unknown onDelete operator: '${onDelete}'`);
+          }
+        } catch (e) {
+          if (!(e instanceof PostOperationError)) throw e;
+          postFailures.push(e.data);
+        }
       }
-    })).then(() => andThen(txn));
+
+      let result;
+      try {
+        result = await andThen(txn);
+      } catch (e) {
+        if (!(e instanceof PostOperationError)) throw e;
+        postFailures.push(e.data);
+        result = e.result;
+      }
+
+      if (postFailures.length === 1) throw new PostOperationError(postFailures[0], result);
+      if (postFailures.length > 1) throw new PostOperationError(new AggregateError(postFailures), result);
+      return result;
+    };
 
     // Only pay for a transaction when there's an actual cascade to protect — a model with no
     // @field(onDelete:) rules deletes exactly one document, already atomic on its own.
