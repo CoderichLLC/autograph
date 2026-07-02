@@ -619,6 +619,13 @@ module.exports = class Resolver {
     // executed (a preMutation short-circuit writes nothing — there is no durable outcome to
     // announce). Granularity matches postMutation: per query — a *Many batch or RI cascade emits
     // one event per element/step, at the moment the whole unit's fate is sealed.
+    //
+    // REGISTRATION ONLY — nothing is emitted here. Both branches defer: addSettled fires at the
+    // scope's true settle; emitDurable is invoked at the END of the post* phase below. Firing
+    // order is therefore always postMutation -> preResponse -> postResponse -> postCommit, in
+    // both paths. Registration must happen HERE (at write success, before the post* phase) so
+    // that a participant (postMutation) failure that aborts the unit still emits postRollback
+    // for this write — it happened, then was undone; that's exactly what compensation hooks need.
     let emitDurable; // set when NO transaction scope carried this write (durable right now)
     if (type === 'Mutation' && resultEarly === undefined
       && (Emitter.hasListenersFor('postCommit', qModel, qKey) || Emitter.hasListenersFor('postRollback', qModel, qKey))) {
@@ -663,25 +670,30 @@ module.exports = class Resolver {
       throw err;
     }
 
-    // preResponse/postResponse are the PRESENTER phase — the data is correct and committed (or
-    // committing); only the presentation failed. Never rollback-worthy: always PostOperationError,
-    // so Resolver#withTransaction commits anyway and re-throws. Each stage runs only if the
-    // previous one didn't already short-circuit with an explicit return value (unchanged).
+    // RESPONSE layer (see TRANSACTIONS.md §4.16). Failures here are never rollback-worthy —
+    // the data is correct and committed (or committing); only the response work failed. Always
+    // PostOperationError, so Resolver#withTransaction commits anyway and re-throws.
+    //
+    // - preResponse is the PRESENTER — the last chance to SHAPE what the caller is told. Skipped
+    //   if postMutation already short-circuited with an explicit replacement result (unchanged).
+    // - postResponse is the RESPONSE OBSERVER — it ALWAYS fires, last, with the settled result,
+    //   regardless of upstream short-circuits (an observer that misses exactly the overridden
+    //   responses would be useless), and as a PURE observer its return value is deliberately
+    //   ignored — it cannot reshape what it is witnessing. It observes the response layer only
+    //   (what the caller was told); whether that became durably true is the durability layer's
+    //   observers (postCommit/postRollback). It does not fire on error paths — an errored
+    //   mutation sends no result out the door for it to observe.
     try {
       if (!shortCircuited) {
-        let early = await Emitter.emit('preResponse', event);
-        if (early !== undefined) {
-          query.result = early;
-        } else {
-          early = await Emitter.emit('postResponse', event);
-          if (early !== undefined) query.result = early;
-        }
+        const early = await Emitter.emit('preResponse', event);
+        if (early !== undefined) query.result = early;
       }
+      await Emitter.emit('postResponse', event);
       if (emitDurable) await emitDurable();
       return query.result;
     } catch (e) {
       const err = Boom.boomify(e instanceof PostOperationError ? e : new PostOperationError(e, query.result));
-      // A presenter failure is not a data failure — the write is still durable, so the
+      // A response-layer failure is not a data failure — the write is still durable, so the
       // durable-outcome event still fires (its listeners are isolated; this cannot mask `err`).
       if (emitDurable) await emitDurable();
       throw err;

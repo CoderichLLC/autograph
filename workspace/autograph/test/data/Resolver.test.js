@@ -492,6 +492,98 @@ describe('Resolver (transaction regressions)', () => {
     });
   });
 
+  describe('postResponse — unconditional, pure response observer', () => {
+    // postResponse observes the final, out-the-door result (the response layer). It ALWAYS fires,
+    // last, with the settled result — including when postMutation or preResponse overrode it via
+    // the return-value idiom (previously those short-circuits silenced it, so the observer missed
+    // exactly the responses that were reshaped). As a PURE observer its return value is ignored.
+    let observed;
+    let observer;
+
+    beforeEach(() => {
+      observed = [];
+      // postResponse fires for reads too — record mutations only, so this suite's own
+      // setup/cleanup reads don't pollute the assertions.
+      observer = (event) => { if (event.query.isMutation) observed.push(event.query.result); };
+      Emitter.onModels('postResponse', ['Color'], observer);
+    });
+
+    afterEach(() => {
+      Emitter.removeListener('postResponse', observer);
+    });
+
+    // Both override tests reshape only the RESPONSE — the underlying write still lands a real
+    // row, so cleanup diffs the whole collection before/after rather than trusting the result.
+    const collectIds = rows => new Set(rows.map(r => `${r.id}`));
+
+    test('fires even when postMutation short-circuits with a replacement result — and sees that replacement', async () => {
+      const before = await resolver.match('Color').where({}).many();
+      const override = { id: 'pm-override', type: 'blue' };
+      const hook = () => override;
+      Emitter.onModels('postMutation', ['Color'], hook);
+
+      const result = await resolver.match('Color').save({ type: 'blue' });
+      Emitter.removeListener('postMutation', hook);
+
+      expect(result).toBe(override);
+      expect(observed).toEqual([override]); // observer saw the FINAL (overridden) result
+
+      const beforeIds = collectIds(before);
+      const added = (await resolver.match('Color').where({}).many()).filter(r => !beforeIds.has(`${r.id}`));
+      await Promise.all(added.map(r => resolver.match('Color').id(r.id).delete()));
+    });
+
+    test('fires even when preResponse overrides the result — and sees preResponse\'s value', async () => {
+      const before = await resolver.match('Color').where({}).many();
+      const override = { id: 'pr-override', type: 'red' };
+      const hook = () => override;
+      Emitter.onModels('preResponse', ['Color'], hook);
+
+      const result = await resolver.match('Color').save({ type: 'red' });
+      Emitter.removeListener('preResponse', hook);
+
+      expect(result).toBe(override);
+      expect(observed).toEqual([override]);
+
+      const beforeIds = collectIds(before);
+      const added = (await resolver.match('Color').where({}).many()).filter(r => !beforeIds.has(`${r.id}`));
+      await Promise.all(added.map(r => resolver.match('Color').id(r.id).delete()));
+    });
+
+    test('its return value is ignored — a pure observer cannot reshape the response', async () => {
+      const hijacker = event => ({ id: 'hijacked', type: 'green' }); // returned value must NOT become the result
+      Emitter.onModels('postResponse', ['Color'], hijacker);
+
+      const result = await resolver.match('Color').save({ type: 'green' });
+      Emitter.removeListener('postResponse', hijacker);
+
+      expect(result.id).toBeDefined();
+      expect(result.id).not.toBe('hijacked');
+      expect(result.type).toBe('green');
+
+      await resolver.match('Color').id(result.id).delete();
+    });
+
+    test('a postResponse throw is a response-layer failure — PostOperationError, the write stays', async () => {
+      const thrower = (event, next) => { throw new Error('observer exploded'); };
+      Emitter.onModels('postResponse', ['Color'], thrower);
+
+      let caughtError;
+      try {
+        await resolver.match('Color').save({ type: 'purple' });
+      } catch (e) {
+        caughtError = e;
+      }
+      Emitter.removeListener('postResponse', thrower);
+
+      expect(caughtError).toBeInstanceOf(PostOperationError);
+      expect(caughtError.result).toBeDefined();
+      expect(await resolver.match('Color').id(caughtError.result.id).one()).not.toBeNull();
+
+      await resolver.match('Color').id(caughtError.result.id).delete();
+    });
+  });
+
   describe('role-graded post-phase failures — participants abort, presenters surface, bare writes stay', () => {
     // The post* phase is role-graded (TRANSACTIONS.md §4.15):
     // - postMutation = PARTICIPANT: part of the unit of work (audit rows, counters, invariant

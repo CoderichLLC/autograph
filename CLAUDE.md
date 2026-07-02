@@ -136,14 +136,22 @@ shape the response, listener failures are isolated (never rejecting `commit()` o
 and under `autoTransaction` a `postCommit` write through `event.resolver` throws (its scope has
 settled) — start a fresh unit with `event.resolver.transaction()` instead.
 
-**Failure semantics are role-graded** (see TRANSACTIONS.md §4.15). `preMutation`/`validate`
-failures abort the write (`PreOperationError`). A `postMutation` failure — the *participant*
-phase — **aborts the whole transaction** when one carries the write (a plain `throw` is the abort
-signal, same as every DB trigger/ORM convention; opt into tolerance with your own `try/catch`);
-when nothing carries the write it is already durable, and the failure surfaces as
-`PostOperationError` with `.result`. `preResponse`/`postResponse` failures — the *presenter*
-phase — are always `PostOperationError` (data committed, presentation failed; never
-rollback-worthy). `postCommit`/`postRollback` failures are isolated and cannot affect anything.
+**The events sort into three layers** (see TRANSACTIONS.md §4.15/§4.16). *DB layer*:
+`preMutation`/`validate` shape what lands in the database; `postMutation` participates in the
+unit of work. *Response layer*: `preResponse` shapes what the caller is told (last chance to
+reshape the outgoing result; skipped if `postMutation` short-circuited); `postResponse` observes
+it — it fires **unconditionally**, last, with the settled result, and is a **pure observer**: its
+return value is ignored (treat `event.query.result` as read-only there; it does not fire on error
+paths). *Durability layer*: `postCommit`/`postRollback` observe what became durably true.
+
+**Failure semantics are role-graded.** `preMutation`/`validate` failures abort the write
+(`PreOperationError`). A `postMutation` failure — a *participant* failure — **aborts the whole
+transaction** when one carries the write (a plain `throw` is the abort signal, same as every DB
+trigger/ORM convention; opt into tolerance with your own `try/catch`); when nothing carries the
+write it is already durable, and the failure surfaces as `PostOperationError` with `.result`.
+`preResponse`/`postResponse` failures — response-layer failures — are always `PostOperationError`
+(data committed, only response work failed; never rollback-worthy). `postCommit`/`postRollback`
+failures are isolated and cannot affect anything.
 Note: async **basic** (arity < 2) listeners are fire-and-forget on every event — their rejections
 are deterministically swallowed (never an unhandled rejection); use the next-style (arity ≥ 2)
 form when a hook's async failure must mean something.

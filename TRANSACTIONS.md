@@ -803,6 +803,42 @@ the batch was correct all along.
 remains in `postMutation` will abort the transaction if it throws — which is exactly why it's
 still there.
 
+### 4.16 The three layers — and `postResponse` as the unconditional, pure response observer
+
+The full event surface sorts into three layers, each with its own shape/observe pair and its own
+failure semantics. Naming the layers dissolves the last "least surprise" question ("why do the
+`*Response` events fire before commit?") — they fire before commit because they belong to the
+**response** layer, and the response is assembled before the unit settles; durability has its own
+observers now:
+
+```
+DB layer:         preMutation → validate → [write] → postMutation        shape/participate — abort semantics
+response layer:   preResponse (shape) → postResponse (observe, ALWAYS)   PostOperationError semantics
+durability layer: ⋯ commit | rollback ⋯ → postCommit | postRollback      observe — isolated
+```
+
+- `preMutation`/`validate` shape **what lands in the database**; `postMutation` participates in
+  that unit of work (§4.15).
+- `preResponse` shapes **what the caller is told** — the last chance to reshape the outgoing
+  result. Skipped if `postMutation` already short-circuited with an explicit replacement
+  (unchanged).
+- `postResponse` **observes** what the caller was told. Two changes make it honest about that
+  role: it now fires **unconditionally**, last, with the settled result — previously an upstream
+  return-value short-circuit (from `postMutation` or `preResponse`) silenced it, so the observer
+  missed exactly the responses that were reshaped — and it is a **pure observer**: its return
+  value is deliberately ignored (an observer must not be able to reshape what it witnesses; treat
+  `event.query.result` as read-only there). It does not fire on error paths — an errored mutation
+  sends no result out the door to observe. Its failure is still a response-layer failure
+  (`PostOperationError` — awaited and visible, but never rollback-worthy).
+- `postCommit`/`postRollback` observe **what became durably true** (§4.14). Under
+  `autoTransaction` the two observation layers genuinely diverge: a `postResponse`-observed
+  success can still be rolled back by the host afterward — which is now expressible
+  (`postRollback`) instead of surprising.
+
+Boundary note: AG's `postResponse` is *per-query* out-the-door. The strictest "final HTTP payload,
+errors included" lives one level above AG — e.g. Apollo's `willSendResponse` — and can't be an AG
+event without AG knowing about transports.
+
 Walking the actual lifecycle end to end, in order:
 
 1. **`new Resolver({ schema, context, autoTransaction })`** — if `autoTransaction: true`, constructs
