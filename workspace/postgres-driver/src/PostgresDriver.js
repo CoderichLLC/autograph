@@ -11,11 +11,6 @@ const ISO_DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
 module.exports = class PostgresDriver {
   #pool;
   #config;
-  // Software-level transaction isolation (needed because pg-mem writes are always immediately visible).
-  // Each active transaction gets a context that tracks IDs it created.
-  // Reads without a session filter out ALL pending IDs; reads within a session obey snapshot semantics.
-  #allPendingIds = new Set();
-  #txnContexts = new Map();
 
   constructor({ pool, uri, ...config } = {}) {
     this.#config = config;
@@ -108,7 +103,6 @@ module.exports = class PostgresDriver {
     if (plan.arrayJoins?.length) rows = await this.#applyArrayJoins(rows, plan.arrayJoins, plan.session);
     rows = PostgresDriver.applyJsFilters(rows, plan.jsFilters);
     if (plan.deduplicateByPk) rows = PostgresDriver.deduplicateByPk(rows);
-    rows = this.#filterPending(rows, plan.session);
     return rows[0] ?? null;
   }
 
@@ -117,7 +111,7 @@ module.exports = class PostgresDriver {
     if (plan.arrayJoins?.length) rows = await this.#applyArrayJoins(rows, plan.arrayJoins, plan.session);
     rows = PostgresDriver.applyJsFilters(rows, plan.jsFilters);
     if (plan.deduplicateByPk) rows = PostgresDriver.deduplicateByPk(rows);
-    return this.#filterPending(rows, plan.session);
+    return rows;
   }
 
   async count(plan) {
@@ -176,20 +170,7 @@ module.exports = class PostgresDriver {
   }
 
   createOne(plan) {
-    return this.#run(plan.sql, plan.session).then((rows) => {
-      const row = rows[0];
-      if (row && plan.session) {
-        const ctx = this.#txnContexts.get(plan.session);
-        if (ctx) {
-          const id = row._id;
-          ctx.ownPending.add(id);
-          this.#allPendingIds.add(id);
-          if (!ctx.ownPendingByModel.has(plan.model)) ctx.ownPendingByModel.set(plan.model, new Set());
-          ctx.ownPendingByModel.get(plan.model).add(id);
-        }
-      }
-      return row;
-    });
+    return this.#run(plan.sql, plan.session).then(rows => rows[0]);
   }
 
   async updateOne(plan) {
@@ -264,88 +245,31 @@ module.exports = class PostgresDriver {
   transaction(parentHandle) {
     if (parentHandle) return Promise.resolve(parentHandle);
 
-    return new Promise((resolve, reject) => {
-      this.#pool.connect().then((client) => {
-        client.query('BEGIN').then(() => {
-          let closed = false;
+    // A Postgres transaction IS a dedicated connection running BEGIN..COMMIT/ROLLBACK — the
+    // opaque session token AG threads back (query.options.session) is simply "which executor to
+    // call .query() on" (see #run). REPEATABLE READ gives true snapshot isolation natively:
+    // reads see a stable snapshot from transaction start, other transactions' uncommitted (and
+    // post-snapshot committed) writes are invisible, and concurrent-write conflicts surface as
+    // 'could not serialize access' — which execute()'s retry exists for.
+    return this.#pool.connect().then((client) => {
+      const level = this.#config.transaction?.isolationLevel ?? 'REPEATABLE READ';
+      return client.query(`BEGIN ISOLATION LEVEL ${level}`).then(() => {
+        let closed = false;
+        const session = { query: (...args) => client.query(...args) };
 
-          // Snapshot of IDs pending in OTHER active transactions when this transaction starts.
-          const exclusions = new Set(this.#allPendingIds);
-          const ownPending = new Set();
-          const ownPendingByModel = new Map();
+        // Because we allow queries in parallel we want to prevent calling this more than once.
+        const close = (cmd) => {
+          if (closed) return Promise.resolve();
+          closed = true;
+          return client.query(cmd).finally(() => client.release());
+        };
 
-          // Unique wrapper — used as the Map key for this transaction's context.
-          // Delegates actual SQL to the underlying client.
-          const sessionWrapper = { query: (...args) => client.query(...args) };
-          // postSnapshotIds: IDs committed by OTHER transactions AFTER this snapshot was taken.
-          // These must be hidden from this transaction (snapshot isolation semantics).
-          const postSnapshotIds = new Set();
-          this.#txnContexts.set(sessionWrapper, { ownPending, exclusions, ownPendingByModel, postSnapshotIds });
-
-          const close = async (cmd) => {
-            if (closed) return undefined;
-            closed = true;
-
-            if (cmd === 'ROLLBACK') {
-              // pg-mem doesn't support real rollback — manually delete rows this txn inserted.
-              for (const [model, ids] of ownPendingByModel) {
-                if (ids.size > 0) {
-                  const placeholders = [...ids].map((_, i) => `$${i + 1}`).join(', ');
-                  await this.#pool.query(`DELETE FROM "${model}" WHERE "_id" IN (${placeholders})`, [...ids]); // eslint-disable-line no-await-in-loop
-                }
-              }
-            }
-
-            // On COMMIT: propagate this txn's created IDs to all still-active transactions'
-            // postSnapshotIds so they remain hidden (snapshot isolation — they pre-date this commit).
-            if (cmd === 'COMMIT') {
-              for (const [, otherCtx] of this.#txnContexts) {
-                for (const id of ownPending) otherCtx.postSnapshotIds.add(id);
-              }
-            }
-
-            // Remove this txn's IDs from the global pending set.
-            for (const id of ownPending) this.#allPendingIds.delete(id);
-            this.#txnContexts.delete(sessionWrapper);
-
-            return client.query(cmd).finally(() => client.release());
-          };
-
-          resolve(Object.defineProperties({}, {
-            session: { value: sessionWrapper, enumerable: true },
-            commit: { value: () => close('COMMIT') },
-            rollback: { value: () => close('ROLLBACK') },
-          }));
-        }).catch(reject);
-      }).catch(reject);
-    });
-  }
-
-  // Filter rows based on software transaction isolation semantics.
-  // Without a session: exclude all IDs pending in active transactions.
-  // Within a session: include own pending; exclude IDs that were pending in other txns at start (snapshot).
-  #filterPending(rows, session) {
-    const ctx = session ? this.#txnContexts.get(session) : null;
-    // The global early-exit below is only valid when THIS session has no exclusions of its own to
-    // enforce. A session's `exclusions` snapshot (ids pending in other sessions when it began) and
-    // `postSnapshotIds` (ids committed by others since) must keep hiding those ids for its entire
-    // lifetime — even after the global pending set empties out because the excluded write
-    // elsewhere has since committed. Without this, a transaction that reads only (see
-    // TestSuite.js "multi txn (isolated snapshots)") would lose its own snapshot the moment
-    // whatever it's supposed to keep hiding finishes committing.
-    const hasOwnExclusions = ctx && (ctx.exclusions.size > 0 || ctx.postSnapshotIds.size > 0);
-    if (this.#allPendingIds.size === 0 && !hasOwnExclusions) return rows;
-    return rows.filter((row) => {
-      const { _id: id } = row;
-      if (!id) return true;
-      if (!ctx) return !this.#allPendingIds.has(id);
-      if (ctx.ownPending.has(id)) return true;
-      if (ctx.exclusions.has(id)) return false;
-      if (ctx.postSnapshotIds?.has(id)) return false;
-      for (const [otherSess, otherCtx] of this.#txnContexts) {
-        if (otherSess !== session && otherCtx.ownPending.has(id)) return false;
-      }
-      return true;
+        return Object.defineProperties({}, {
+          session: { value: session, enumerable: true },
+          commit: { value: () => close('COMMIT') },
+          rollback: { value: () => close('ROLLBACK') },
+        });
+      });
     });
   }
 
@@ -755,7 +679,7 @@ module.exports = class PostgresDriver {
   // $schema / model: field metadata for JSONB array detection.
   // mainTable: qualifies unqualified columns to avoid ambiguity when JOINs are present.
   static buildWhereCallback(where, joinedTables = new Set(), $schema = null, model = null, mainTable = null) {
-    return function () {
+    return function buildWhereCallback() {
       Object.entries(where || {}).forEach(([col, value]) => {
         let colExpr;
         let jsonbContainerExpr = null; // JSONB extract (->) for @> containment (not ->>'s text)

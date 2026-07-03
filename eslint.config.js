@@ -10,6 +10,7 @@ module.exports = getEslintConfig({
       '@coderich/autograph-db-tests',
       '@coderich/autograph-mongodb',
       'mongodb-memory-server',
+      'pg-mem',
     ],
   },
 });

@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## v0.15.x (BREAKING)
+  - PageInfo and cursor no longer required schema (only defined when cursorPaginating...)
+  - Revamped Pipeline { schema, context, resolver, query, model, field, value, path, startValue }
+    - Pipeline "toId" is completely removed (use custom "toObjectId" Pipeline etc)
+    - Removed Pipelines [transform, destruct]
+      - transform -> normalize
+  - Revamped Emitter { schema, context, resolver, query }
+    - query IS the single source of truth
+    - "Basic" functions are hoisted to the top for execution; RETURNING a value will bypass thunk()
+    - "Next" functions are run next, next() must ALWAYS be called; passing a value to next() will bypass thunk()
+    - Event shape refactored:
+      - event.query.input  (replaces event.merged and old event.input)
+      - event.query.result (replaces event.result shortcut)
+  - Emitter.on('setup') is passed the "parsedSchema" object
+  - No more gqlScope, dalScope, fieldScope (use crud + scope)
+  - resolver.resolve() now takes 1 argument (info) and requires you to use .args() etc if need be
+  - $magic methods now have signature doc.$.<method> and are more powerful and chainable
+  - Resolver now sets itself at context.autograph (configurable)
+  - createNamedQuery is replaced by Resolver.$loader
+    - cb function now has signature (args, context)
+    - cache is on by default and persists indefinitely (must be managed)
+  - MongoClient now seperate NPM module @coderich/autograph-mongodb
+
 ## v0.11.x
 - Node 18.12.1
 - Engine >=16.20.0

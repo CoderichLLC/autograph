@@ -1,6 +1,6 @@
-// eslint-disable-next-line import/no-extraneous-dependencies -- dev-only test helper (in-memory pg)
 const { newDb } = require('pg-mem');
 const { setup, createObjectIdShim } = require('@coderich/autograph-db-tests');
+const { wrapPool } = require('./test/PgMemShim');
 const PostgresDriver = require('./src/PostgresDriver');
 
 // Map autograph field metadata to a Postgres column type.
@@ -35,7 +35,9 @@ function buildDDL(models) {
 exports.setup = async () => {
   const pgMem = newDb();
   const { Pool } = pgMem.adapters.createPg();
-  const pool = new Pool();
+  // The production driver is written against REAL Postgres semantics (native isolation and
+  // rollback); pg-mem has neither, so the test pool is wrapped in an emulation shim.
+  const pool = wrapPool(new Pool());
 
   // ObjectId shim: IDs are plain strings; Symbol.hasInstance override makes
   // `expect.any(ObjectId)` pass for non-empty strings. See testsuite/index.js.

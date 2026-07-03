@@ -44,33 +44,6 @@ Improvement Considerations:
   * Support for GUID (node interface)
     - autograph.legacyMode (move to config)
 
-BREAKING CHANGELOG:
-  * PageInfo and cursor no longer required schema (only defined when cursorPaginating...)
-  * Revamped how transactions work
-  * Revamped how initial setup works (config.js)
-    - makeExecutableSchema
-  * Revamped Pipeline { schema, context, resolver, query, model, field, value, path, startValue }
-    - Pipeline "toId" is completely removed (use custom "toObjectId" Pipeline etc)
-    - Removed Pipelines [transform, destruct]
-      - transform -> normalize
-    - deserialize pipeline still supported but runs on read path via compiled docTransform
-      (NOT via the Transformer class; zero overhead when empty)
-  * Revamped Emitter { schema, context, resolver, query }
-    - query IS the single source of truth
-    - "Basic" functions are hoisted to the top for execution; RETURNING a value will bypass thunk()
-    - "Next" functions are run next, next() must ALWAYS be called; passing a value to next() will bypass thunk()
-    - Event shape refactored:
-      * event.query.input  (replaces event.merged and old event.input)
-      * event.query.result (replaces event.result shortcut)
-  * Emitter.on('setup') is passed the "parsedSchema" object
-  * No more gqlScope, dalScope, fieldScope (use crud + scope)
-  * resolver.resolve() now takes 1 argument (info) and requires you to use .args() etc if need be
-  * $Magic methods now have signature doc.$.<method> and are more powerful and chainable
-  * Resolver now sets itself at context.autograph (configurable)
-  * createNamedQuery is replaced by Resolver.$loader
-    - cb function now has signature (args, context)
-    - cache is on by default and persists indefinitely (must be managed)
-  * MongoClient now seperate NPM module @coderich/autograph-mongodb
 
 ---------
 

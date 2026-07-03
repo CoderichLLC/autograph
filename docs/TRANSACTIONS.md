@@ -6,8 +6,8 @@ was ported — `Transaction.js`/`QueryResolverTransaction.js` from `0.15` were d
 (confirmed orphaned, nothing else referenced them). Primary/reference driver: **MongoDB**; a real
 `PostgresDriver` (against `pg-mem` in tests) validated the design against a second driver mid-way
 through. Verified against the full `autograph` suite (206/206), `mongo-driver`'s integration suite
-(93/94 — 1 unrelated pre-existing skip), and `postgres-driver`'s (92/94 — 1 known `pg-mem`
-limitation, §4.10).
+(93/94 — 1 unrelated pre-existing skip), and `postgres-driver`'s (93/94 — 1 unrelated
+pre-existing skip; the emulation history is §4.10).
 
 **The mechanism went through a real architectural revision after initial implementation.** The
 first version propagated the ambient transaction via `AsyncLocalStorage` (§4.2 originally). A
@@ -513,12 +513,18 @@ test actually failed against the old code before restoring it.
    set. Fixed by also checking the specific session's own exclusion state before taking the
    early-exit path. Driver-specific, not a core autograph bug — a real Postgres server has no need
    for any of this emulation, since it has genuine MVCC snapshot isolation natively.
-10. One remaining, accepted `pg-mem`-only limitation (not fixed, not a core bug): `PostgresDriver`'s
-    software rollback only reverts newly-inserted rows (`ownPendingByModel`, deleted on rollback) —
-    it has no mechanism to revert an in-place UPDATE, since `pg-mem` provides no real `ROLLBACK`.
-    "delete rolls back cascades when a restrict throws mid-walk" fails against `postgres-driver`
-    specifically because its cascade step is a pull/update, not an insert. Real Postgres would
-    handle this correctly via native `ROLLBACK`.
+   **Since relocated entirely out of the driver**: `PostgresDriver` is now written purely against
+   real Postgres semantics (`BEGIN ISOLATION LEVEL REPEATABLE READ`, native rollback) and contains
+   zero `pg-mem` workarounds; the whole emulation (including this fix) lives in the test harness's
+   pool-level monkey-patch (`postgres-driver/test/PgMemShim.js`).
+10. A long-standing `pg-mem`-only limitation — software rollback only reverted newly-inserted
+    rows, so "delete rolls back cascades when a restrict throws mid-walk" (whose cascade step is
+    a pull/UPDATE) failed under the pg-mem-backed test run — was RESOLVED when the emulation
+    moved into the test shim: `PgMemShim.js` now captures PRE-IMAGES of every row an
+    in-transaction UPDATE/DELETE touches (first-capture-wins = transaction-start state) and
+    restores them on ROLLBACK. `postgres-driver` now passes 93/94 (1 unrelated pre-existing
+    skip), matching `mongo-driver`. Real Postgres never needed any of this — native `ROLLBACK`
+    covers it — which is exactly why the emulation lives in the harness, not the driver.
 
 ### 4.11 Operation mode — `enableAutoTransaction()` for a decision made *after* construction
 
