@@ -1,6 +1,7 @@
 const Util = require('@coderich/util');
 const { Kind, visit } = require('graphql');
 const { isLeafValue } = require('../service/AppService');
+const Vocabulary = require('../query/Vocabulary');
 const Transformer = require('../data/Transformer');
 const Pipeline = require('../data/Pipeline');
 const { $RAW } = require('../service/Symbols');
@@ -271,13 +272,13 @@ function parseSchema(config, typeDefs) {
               // Invoke callback function; allowing result to be modified in order to change key/value
               let run = opts.run.concat($field[opts.key]);
               const path = opts.path.concat($field[opts.key]);
-              const isLeaf = isLeafValue(value);
+              const isLeaf = isLeafValue(value) || Vocabulary.isOperatorObject(value);
               const $node = fn({ model: $model, field: $field, key, value, path, run, isLeaf });
               if (!$node) return prev;
 
               // Recursive walk
               if (!$field.model?.isEmbedded) run = [];
-              const $value = opts.itemize && $field.model && Util.isPlainObjectOrArray($node.value) ? Util.map($node.value, el => $field.model.walk(el, fn, { ...opts, path, run })) : $node.value;
+              const $value = opts.itemize && $field.model && Util.isPlainObjectOrArray($node.value) && !Vocabulary.isOperatorObject($node.value) ? Util.map($node.value, el => $field.model.walk(el, fn, { ...opts, path, run })) : $node.value;
               return Object.assign(prev, { [$node.key]: $value });
             }, {});
           };
@@ -354,18 +355,26 @@ function parseSchema(config, typeDefs) {
             shape: Object.values($model.fields).reduce((prev, curr) => {
               const args = { model: $model, field: curr };
 
+              // Vocabulary-aware rule wrapper: an operator object in value position applies the
+              // rule to its OPERANDS per coercion class ($in element-wise, $exists untouched) —
+              // `{ $ne: 'RICH' }` normalizes/serializes exactly as an equality value would.
+              const operatorAware = rule => (a) => {
+                if (!Vocabulary.isOperatorObject(a.value)) return rule(a);
+                return Vocabulary.mapValues(a.value, value => rule({ ...a, value }));
+              };
+
               const rules = [
                 a => Pipeline.$cast({ ...a, ...args, path: a.path.concat(curr.name) }),
                 a => Pipeline.$instruct({ ...a, ...args, path: a.path.concat(curr.name) }),
                 a => Pipeline.$serialize({ ...a, ...args, path: a.path.concat(curr.name) }),
-              ];
+              ].map(operatorAware);
 
               if (curr.isEmbedded) {
-                rules.push(a => Util.map(a.value, (value, i) => {
+                rules.push(operatorAware(a => Util.map(a.value, (value, i) => {
                   const path = a.path.concat(curr.name);
                   if (curr.isArray) path.push(i);
                   return curr.model.transformers.where.transform(value, { ...args, query: a.query, context: a.context, path });
-                }));
+                })));
               }
 
               return Object.assign(prev, { [curr.name]: rules });

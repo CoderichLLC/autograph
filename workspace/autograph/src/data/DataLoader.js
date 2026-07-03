@@ -3,6 +3,7 @@ const Util = require('@coderich/util');
 const DataLoader = require('dataloader');
 const { inspect } = require('../service/AppService');
 const TransactionScope = require('./TransactionScope');
+const Vocabulary = require('../query/Vocabulary');
 
 module.exports = class Loader {
   #model;
@@ -136,6 +137,10 @@ module.exports = class Loader {
       const keys = Object.keys(where);
       if (keys.length === 0) return; // nothing to vary on
       keys.forEach((key) => {
+        // Only EQUALITY-shaped values (scalar / array / regex) may be the fanout key: widening
+        // is `[batchKey]: { $in: [...] }`, and folding operator objects into an $in list would
+        // corrupt semantics — { $gt: 5 } and { $gt: 9 } must never merge into $in: [{...},{...}].
+        if (key.startsWith('$') || Vocabulary.isOperatorObject(where[key])) return;
         const others = {};
         keys.forEach((k) => { if (k !== key) others[k] = where[k]; });
         const sig = `${key}|${JSON.stringify(Loader.#canonicalize(others))}`;

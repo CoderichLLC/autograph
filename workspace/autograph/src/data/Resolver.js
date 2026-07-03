@@ -193,11 +193,6 @@ module.exports = class Resolver {
     return detached;
   }
 
-  driver(model) {
-    model = this.toModel(model);
-    return model?.source?.client?.driver(model.key);
-  }
-
   graphql(args) {
     args.schema ??= this.#xschema;
     args.contextValue ??= this.#context;

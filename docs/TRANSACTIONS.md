@@ -758,10 +758,10 @@ needed, now surfaced as ordinary Emitter events:
   failures are isolated (`allSettled` in `TransactionScope#settle`; an isolated catch on the
   non-transactional path) and can never reject `commit()` or a mutation that already succeeded. A
   `postCommit` failure can only be logged by the listener itself.
-- **Writes from inside these hooks are new units of work.** A basic (arity < 2) listener receives
-  a DETACHED resolver (§4.18), so `event.resolver.match(...).save(...)` simply works — a fresh,
-  fate-independent write, which is exactly what a durability observer's follow-up write is. A
-  next-style (arity >= 2) listener still holds the ambient resolver, whose scope has settled by the
+- **Writes from inside these hooks are new units of work.** An OBSERVER (`Emitter.observe*`)
+  receives a DETACHED resolver (§4.18), so `event.resolver.match(...).save(...)` simply works — a
+  fresh, fate-independent write, which is exactly what a durability observer's follow-up write is.
+  A PARTICIPANT (`Emitter.on*`) still holds the ambient resolver, whose scope has settled by the
   time `postCommit` fires — its writes reject with the settled-scope error; use
   `event.resolver.transaction()` (a settled scope is not offered as a parent — §4.13 #7) for an
   explicit fresh unit.
@@ -1051,7 +1051,7 @@ host's scope ambiently and the host calls `commit()`/`rollback()` (§4.7).
 - **Context restore vs. stray async work.** The wrapper restores `context[namespace].resolver`
   when the field (or hoist) settles, so un-awaited async work spawned inside a field that
   RE-READS the context resolver later sees whatever is then current. Fire-and-forget work should
-  capture `event.resolver` (arity < 2 listeners get the detached twin for exactly this reason —
+  capture `event.resolver` (observers get the detached twin for exactly this reason —
   §4.18), not re-read the context.
 - **Hosts that assemble their own executable schema** (bypassing `Schema#toObject()`'s wrap)
   get no per-field or `@transaction` scoping — they keep the §4.7/§4.11 host-managed contract
@@ -1067,9 +1067,16 @@ host's scope ambiently and the host calls `commit()`/`rollback()` (§4.7).
   fields when no participant hook is listening (`Emitter.hasListenersFor`), always carry
   user-defined fields whose bodies AG can't see — is deferred until measured need.
 
-### 4.18 Detached resolvers — arity < 2 listeners are never transaction participants
+### 4.18 Detached resolvers — OBSERVERS are never transaction participants
 
-**The unit of work is exactly what the mutation awaits.** A basic-style (arity < 2) Emitter
+> **Vocabulary update**: listener role is now DECLARED at registration (`Emitter.on*` =
+> participant, `Emitter.observe*` = observer), never inferred from a function's arity —
+> parameter count is a call-convention detail, not a semantic contract (`(event, next)` remains
+> honored as the legacy done-callback form). The reasoning below predates that change and uses
+> the old arity vocabulary; "arity < 2 / basic" reads as OBSERVER, "arity ≥ 2 / next-style" as
+> PARTICIPANT.
+
+**The unit of work is exactly what the mutation awaits.** A fire-and-forget observer
 listener is structurally incapable of being awaited — `emit()` collects its promise and
 deterministically swallows its rejection (§4.13). Handing such a listener the ambient *sessioned*
 resolver was a category error: participant-grade access granted to something that can never meet
@@ -1085,8 +1092,8 @@ taxonomy with no leftover ambiguity:
 
 | Listener shape | Resolver received | Writes | Failure |
 |---|---|---|---|
-| arity ≥ 2 (participant) | ambient | share the mutation's fate | aborts the carried unit (§4.15) |
-| arity < 2 (detached observer) | detached twin | immediate, fate-independent | swallowed (§4.13) |
+| `on*` (participant) | ambient | share the mutation's fate | aborts the carried unit (§4.15) |
+| `observe*` (detached observer) | detached twin | immediate, fate-independent | swallowed (§4.13) |
 | `postCommit`/`postRollback` (durability observer) | per shape above | new units of work | isolated (§4.14) |
 
 Every hook author's question — "does my write share fate / survive rollback / wait for commit?" —

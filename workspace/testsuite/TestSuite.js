@@ -398,9 +398,8 @@ module.exports = () => describe('TestSuite', () => {
   });
 
   describe('Search (or)', () => {
-    test.skip('or', async () => {
-      const results = await resolver.match('Person').flags({ debug: true }).where([{ name: 'rich*' }]).many();
-      console.log(results);
+    test('or', async () => {
+      expect(await resolver.match('Person').where([{ name: 'rich*' }]).count()).toBe(1);
     });
   });
 
@@ -787,6 +786,87 @@ module.exports = () => describe('TestSuite', () => {
     });
   });
 
+  describe('Where Vocabulary (conformance)', () => {
+    // One test per tier-1 operator, run against EVERY driver — this section IS the enforcement
+    // of the contract vocabulary (autograph/src/query/Vocabulary.js): AG's own IR for query
+    // intent, borrowed from MongoDB's wire syntax. MongoDriver is the reference implementation
+    // (passthrough); every other driver translates to its own idiom and must land on identical
+    // semantics, including the portable definitions ($exists = "a non-null value is present";
+    // $ne/$nin also match missing/null values).
+    let vocabAuthor;
+
+    beforeAll(async () => {
+      vocabAuthor = await resolver.match('Person').save({ name: 'vocabperson', emailAddress: 'vocabperson@gmail.com' });
+      await Promise.all([
+        resolver.match('Book').save({ name: 'VocabBook1', price: 10, author: vocabAuthor.id }),
+        resolver.match('Book').save({ name: 'VocabBook2', price: 20, author: vocabAuthor.id }),
+        resolver.match('Book').save({ name: 'VocabBook3', price: 30, author: vocabAuthor.id }),
+      ]);
+    });
+
+    afterAll(async () => {
+      const books = await resolver.match('Book').where({ name: 'VocabBook*' }).many();
+      await Promise.all(books.map(b => resolver.match('Book').id(b.id).delete()));
+      await resolver.match('Person').id(vocabAuthor.id).delete();
+    });
+
+    const books = where => resolver.match('Book').where({ name: 'VocabBook*', ...where }).many();
+    const prices = rows => rows.map(r => r.price).sort((a, b) => a - b);
+
+    test('comparisons: $gt / $gte / $lt / $lte (and range composition)', async () => {
+      expect(prices(await books({ price: { $gt: 10 } }))).toEqual([20, 30]);
+      expect(prices(await books({ price: { $gte: 20 } }))).toEqual([20, 30]);
+      expect(prices(await books({ price: { $lt: 20 } }))).toEqual([10]);
+      expect(prices(await books({ price: { $lte: 20 } }))).toEqual([10, 20]);
+      expect(prices(await books({ price: { $gt: 10, $lt: 30 } }))).toEqual([20]);
+    });
+
+    test('$in / $nin / $ne / $eq', async () => {
+      expect(prices(await books({ price: { $in: [10, 30] } }))).toEqual([10, 30]);
+      expect(prices(await books({ name: { $in: ['VocabBook1*', 'VocabBook3*'] } }))).toEqual([10, 30]); // globs convert INSIDE list operands
+      expect(prices(await books({ price: { $nin: [10, 30] } }))).toEqual([20]);
+      expect(prices(await books({ price: { $ne: 10 } }))).toEqual([20, 30]);
+      expect(prices(await books({ price: { $eq: 20 } }))).toEqual([20]);
+    });
+
+    test('$exists: a non-null value is present (portable semantics) — on a key-mapped field', async () => {
+      // vocabAuthor has no age; give a second person one. Person.age maps to the column
+      // 'my_age', so this also proves key-walking composes with operator objects.
+      const aged = await resolver.match('Person').save({ name: 'vocabaged', emailAddress: 'vocabaged@gmail.com', age: 40 });
+      try {
+        const has = await resolver.match('Person').where({ emailAddress: 'vocab*@gmail.com', age: { $exists: true } }).many();
+        const hasNot = await resolver.match('Person').where({ emailAddress: 'vocab*@gmail.com', age: { $exists: false } }).many();
+        expect(has.map(p => p.name)).toEqual(['vocabaged']);
+        expect(hasNot.map(p => p.name)).toEqual(['vocabperson']);
+        expect((await resolver.match('Person').where({ emailAddress: 'vocab*@gmail.com', age: { $gte: 40 } }).many()).map(p => p.name)).toEqual(['vocabaged']);
+      } finally {
+        await resolver.match('Person').id(aged.id).delete();
+      }
+    });
+
+    test('$or / $and compose branches, coexist with field keys, and nest', async () => {
+      expect(prices(await books({ $or: [{ price: { $lt: 15 } }, { price: { $gte: 30 } }] }))).toEqual([10, 30]);
+      expect(prices(await books({ price: { $exists: true }, $or: [{ price: 10 }, { price: 30 }] }))).toEqual([10, 30]); // implicit AND
+      expect(prices(await books({ $and: [{ price: { $gt: 5 } }, { $or: [{ price: 10 }, { price: { $gte: 30 } }] }] }))).toEqual([10, 30]);
+    });
+
+    test('$not negates field-level predicates and matches missing values', async () => {
+      expect(prices(await books({ price: { $not: { $gt: 15 } } }))).toEqual([10]);
+      // Missing-value semantics: vocabperson has no age — $not must match it.
+      const rows = await resolver.match('Person').where({ emailAddress: 'vocabperson*', age: { $not: { $gte: 0 } } }).many();
+      expect(rows.map(p => p.name)).toEqual(['vocabperson']);
+    });
+
+    test('operator operands ride field pipelines exactly like equality operands', async () => {
+      // Person.name normalizes toLowerCase — uppercase operands only match via the pipeline.
+      expect((await resolver.match('Person').where({ emailAddress: 'vocabperson*', name: { $in: ['VOCABPERSON'] } }).many()).length).toBe(1);
+    });
+
+    test('unknown operators are rejected loudly (the allowlist)', async () => {
+      await expect(books({ price: { $where: 'true' } })).rejects.toThrow(/Unknown where operator/);
+    });
+  });
+
   describe('Transactions (manual)', () => {
     test('single txn (commit)', async () => {
       const txn = resolver.transaction();
@@ -1002,23 +1082,23 @@ module.exports = () => describe('TestSuite', () => {
 
   describe('Driver Queries', () => {
     test('get', async () => {
-      expect(await resolver.driver('Person').findOne({})).toBeDefined();
-      expect(await resolver.driver('Person').findOne({ name: 'richard' })).toBeNull(); // deleted
-      expect(await resolver.driver('Person').findOne({ name: 'Christie' })).toBeNull(); // case
-      expect(await resolver.driver('Person').findOne({ name: 'christie' })).toMatchObject({ name: 'christie', email_address: 'christie@gmail.com' });
+      expect(await global.rawDriver('person').findOne({})).toBeDefined();
+      expect(await global.rawDriver('person').findOne({ name: 'richard' })).toBeNull(); // deleted
+      expect(await global.rawDriver('person').findOne({ name: 'Christie' })).toBeNull(); // case
+      expect(await global.rawDriver('person').findOne({ name: 'christie' })).toMatchObject({ name: 'christie', email_address: 'christie@gmail.com' });
 
       // Driver -> Match counterparts
       const matchPerson = await resolver.match('Person').where({ name: 'christie' }).one();
       const matchPeople = await resolver.match('Person').many();
 
       // Driver findOne toResultSet
-      const rawPerson = await resolver.driver('Person').findOne({ name: 'christie' });
+      const rawPerson = await global.rawDriver('person').findOne({ name: 'christie' });
       const $rawPerson = await resolver.toResultSet('Person', rawPerson);
       expect($rawPerson).toMatchObject(matchPerson);
       expect(`${$rawPerson}`).toBe('Person');
 
       // Driver array toResultSet
-      const rawArray = await resolver.driver('Person').find().then(cursor => cursor.toArray());
+      const rawArray = await global.rawDriver('person').find().then(cursor => cursor.toArray());
       expect(await resolver.toResultSet('Person', rawArray)).toMatchObject(matchPeople);
     });
   });
@@ -1056,10 +1136,10 @@ module.exports = () => describe('TestSuite', () => {
     });
 
     test('update should not clobber unknown attributes', async () => {
-      await resolver.driver('Person').findOneAndUpdate({ _id: christie.id }, { $set: { section: { name: 'sec', unknown: 'unknown' } } });
+      await global.rawDriver('person').findOneAndUpdate({ _id: christie.id }, { $set: { section: { name: 'sec', unknown: 'unknown' } } });
       const person = await resolver.match('Person').id(christie.id).save({ section: { name: 'section' } });
       expect(person.section).toEqual(expect.objectContaining({ id: expect.thunk(ObjectId.isValid), name: 'section', frozen: 'frozen' }));
-      const dbPerson = await resolver.driver('Person').findOne({ _id: christie.id });
+      const dbPerson = await global.rawDriver('person').findOne({ _id: christie.id });
       expect(dbPerson.section).toEqual(expect.objectContaining({ _id: expect.thunk(ObjectId.isValid), name: 'section', unknown: 'unknown' }));
     });
 

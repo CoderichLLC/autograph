@@ -1,6 +1,27 @@
 const Util = require('@coderich/util');
 const { isGlob, globToRegex, mergeDeep, JSONParse } = require('../service/AppService');
+const Vocabulary = require('./Vocabulary');
 const TransactionScope = require('../data/TransactionScope');
+
+// Glob→regex conversion for a where value, vocabulary-aware: operator operands convert per
+// their coercion class ($in element-wise, $exists untouched); bare values convert as before.
+const convertGlobs = (value) => {
+  if (Vocabulary.isOperatorObject(value)) return Vocabulary.mapValues(value, el => (isGlob(el) ? globToRegex(el) : el));
+  return Util.map(value, el => (isGlob(el) ? globToRegex(el) : el));
+};
+
+// Flatten a where clause by FIELD PATHS only — operator objects are vocabulary VALUES, never
+// path segments. This is the operator-aware replacement for Util.flatten in #finalize: flattening
+// `{ price: { $ne: -999 } }` to the key 'price.$ne' hands MongoDB a literal field path that
+// silently matches nothing (verified empirically), and hands every other driver a reconstruction
+// chore. Operator objects arrive at drivers INTACT.
+const flattenWhere = (obj, path = [], acc = {}) => {
+  Object.entries(obj ?? {}).forEach(([key, value]) => {
+    if (Util.isPlainObject(value) && !Vocabulary.isOperatorObject(value) && Object.keys(value).length) flattenWhere(value, path.concat(key), acc);
+    else acc[path.concat(key).join('.')] = value;
+  });
+  return acc;
+};
 
 // Deep "merged" view: input first, falls through to doc — recursively for plain objects.
 // READ-ONLY. Writes/deletes throw with a hint pointing at `query.input` as the correct
@@ -148,7 +169,12 @@ module.exports = class Query {
     const args = { query: this.#query, resolver: this.#resolver, context: this.#context };
 
     if (['create', 'update'].includes(this.#query.crud) && !this.#query.isSaveNative) input = this.#model.transformers[this.#query.crud]?.transform(Util.unflatten(this.#query.input, { safe: true }), args);
-    if (!this.#query.isWhereNative && ['read', 'update', 'delete'].includes(this.#query.crud)) where = this.#model.transformers.where.transform(Util.unflatten(this.#query.where ?? {}, { safe: true }), args);
+    // Validate the where against the vocabulary allowlist BEFORE any transformation — this is
+    // the loud front door for whatever the GraphQL Mixed where-inputs let through. Native wheres
+    // are exempt by design: flags({ native }) is the developer's code-level declaration of TRUE
+    // driver dialect (e.g. Mongo $expr) — the allowlist guards the untrusted path only.
+    if (!this.#query.isWhereNative && ['read', 'update', 'delete'].includes(this.#query.crud)) Vocabulary.validate(this.#query.where ?? {});
+    if (!this.#query.isWhereNative && ['read', 'update', 'delete'].includes(this.#query.crud)) where = this.#transformWhere(Util.unflatten(this.#query.where ?? {}, { safe: true }), args);
     if (!this.#query.isSortNative && ['read'].includes(this.#query.crud)) sort = this.#model.transformers.sort.transform(Util.unflatten(this.#query.sort, { safe: true }), args);
 
     if (asClone) return this.clone({ input, where, sort });
@@ -157,6 +183,27 @@ module.exports = class Query {
     this.#query.sort = sort;
     this.#cacheKey = undefined; // invalidate; $cacheKey getter recomputes on next access
     return this;
+  }
+
+  // Compound operators ($or/$and) carry whole where clauses — the field-shaped transformer
+  // knows only field names, so compounds are lifted around it and each branch recurses through
+  // the SAME transformation (field pipelines reach operands inside every branch).
+  #transformWhere(where, args) {
+    const { $or, $and, ...fields } = where ?? {};
+    const out = this.#model.transformers.where.transform(fields, args);
+    if ($or) out.$or = $or.map(branch => this.#transformWhere(Util.unflatten(branch ?? {}, { safe: true }), args));
+    if ($and) out.$and = $and.map(branch => this.#transformWhere(Util.unflatten(branch ?? {}, { safe: true }), args));
+    return out;
+  }
+
+  // Same lift for the domain→data key-walk (walk drops unknown keys, and '$or' is not a field).
+  #walkWhere(where) {
+    if (!Util.isPlainObject(where)) return where;
+    const { $or, $and, ...fields } = where;
+    const out = this.#model.walk(fields, node => Object.assign(node, { key: node.field.key }));
+    if ($or) out.$or = $or.map(branch => this.#walkWhere(branch));
+    if ($and) out.$and = $and.map(branch => this.#walkWhere(branch));
+    return out;
   }
 
   validate() {
@@ -174,6 +221,10 @@ module.exports = class Query {
    */
   toDriver() {
     const { crud, input, doc, where, sort, before, after, isWhereNative, isSaveNative, isSortNative, isCursorPaging } = this.#query;
+    // Native wheres are deliberately NOT vocabulary-validated: flags({ native }) is a code-level
+    // developer declaration of TRUE driver dialect (raw column keys, raw driver constructs —
+    // e.g. Mongo $expr) — the allowlist guards the untrusted transformed path (transform()),
+    // not the developer's explicit escape hatch.
     let $input = isSaveNative ? input : this.#model.transformers.toDriver.transform(input);
     if (crud === 'update' && !isSaveNative) {
       const ignorePaths = [...this.#model.ignorePaths];
@@ -194,7 +245,7 @@ module.exports = class Query {
       model: this.#model.key,
       select: this.#query.select.map(name => this.#model.fields[name].key),
       input: $input,
-      where: isWhereNative ? where : this.#model.walk(where, node => Object.assign(node, { key: node.field.key })),
+      where: isWhereNative ? where : this.#walkWhere(where),
       sort: isSortNative ? sort : this.#model.walk(sort, node => Object.assign(node, { key: node.field.key })),
       before: (!isCursorPaging || !before) ? undefined : JSONParse(Buffer.from(before, 'base64').toString('ascii')),
       after: (!isCursorPaging || !after) ? undefined : JSONParse(Buffer.from(after, 'base64').toString('ascii')),
@@ -209,10 +260,28 @@ module.exports = class Query {
   /**
    * Finalize the query for the driver
    */
+  // Reconstruct a compound-operator branch: same glob/$in/operator treatment as the top level,
+  // recursing nested compounds. Join paths are REJECTED inside branches — a disjunctive branch
+  // cannot be extracted into the (conjunctive) join machinery, and silently dropping it would
+  // lie; loud beats blurry.
+  #finalizeBranch(branch) {
+    const { $or, $and, ...fields } = branch ?? {};
+    const out = Object.entries(flattenWhere(fields)).reduce((prev, [key, value]) => {
+      if (this.#model.isJoinPath(key, 'key')) throw new Error(`Unsupported where clause: join path "${key}" inside $or/$and — compound branches must use direct (non-join) fields`);
+      value = convertGlobs(value);
+      if (Array.isArray(value)) value = { $in: value };
+      return Object.assign(prev, { [key]: value });
+    }, {});
+    if ($or) out.$or = $or.map(b => this.#finalizeBranch(b));
+    if ($and) out.$and = $and.map(b => this.#finalizeBranch(b));
+    return out;
+  }
+
   #finalize(query) {
     const { where = {}, sort = {} } = query;
+    const { $or, $and, ...whereFields } = where;
     const flatSort = Util.flatten(sort, { safe: true });
-    const flatWhere = Util.flatten(where, { safe: true });
+    const flatWhere = flattenWhere(whereFields); // operator-aware: operator objects stay intact as values
     const $sort = Util.unflatten(Object.keys(flatSort).reduce((prev, key) => Object.assign(prev, { [key]: {} }), {}), { safe: true });
 
     //
@@ -222,13 +291,17 @@ module.exports = class Query {
     }, { key: 'key' });
 
     // Reconstruct the where clause by pulling out anything that requires a join.
-    // Arrays are normalized to { $in: [...] } here (core owns this; drivers receive pre-normalized queries).
+    // BARE arrays are normalized to { $in: [...] } here (core owns this; drivers receive
+    // pre-normalized queries); explicit operator objects pass through intact — their operands
+    // get glob conversion per the vocabulary's coercion classes, never re-wrapping.
     query.where = Object.entries(flatWhere).reduce((prev, [key, value]) => {
       if (this.#model.isJoinPath(key, 'key')) return prev;
-      value = Util.map(value, el => (isGlob(el) ? globToRegex(el) : el));
+      value = convertGlobs(value);
       if (Array.isArray(value)) value = { $in: value };
       return Object.assign(prev, { [key]: value });
     }, {});
+    if ($or) query.where.$or = $or.map(b => this.#finalizeBranch(b));
+    if ($and) query.where.$and = $and.map(b => this.#finalizeBranch(b));
 
     // Determine what join data is needed (derived from where + sort)
     const joinData = mergeDeep($sort, Util.unflatten(Object.entries(flatWhere).reduce((prev, [key, value]) => {
@@ -287,7 +360,7 @@ module.exports = class Query {
       if (isLeaf) {
         const $model = field.model || model;
         const join = findJoin(query.joins, $model.key);
-        const $value = Util.map(value, el => (isGlob(el) ? globToRegex(el) : el));
+        const $value = convertGlobs(value);
         const $$value = Array.isArray($value) ? { $in: $value } : $value;
         const from = field.model ? join.from : key;
         join.where[from] = $$value;

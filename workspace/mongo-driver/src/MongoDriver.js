@@ -93,10 +93,6 @@ module.exports = class MongoDriver {
     return this.#connection.then(client => client.close());
   }
 
-  driver(name) {
-    return this.collection(name);
-  }
-
   // MongoDB has no savepoint primitive — a session supports exactly one active transaction, so
   // there is no such thing as a "child" session. When offered a parent handle ({ session, commit,
   // rollback }), we simply hand it back unchanged: TransactionScope reacts to that identity
@@ -177,6 +173,7 @@ module.exports = class MongoDriver {
 
   static convertFieldsForRegex($schema, model, where, forceArray) {
     return Object.entries(where).reduce((prev, [key, mixed]) => {
+      if (key.startsWith('$')) return prev; // compound branches: no per-field regex conversion
       const field = $schema(`${model}.${key}`);
       const [value] = Object.values(Util.flatten({ mixed }, { safe: true }));
 
@@ -189,8 +186,28 @@ module.exports = class MongoDriver {
     }, {});
   }
 
+  // Contract-semantics translation (see autograph/src/query/Vocabulary.js): the vocabulary
+  // defines `$exists: true` as "a non-null value is present" — portable across drivers. Mongo's
+  // native $exists counts null-valued fields as existing, so it translates to the equivalent
+  // null-comparison. Everything else in the vocabulary is Mongo wire syntax already (this driver
+  // is the reference implementation — passthrough).
+  static translateVocabulary(where = {}) {
+    return Object.entries(where).reduce((prev, [key, value]) => {
+      if ((key === '$or' || key === '$and') && Array.isArray(value)) value = value.map(branch => MongoDriver.translateVocabulary(branch));
+      else if (value != null && typeof value === 'object' && '$exists' in value) {
+        const { $exists, ...rest } = value;
+        value = { ...rest, ...($exists ? { $ne: null } : { $eq: null }) };
+      }
+      return Object.assign(prev, { [key]: value });
+    }, {});
+  }
+
   static aggregateQuery(query, count = false) {
-    const { model, select, where, sort = {}, skip, limit, joins, after, before, first, isWhereNative, isSortNative } = query;
+    const { model, select, sort = {}, skip, limit, joins, after, before, first, isWhereNative, isSortNative } = query;
+    // Native wheres are TRUE Mongo dialect — no contract translation ($exists keeps Mongo's own
+    // null-counts-as-existing semantics there); the portable translation applies to the
+    // vocabulary path only.
+    const where = isWhereNative ? query.where : MongoDriver.translateVocabulary(query.where);
     const $aggregate = [{ $match: where }];
     const $addFields = isWhereNative ? {} : MongoDriver.convertFieldsForRegex(query.$schema, model, where);
     const $sort = isSortNative ? sort : MongoDriver.convertFieldsForSort(sort);

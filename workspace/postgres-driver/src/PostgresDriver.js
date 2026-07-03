@@ -123,6 +123,35 @@ module.exports = class PostgresDriver {
     return this.#run(plan.sql, plan.session).then(rows => Number(rows[0]?.count ?? 0));
   }
 
+  createOne(plan) {
+    return this.#run(plan.sql, plan.session).then(rows => rows[0]);
+  }
+
+  async updateOne(plan) {
+    if (plan.partialJsonb) {
+      // Read current row, deep-merge partial updates, then write back.
+      const current = await this.#run(plan.sql, plan.session).then(rows => rows[0]);
+      if (!current) return null;
+      const merged = PostgresDriver.mergePartialJsonb(current, plan.partialJsonb.input);
+      const { sql, bindings } = knex(plan.model)
+        .where(PostgresDriver.buildWhereCallback(plan.partialJsonb.where))
+        .update(PostgresDriver.serializeInput(merged))
+        .returning('*')
+        .toSQL().toNative();
+      const executor = plan.session || this.#pool;
+      const r = await executor.query(sql, bindings);
+      return r.rows[0] ? PostgresDriver.reviveRow(r.rows[0]) : null;
+    }
+    return this.#run(plan.sql, plan.session).then(rows => rows[0] ?? null);
+  }
+
+  deleteOne(plan) { return this.#run(plan.sql, plan.session); }
+  deleteMany(plan) { return this.#run(plan.sql, plan.session); }
+
+  collection(name) {
+    return { query: (...args) => this.#pool.query(...args) };
+  }
+
   // Resolve JSONB array FK joins (friends, sections.person) in JS.
   // For each join: query the target table with its conditions, get matching PKs,
   // then filter the main rows by containment.
@@ -169,72 +198,6 @@ module.exports = class PostgresDriver {
     return result;
   }
 
-  createOne(plan) {
-    return this.#run(plan.sql, plan.session).then(rows => rows[0]);
-  }
-
-  async updateOne(plan) {
-    if (plan.partialJsonb) {
-      // Read current row, deep-merge partial updates, then write back.
-      const current = await this.#run(plan.sql, plan.session).then(rows => rows[0]);
-      if (!current) return null;
-      const merged = PostgresDriver.mergePartialJsonb(current, plan.partialJsonb.input);
-      const { sql, bindings } = knex(plan.model)
-        .where(PostgresDriver.buildWhereCallback(plan.partialJsonb.where))
-        .update(PostgresDriver.serializeInput(merged))
-        .returning('*')
-        .toSQL().toNative();
-      const executor = plan.session || this.#pool;
-      const r = await executor.query(sql, bindings);
-      return r.rows[0] ? PostgresDriver.reviveRow(r.rows[0]) : null;
-    }
-    return this.#run(plan.sql, plan.session).then(rows => rows[0] ?? null);
-  }
-
-  deleteOne(plan) { return this.#run(plan.sql, plan.session); }
-  deleteMany(plan) { return this.#run(plan.sql, plan.session); }
-
-  collection(name) {
-    return { query: (...args) => this.#pool.query(...args) };
-  }
-
-  // Raw table accessor used by Driver Queries and Bug Fixes tests.
-  driver(name) {
-    const pool = this.#pool;
-    const revive = PostgresDriver.reviveRow;
-    return {
-      findOne: async (where) => {
-        const q = Object.keys(where || {}).length ? knex(name).where(where).limit(1) : knex(name).limit(1);
-        const { sql, bindings } = q.toSQL().toNative();
-        const r = await pool.query(sql, bindings);
-        return r.rows[0] ? revive(r.rows[0]) : null;
-      },
-      findMany: async (where) => {
-        const { sql, bindings } = knex(name).where(where || {}).toSQL().toNative();
-        const r = await pool.query(sql, bindings);
-        return r.rows.map(revive);
-      },
-      find: async (where) => {
-        const { sql, bindings } = knex(name).where(where || {}).toSQL().toNative();
-        const r = await pool.query(sql, bindings);
-        const rows = r.rows.map(revive);
-        return { toArray: () => Promise.resolve(rows) };
-      },
-      // MongoDB-style update: applies $set patch without replacing entire document.
-      findOneAndUpdate: async (where, update) => {
-        const patch = update.$set || update;
-        const serialized = PostgresDriver.serializeInput(patch);
-        const { sql, bindings } = knex(name)
-          .where(where || {})
-          .update(serialized)
-          .returning('*')
-          .toSQL().toNative();
-        const r = await pool.query(sql, bindings);
-        return r.rows[0] ? revive(r.rows[0]) : null;
-      },
-    };
-  }
-
   disconnect() { return this.#pool.end(); }
 
   // No real SAVEPOINT support yet — when offered a parent handle (an ambient scope this call is
@@ -276,7 +239,6 @@ module.exports = class PostgresDriver {
   // Execute a knex builder using session (transaction client) or pool.
   #run(builder, session) {
     const { sql, bindings } = builder.toSQL().toNative();
-    if (process.env.DEBUG_SQL) console.log('[SQL]', sql, bindings);
     const executor = session || this.#pool;
     return executor.query(sql, bindings).then(r => r.rows.map(PostgresDriver.reviveRow));
   }
@@ -345,6 +307,13 @@ module.exports = class PostgresDriver {
     const jsFilters = [];
 
     Object.entries(where || {}).forEach(([col, value]) => {
+      // Compound operators carry whole where clauses — no field metadata to consult; they land
+      // in dbWhere intact and buildWhereCallback recurses them. (JS-filter-needing predicates
+      // inside compound branches are not supported — see the vocabulary conformance notes.)
+      if (col.startsWith('$')) {
+        dbWhere[col] = value;
+        return;
+      }
       const fieldMeta = ($schema && model) ? $schema(`${model}.${col}`) : null;
       const isJsonbArray = fieldMeta?.isArray;
       const isDotted = col.includes('.');
@@ -681,6 +650,20 @@ module.exports = class PostgresDriver {
   static buildWhereCallback(where, joinedTables = new Set(), $schema = null, model = null, mainTable = null) {
     return function buildWhereCallback() {
       Object.entries(where || {}).forEach(([col, value]) => {
+        // Compound operators: parenthesized group; each branch recurses through this same
+        // builder ($or → OR'd branch groups, $and → AND'd branch groups).
+        if (col === '$or' || col === '$and') {
+          const isOr = col === '$or';
+          const branches = Array.isArray(value) ? value : [value];
+          this.where(function compound() {
+            branches.forEach((branch) => {
+              const cb = PostgresDriver.buildWhereCallback(branch, joinedTables, $schema, model, mainTable);
+              if (isOr) this.orWhere(cb);
+              else this.andWhere(cb);
+            });
+          });
+          return;
+        }
         let colExpr;
         let jsonbContainerExpr = null; // JSONB extract (->) for @> containment (not ->>'s text)
         let isJsonbPath = false;
@@ -763,10 +746,50 @@ module.exports = class PostgresDriver {
           if (neVal === null) {
             this.whereRaw(`${colExpr} IS NOT NULL`);
           } else if (typeof neVal === 'string') {
-            this.whereRaw(`LOWER(${colExpr}) != LOWER(?)`, [neVal]);
+            // Mongo $ne semantics: docs where the field is missing/null also "do not equal".
+            this.whereRaw(`(${colExpr} IS NULL OR LOWER(${colExpr}) != LOWER(?))`, [neVal]);
           } else {
-            this.whereRaw(`${colExpr} != ?`, [neVal]);
+            this.whereRaw(`(${colExpr} IS NULL OR ${colExpr} != ?)`, [neVal]);
           }
+        } else if (value && typeof value === 'object' && Object.keys(value).some(k => k.startsWith('$'))) {
+          // Vocabulary tier-1 operators (see autograph/src/query/Vocabulary.js — the contract IR).
+          Object.entries(value).forEach(([op, operand]) => {
+            switch (op) {
+              case '$eq':
+                if (operand === null) this.whereRaw(`${colExpr} IS NULL`);
+                else if (typeof operand === 'string') this.whereRaw(`LOWER(${colExpr}) = LOWER(?)`, [operand]);
+                else this.whereRaw(`${colExpr} = ?`, [operand]);
+                break;
+              case '$gt': this.whereRaw(`${colExpr} > ?`, [operand]); break;
+              case '$gte': this.whereRaw(`${colExpr} >= ?`, [operand]); break;
+              case '$lt': this.whereRaw(`${colExpr} < ?`, [operand]); break;
+              case '$lte': this.whereRaw(`${colExpr} <= ?`, [operand]); break;
+              case '$nin': {
+                // Mongo $nin semantics: also matches docs where the field is missing/null.
+                const vals = operand ?? [];
+                if (!vals.length) break; // $nin [] matches everything
+                const strings = vals.every(v => typeof v === 'string');
+                const list = vals.map(() => (strings ? 'LOWER(?)' : '?')).join(', ');
+                this.whereRaw(`(${colExpr} IS NULL OR ${strings ? `LOWER(${colExpr})` : colExpr} NOT IN (${list}))`, vals);
+                break;
+              }
+              case '$exists':
+                // Contract semantics: "a non-null value is present" (see Vocabulary.js) — SQL's
+                // only notion; MongoDriver translates to the equivalent null-comparison.
+                this.whereRaw(operand ? `${colExpr} IS NOT NULL` : `${colExpr} IS NULL`);
+                break;
+              case '$not': {
+                // Field-level negation with Mongo's semantics: matches docs where the field is
+                // null/missing OR the inner predicate fails (SQL NOT alone excludes NULL rows).
+                const inner = PostgresDriver.buildWhereCallback({ [col]: operand }, joinedTables, $schema, model, mainTable);
+                this.where(function negation() {
+                  this.whereRaw(`${colExpr} IS NULL`).orWhereNot(inner);
+                });
+                break;
+              }
+              default: throw new Error(`PostgresDriver: unsupported where operator '${op}'`);
+            }
+          });
         } else if (isJsonbArray) {
           // Scalar containment on a JSONB array column (top-level or nested).
           const expr = jsonbContainerExpr || colExpr;

@@ -1,7 +1,42 @@
 # CHANGELOG
 
+## v0.16.x (BREAKING)
+  - Transactions re-introduced (`TransactionScope`) — reference-threaded, never ambient (no ALS)
+    - **Every gqlMutation is its own transaction** (isolated clone; `context.autograph.resolver` swapped per field; commit before field resolves)
+    - **Inside a custom mutation resolver body, data is PROVISIONAL until the field commits** — inline irreversible side effects (email/webhook) are now rollback-exposed; move them to `postCommit`
+    - `mutation @transaction { a, b, c }` escalates to one operation-level unit (executes via first-field hoist; rollback ⇒ `data: null`)
+    - Wrapper errors carry `extensions.{code, committed}` (`PRE_OPERATION_ERROR`/`POST_OPERATION_ERROR`/`MUTATION_ERROR`/`OPERATION_ABORTED`); no `result` on the wire
+    - agMutations (`resolver.match().save()` etc.) only JOIN scopes, never create; RI/`*Many` auto-wrap their own
+    - `enableAutoTransaction()` / `autoTransaction` flag REMOVED; host escape hatch = `transaction({ isolated: false })`
+    - Scopes bind a session on FIRST use (reads included — snapshot isolation); settled scopes: reads degrade to committed, writes reject
+    - New events `postCommit` / `postRollback` (durable-outcome observers; failures isolated)
+    - Post-phase failures role-graded: `postMutation` throw aborts a carried unit; `preResponse`/`postResponse` throw = `PostOperationError` (commits anyway, `.result` carries the write)
+    - Scripts/out-of-band unchanged: awaited ⇒ durable (only `*Many`/RI auto-wrap, bounded within the call)
+  - Emitter: listener role declared at REGISTRATION, not arity
+    - `on*()` = PARTICIPANT: awaited, ambient resolver, throw aborts the mutation, non-undefined return short-circuits (sync return stops later listeners; async return now short-circuits too)
+    - `observe*()` = OBSERVER: fire-and-forget, DETACHED resolver (committed-only reads; fate-independent writes), failures swallowed, return ignored, runs first
+    - **BREAKING: arity<2 listeners via `on()` are now participants** (were fire-and-forget basics) — migrate observers to `observe*()`
+    - Legacy `(event, next)` form still works (call convention only)
+    - One flat priority order per role (no more basics/nexts phases)
+    - `event.context[namespace].resolver` is POISONED in hooks (throws) — use `event.resolver` (`.detach()`/`.transaction()` for other fates)
+  - Where Vocabulary: `$eq $ne $gt $gte $lt $lte $in $nin $exists $not $or $and` first-class in `.where()` AND GraphQL where-inputs (`src/query/Vocabulary.js`)
+    - Allowlist validation — unknown `$`-operators now REJECT loudly (was silent passthrough; closes GQL injection surface)
+    - Fixed: operators through the normal path silently matched NOTHING on Mongo (finalize flattening bug, incl. the known `$in` bug)
+    - Field pipelines/key-mapping apply INTO operator operands at every depth; globs convert inside `$in`/`$nin`
+    - Portable semantics: `$exists` = "non-null value present"; `$ne`/`$nin` match missing/null (PG behavior aligned to Mongo)
+    - Join paths inside `$or`/`$and` branches reject loudly
+    - `flags({ native })` = TRUE driver dialect (unvalidated/untranslated, raw column keys, e.g. Mongo `$expr`) — still transactional/cached
+  - **`resolver.driver()` REMOVED** — use the vocabulary, `flags.native`, or your own client instance; TestSuite raw verification via test-harness `global.rawDriver`
+  - Driver contract changes (pre-publication): `driver(name)` no longer required; where operators arrive INTACT (never pre-flattened — drop reconstruction); vocabulary conformance section in TestSuite
+  - PostgresDriver: production-pure (all pg-mem emulation moved to test harness `PgMemShim`); real `BEGIN ISOLATION LEVEL REPEATABLE READ` + native rollback
+
 ## v0.15.x (BREAKING)
-  - PageInfo and cursor no longer required schema (only defined when cursorPaginating...)
+  - Removed all deprecations
+  - @oneOf support
+
+## v0.14.x (BREAKING)
+  - Transaction support removed
+  - PageInfo and cursor no longer required schema (only defined when cursorPaginating)
   - Revamped Pipeline { schema, context, resolver, query, model, field, value, path, startValue }
     - Pipeline "toId" is completely removed (use custom "toObjectId" Pipeline etc)
     - Removed Pipelines [transform, destruct]

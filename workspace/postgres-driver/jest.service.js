@@ -58,6 +58,36 @@ exports.setup = async () => {
     return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
   }
 
+  // Raw table accessor for the TestSuite's "Driver Queries" verification — a TEST-HARNESS
+  // concern (bypasses autograph entirely), not a production API. Provides the documented
+  // findOne/find/findOneAndUpdate surface over raw SQL.
+  const eq = (where = {}) => {
+    const cols = Object.keys(where);
+    const sql = cols.length ? ` WHERE ${cols.map((c, i) => `"${c}" = $${i + 1}`).join(' AND ')}` : '';
+    return { sql, params: cols.map(c => where[c]) };
+  };
+  global.rawDriver = table => ({
+    findOne: async (where) => {
+      const { sql, params } = eq(where);
+      const r = await pool.query(`SELECT * FROM "${table}"${sql} LIMIT 1`, params);
+      return r.rows[0] ? PostgresDriver.reviveRow(r.rows[0]) : null;
+    },
+    find: async (where) => {
+      const { sql, params } = eq(where);
+      const r = await pool.query(`SELECT * FROM "${table}"${sql}`, params);
+      const rows = r.rows.map(PostgresDriver.reviveRow);
+      return { toArray: () => Promise.resolve(rows) };
+    },
+    findOneAndUpdate: async (where, update) => {
+      const patch = PostgresDriver.serializeInput(update.$set || update);
+      const cols = Object.keys(patch);
+      const { sql, params } = eq(where);
+      const sets = cols.map((c, i) => `"${c}" = $${params.length + i + 1}`).join(', ');
+      const r = await pool.query(`UPDATE "${table}" SET ${sets}${sql} RETURNING *`, [...params, ...cols.map(c => patch[c])]);
+      return r.rows[0] ? PostgresDriver.reviveRow(r.rows[0]) : null;
+    },
+  });
+
   // Build schema + resolver (no DB calls yet)
   const result = setup({
     generator: ({ value }) => {

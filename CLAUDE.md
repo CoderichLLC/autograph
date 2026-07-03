@@ -62,7 +62,7 @@ GraphQL Schema (typeDefs with directives)
 
 - `workspace/autograph/src/data/Pipeline.js` — Runs field-level transformation stages. Pipelines are arrays of functions that can be sync or async.
 
-- `workspace/autograph/src/data/Emitter.js` — Event system for lifecycle hooks. "Basic" functions (arity < 2) execute first and can short-circuit; "next" functions (arity ≥ 2) form a middleware chain.
+- `workspace/autograph/src/data/Emitter.js` — Event system for lifecycle hooks. Listener ROLE is declared at registration, never inferred from arity: `on*()` registers PARTICIPANTS (awaited, ambient resolver, throw aborts, non-undefined return short-circuits — sync returns stop later initiation; the legacy `(event, next)` done-callback form is honored as a call convention only); `observe*()` registers OBSERVERS (fire-and-forget, detached resolver, failures isolated, returns ignored, initiated first). One flat priority order per role.
 
 - `workspace/autograph/src/query/Query.js` — Core query representation. Holds the canonical query state, implements the `.merged` read-only proxy (input overlaid on doc), computes the DataLoader cache key, and provides `.toDriver()` for driver consumption.
 
@@ -99,6 +99,43 @@ type Person @model {
 Every model gets a `DataLoader` instance on the `Resolver`. Results are cached for the lifetime of the resolver instance. Call `resolver.clear(model)` or `resolver.clearAll()` to invalidate.
 
 The DataLoader caches the **raw driver result**, not the transformed output — it is safe to mutate, spread, and `JSON.stringify` returned documents.
+
+### Where Vocabulary
+
+The `$`-operator syntax in `.where()` is **autograph's own query IR** (deliberately borrowing
+MongoDB's proven wire syntax), spec'd in `workspace/autograph/src/query/Vocabulary.js` and
+enforced by a per-driver conformance section in the TestSuite. MongoDriver implements it mostly
+by passthrough (the reference implementation); every other driver translates to its own idiom.
+
+| Operator | Coercion | Meaning |
+|---|---|---|
+| `$eq` `$ne` `$gt` `$gte` `$lt` `$lte` | value | operand is field-shaped: pipelines + glob conversion apply exactly as to an equality operand |
+| `$in` `$nin` | list | array of field-shaped operands, applied element-wise |
+| `$exists` | none | boolean; "a NON-NULL value is present" (portable — Mongo translates to a null-comparison) |
+| `$not` | nested | field-level negation; operand is itself an operator object; matches missing/null values (Mongo semantics) |
+| `$or` `$and` | compound | arrays of whole where clauses; nest recursively; coexist with field keys (implicit AND) |
+
+Rules and guarantees:
+- **Validated at the query boundary** (`Vocabulary.validate`): unknown `$`-operators reject
+  loudly — the generated GraphQL where-inputs are `AutoGraphMixed`, so the whole vocabulary is
+  available to GraphQL callers and the allowlist is the injection guard.
+- Operators are always **terminal**: nest fields-then-operator (`{ sections: { name: { $eq: x } } }`);
+  operators never wrap paths. Field pipelines (normalize/serialize/cast) and domain→data key
+  mapping run at every depth, INTO operator operands, per the coercion classes.
+- `$ne`/`$nin` also match missing/null values (portable Mongo semantics, both drivers).
+- **Globs** are the pattern spelling for the transformed path (they ride pipelines as strings,
+  then convert glob→regex) — bare and inside `$in`/`$nin` operands. Raw `RegExp` values get
+  string-mangled by `$cast` on the transformed path; they belong to `flags({ native })` mode.
+- `flags({ native: true | ['where','save','sort'] })` is TRUE driver dialect: it sheds the
+  schema's transforms (pipelines, key mapping, finalize) AND the vocabulary contract — raw
+  column keys, raw driver constructs (e.g. Mongo `$expr`), unvalidated and untranslated. The
+  full resolve() machinery still applies (transactions, DataLoader caching, deserialize, events)
+  — native changes what the driver RECEIVES, never how the query participates.
+- Limitations (loud, not silent): join paths inside `$or`/`$and` branches are rejected;
+  PG does not yet support operators on embedded-ARRAY element paths (its JS-filter fallback) or
+  JS-filter-needing predicates inside compound branches.
+- DataLoader batch-merging only ever widens equality-shaped values — operator-valued and
+  compound keys never become fanout keys.
 
 ### Emitter Events
 
@@ -208,16 +245,11 @@ class MyDriver {
   // Execute a previously-prepared plan and return results.
   execute(plan) { ... }
 
-  // Required by TestSuite "Driver Queries" section.
-  // Returns a raw table/collection accessor that bypasses autograph pipelines.
-  driver(name) {
-    return {
-      findOne(where),           // → Promise<row | null>
-      findMany(where),          // → Promise<row[]>
-      find(where),              // → Promise<{ toArray() }>   (MongoDB cursor shape)
-      findOneAndUpdate(where, update),  // update may be { $set: patch } or plain patch
-    };
-  }
+  // There is NO production raw accessor: native expressiveness lives INSIDE the QueryBuilder —
+  // the Where Vocabulary (below) plus `flags({ native })` cover it, inheriting transactions,
+  // caching, and events for free. The TestSuite's raw-row verification uses a TEST-HARNESS
+  // accessor (`global.rawDriver(tableKey)` → { findOne, find, findOneAndUpdate }) defined in
+  // each driver package's jest.service — a test concern, not part of this contract.
 
   // Required by TestSuite "Bug Fixes" section.
   // Returns a raw collection accessor.
@@ -246,7 +278,7 @@ class MyDriver {
 |---|---|
 | `query.op` | `'findOne'` \| `'findMany'` \| `'count'` \| `'createOne'` \| `'updateOne'` \| `'deleteOne'` \| `'deleteMany'` |
 | `query.model` | Table/collection name string |
-| `query.where` | Flat object. **MongoDB-style operators are pre-flattened by `Util.flatten`** — `{ price: { $ne: -999 } }` arrives as `{ 'price.$ne': -999 }`. Reconstruct before use. |
+| `query.where` | Flat object: dotted keys are field PATHS only; **vocabulary operator objects arrive INTACT** — `{ price: { $ne: -999 } }` arrives exactly as written (never flattened into `'price.$ne'`), and compound operators (`$or`/`$and`) arrive as arrays of where clauses. See Where Vocabulary. |
 | `query.input` | Mutation payload (also flat/dot-notated for nested fields) |
 | `query.sort` | Flat sort object, e.g. `{ name: 'asc' }` |
 | `query.select` | Array of column/field name strings |
@@ -297,16 +329,16 @@ function nextId() {
   error, and a **read** through a settled scope degrades to a plain sessionless read of committed
   state (needed because docs returned from a transaction lazily resolve populated fields through
   the same, now-settled resolver during response serialization).
-- **`.where({ field: { $in: [...] } })` reads return nothing, even when matching documents exist**
-  (model- and field-agnostic — reproduces on any model/field, not specific to any particular
-  mutation path). Root cause (via code trace, not yet fixed): `Query.js#finalize` flattens `where`
-  via `Util.flatten` before reconstructing it — an explicit `{ field: { $in: [...] } }` flattens to
-  the key `'field.$in'` with an array value (same as CLAUDE.md's documented `$ne` example above),
-  but `#finalize`'s reconstruction loop unconditionally wraps any array VALUE in `{ $in: value }`
-  regardless of whether the flattened KEY already ends in an operator — producing
-  `{ 'field.$in': { $in: [...] } }` (wrong field path, double-wrapped) instead of
-  `{ field: { $in: [...] } }`. Fix likely belongs in that reduce: skip the array→`$in` wrap when
-  the flattened key's last segment is already a `$`-prefixed operator.
+- ~~`.where({ field: { $in: [...] } })` reads return nothing~~ — **fixed**, and generalized: the
+  root cause (`Query.js#finalize` flattening operator objects into `'field.$in'`-style keys that
+  MongoDB treats as literal field paths matching nothing) affected EVERY operator through the
+  normal path. `#finalize` now flattens field paths only — operator objects reach drivers intact
+  — and the operator set is a first-class, validated **vocabulary** (`src/query/Vocabulary.js`):
+  `$eq/$ne/$in/$nin/$gt/$gte/$lt/$lte/$exists/$not` plus compound `$or/$and` work through
+  `.where()` (and the GraphQL Mixed where-inputs) with field pipelines applied to operator
+  operands, an allowlist rejecting unknown operators loudly (closing a latent injection surface),
+  DataLoader merge-safety, and a per-driver conformance section in the TestSuite. See the Where
+  Vocabulary section.
 
 ## Release 0.16 Goals
 

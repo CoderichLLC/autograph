@@ -18,6 +18,11 @@ exports.setup = async () => {
     transaction: { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } },
   });
 
+  // Raw table accessor for the TestSuite's "Driver Queries" verification — a TEST-HARNESS
+  // concern (bypasses autograph entirely), not a production API. Mongo's collection proxy
+  // natively provides the findOne/find/findOneAndUpdate surface the TestSuite documents.
+  global.rawDriver = name => global.mongoClient.collection(name);
+
   // Autograph
   Object.assign(global, setup({
     generator: ({ value }) => {
