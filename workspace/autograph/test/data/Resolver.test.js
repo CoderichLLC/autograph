@@ -644,7 +644,7 @@ describe('Resolver (transaction regressions)', () => {
       const before = await resolver.match('Color').where({}).many();
 
       const hook = async (event) => { throw new Error('observer failure — isolated, logged-only'); };
-      Emitter.onModels('postCommit', ['Color'], hook);
+      Emitter.observeModels('postCommit', ['Color'], hook);
 
       const results = await resolver.match('Color').save([{ type: 'red' }, { type: 'green' }]); // resolves — no error surfaces
       Emitter.removeListener('postCommit', hook);
@@ -771,18 +771,18 @@ describe('Resolver (transaction regressions)', () => {
     });
   });
 
-  describe('detached resolvers — arity<2 listeners are never transaction participants', () => {
-    // The unit of work is exactly what the mutation awaits. A basic-style (arity < 2) listener
-    // is structurally incapable of being awaited, so it can never be a participant — the Emitter
-    // hands it a DETACHED resolver (no scope, sessionless reads of committed state, writes land
-    // immediately and fate-independently) instead of the ambient one. Next-style (arity >= 2)
-    // listeners remain participants and still receive the ambient resolver.
-    test('an arity<2 listener receives a detached, scope-less resolver; an arity>=2 listener receives the ambient one', async () => {
+  describe('detached resolvers — OBSERVERS are never transaction participants', () => {
+    // The unit of work is exactly what the mutation awaits. An OBSERVER (Emitter.observe*) is
+    // never awaited, so it can never be a participant — the Emitter hands it a DETACHED resolver
+    // (no scope, sessionless reads of committed state, writes land immediately and
+    // fate-independently) instead of the ambient one. Participants (Emitter.on*) remain awaited
+    // and still receive the ambient resolver.
+    test('an OBSERVER receives a detached, scope-less resolver; a PARTICIPANT receives the ambient one', async () => {
       let basicResolver;
       let nextResolver;
       const basicHook = (event) => { basicResolver = event.resolver; };
       const nextHook = (event, next) => { nextResolver = event.resolver; next(); };
-      Emitter.onModels('postMutation', ['Person'], basicHook);
+      Emitter.observeModels('postMutation', ['Person'], basicHook);
       Emitter.onModels('postMutation', ['Person'], nextHook);
 
       try {
@@ -806,7 +806,7 @@ describe('Resolver (transaction regressions)', () => {
       const hook = (event) => {
         pendingWrite = event.resolver.match('Color').save({ type: 'red' });
       };
-      Emitter.onModels('postMutation', ['Person'], hook);
+      Emitter.observeModels('postMutation', ['Person'], hook);
 
       try {
         const txn = resolver.transaction();
@@ -828,7 +828,7 @@ describe('Resolver (transaction regressions)', () => {
       const hook = (event) => {
         observed = event.resolver.match('Person').id(event.query.result.id).one();
       };
-      Emitter.onModels('postMutation', ['Person'], hook);
+      Emitter.observeModels('postMutation', ['Person'], hook);
 
       try {
         const txn = resolver.transaction();
@@ -868,7 +868,7 @@ describe('Resolver (transaction regressions)', () => {
       await txn.rollback();
     });
 
-    test('a postCommit arity<2 listener can write through event.resolver without a fresh transaction() incantation', async () => {
+    test('a postCommit OBSERVER can write through event.resolver without a fresh transaction() incantation', async () => {
       // Previously documented gotcha: under a host-managed scope, a postCommit write through
       // event.resolver threw (its scope had settled). Detachment dissolves it for the
       // fire-and-forget form — the twin has no settled scope to trip over.
@@ -876,7 +876,7 @@ describe('Resolver (transaction regressions)', () => {
       const hook = (event) => {
         pendingWrite = event.resolver.match('Color').save({ type: 'green' });
       };
-      Emitter.onModels('postCommit', ['Person'], hook);
+      Emitter.observeModels('postCommit', ['Person'], hook);
 
       let person;
       try {
@@ -894,6 +894,59 @@ describe('Resolver (transaction regressions)', () => {
 
       await resolver.match('Color').id(color.id).delete();
       await resolver.match('Person').id(person.id).delete();
+    });
+  });
+
+  describe('event.context guards the transport resolver slot — hooks must use event.resolver', () => {
+    // There is no legitimate hook-side read of `context[namespace].resolver`: it is a mutable,
+    // time-sensitive transport slot (the operation-scope wrapper swaps it per field), while
+    // `event.resolver` is the exact identity the hook is entitled to. Misuse fails LOUDLY at
+    // access time instead of nondeterministically joining the wrong unit. Only the event's VIEW
+    // is poisoned — the real context object is untouched.
+    test('accessing event.context.autograph.resolver from a participant hook throws with guidance', async () => {
+      let networkId;
+      const hook = (event, next) => {
+        networkId = event.context.network?.id; // every OTHER context property reads fine
+        event.context.autograph.resolver.match('Person');
+        next();
+      };
+      Emitter.onModels('preMutation', ['Person'], hook);
+
+      try {
+        await expect(resolver.match('Person').save({ name: 'ctx-guard', emailAddress: 'ctx-guard@example.com' }))
+          .rejects.toThrow(/not accessible from event hooks.*event\.resolver/);
+        expect(networkId).toBe('networkId');
+        expect(await resolver.match('Person').where({ emailAddress: 'ctx-guard@example.com' }).many()).toHaveLength(0);
+      } finally {
+        Emitter.removeListener('preMutation', hook);
+      }
+    });
+
+    test('an OBSERVER hits the same guard; assignment is also poisoned; the real context is untouched', async () => {
+      let caught;
+      const basicHook = (event) => {
+        try {
+          event.context.autograph.resolver = 'hijack'; // write is poisoned too
+        } catch (e) {
+          caught = e;
+          event.context.stash = 'passthrough'; // non-resolver writes reach the REAL context
+        }
+      };
+      Emitter.observeModels('postMutation', ['Person'], basicHook);
+
+      let person;
+      try {
+        person = await resolver.match('Person').save({ name: 'ctx-guard-basic', emailAddress: 'ctx-guard-basic@example.com' });
+        expect(caught?.message).toMatch(/not accessible from event hooks/);
+        expect(context.stash).toBe('passthrough'); // the real context object received the write
+        expect(context.autograph.resolver).toBe(resolver); // and its resolver slot is untouched
+        // The escape hatch to the real object remains: event.resolver.getContext().
+        expect(resolver.getContext().autograph.resolver).toBe(resolver);
+      } finally {
+        Emitter.removeListener('postMutation', basicHook);
+        delete context.stash;
+        if (person) await resolver.match('Person').id(person.id).delete();
+      }
     });
   });
 });

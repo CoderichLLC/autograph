@@ -55,6 +55,54 @@ module.exports = class Resolver {
   // instance, which keeps Emitter memoization (keyed per resolver) stable across a request.
   static #detachedResolvers = new WeakMap();
 
+  // The context handed to EVENT HOOKS, with the transport's resolver slot poisoned. There is no
+  // legitimate hook-side use of `context[namespace].resolver`: it is a MUTABLE slot whose meaning
+  // is a function of time (the operation-scope wrapper swaps a txn clone in per field and
+  // restores it after — an un-awaited hook body may read the NEXT field's transaction), while
+  // `event.resolver` is the exact identity the hook is entitled to (participant clone, detached
+  // twin, settled scope). Every hook intent has a first-class expression — event.resolver,
+  // .detach(), .transaction(), or the registration role (on* vs observe*) — so misuse fails
+  // LOUDLY at access time
+  // instead of nondeterministically joining the wrong unit. Only the event's view is guarded:
+  // the real context object is untouched (transport code reads the live slot), every other
+  // context property reads/writes straight through, and `event.resolver.getContext()` remains
+  // the escape hatch to the real object. Memoized per context so event identity is stable.
+  static #guardedContexts = new WeakMap();
+
+  static #guardedNamespaces = new WeakMap(); // namespace object -> its poisoned proxy (stable identity, zero steady-state allocation)
+
+  static #guardContext(context, namespace) {
+    if (context === null || typeof context !== 'object') return context;
+    let guarded = Resolver.#guardedContexts.get(context);
+    if (!guarded) {
+      const poison = () => {
+        throw new Error(`context.${namespace}.resolver is not accessible from event hooks — it is the transport's time-sensitive slot. Use event.resolver: participants (Emitter.on*) hold the carrying unit; observers (Emitter.observe*) hold the detached twin; use event.resolver.transaction() or event.resolver.detach() for new units of work.`);
+      };
+      const handler = {
+        get: (target, prop) => (prop === 'resolver' ? poison() : target[prop]),
+        set: (target, prop, value) => {
+          if (prop === 'resolver') poison();
+          target[prop] = value;
+          return true;
+        },
+      };
+      guarded = new Proxy(context, {
+        get: (target, prop) => {
+          const value = target[prop];
+          if (prop !== namespace || value === null || typeof value !== 'object') return value;
+          let ns = Resolver.#guardedNamespaces.get(value);
+          if (!ns) {
+            ns = new Proxy(value, handler);
+            Resolver.#guardedNamespaces.set(value, ns);
+          }
+          return ns;
+        },
+      });
+      Resolver.#guardedContexts.set(context, guarded);
+    }
+    return guarded;
+  }
+
   #isDetached = false; // true only on instances created BY detach() — they are their own twin
 
   getSchema() {
@@ -109,14 +157,14 @@ module.exports = class Resolver {
    * (committed state only); writes land immediately and unconditionally, outside any transaction
    * that may be ambient on this resolver, and therefore survive its rollback.
    *
-   * This is what the Emitter hands to basic-style (arity < 2) listeners in place of the ambient
+   * This is what the Emitter hands to OBSERVERS (Emitter.observe*) in place of the ambient
    * resolver: a fire-and-forget listener is structurally incapable of being awaited, so it can
    * never be a transaction participant — the unit of work is exactly what the mutation awaits.
    * Handing un-awaitable work a sessioned resolver made its writes race the carrying
    * transaction's settle for membership (sometimes in, sometimes silently dropped); detachment
    * turns that nondeterminism into a deterministic contract. A hook whose write must share the
-   * mutation's fate must be a participant: the next-style (arity >= 2) form, which still
-   * receives the ambient resolver.
+   * mutation's fate must be a participant (Emitter.on*), which still receives the ambient
+   * resolver.
    *
    * Unlike clone(), the detached twin gets FRESH DataLoaders: the ambient resolver's shared
    * cache can hold raw results fetched through an open transaction's session (uncommitted-view
@@ -614,7 +662,7 @@ module.exports = class Resolver {
     // toCacheKey() for memoization. Symbol key is invisible to spread/Object.keys/JSON.stringify
     // (same hygiene the old defineProperty pattern provided) and lets V8 keep the event
     // object's hidden class stable since the property is part of the initial object literal.
-    const event = { schema: this.#schema, context: this.#context, resolver: this, query, [$QUERY]: tquery };
+    const event = { schema: this.#schema, context: Resolver.#guardContext(this.#context, this.#schema.namespace), resolver: this, query, [$QUERY]: tquery };
 
     // pre* phase: preMutation + validate, both BEFORE the write. A failure here means the write
     // never even happened — always rollback-worthy. Wrapped in PreOperationError purely so a

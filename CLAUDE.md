@@ -161,6 +161,11 @@ rejections are deterministically swallowed (never an unhandled rejection), and t
 only; writes land immediately and survive any ambient rollback — see TRANSACTIONS.md §4.18). The
 unit of work is exactly what the mutation awaits: use the next-style (arity ≥ 2) form when a
 hook's failure must mean something or its writes must share the mutation's fate.
+Inside a hook, ALWAYS use `event.resolver` — `event.context[namespace].resolver` is **poisoned**
+(throws on access): the context slot is the transport's time-sensitive handle (the operation-scope
+wrapper swaps it per field), not the hook's; every hook intent has a first-class expression on
+`event.resolver` (itself, `.detach()`, `.transaction()`). Every other context property reads and
+writes straight through; `event.resolver.getContext()` reaches the real context object.
 
 `query` is the single source of truth. Key properties:
 

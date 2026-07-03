@@ -88,28 +88,53 @@ const normalizeOptions = (options) => {
   return options;
 };
 
-// Registration-time prep: swap the listener for a memoizing wrapper when opted in.
-// Priority is set on both the wrapper and the original listener so `#getListeners` can read
-// it through either side of the (potential) once-wrap that EventEmitter adds internally.
-const prepareListener = (listener, opts) => {
+// Registration-time prep: stamp the listener's ROLE and priority, and swap in a memoizing
+// wrapper when opted in. Priority/role are set on both the wrapper and the original listener so
+// `#getListeners` can read them through either side of the (potential) once-wrap that
+// EventEmitter adds internally.
+const prepareListener = (listener, opts, role) => {
   const priority = opts.priority ?? 0;
   let target = listener;
-  if (opts.memoize) target = listener.length < 2 ? wrapBasicMemoize(listener) : wrapNextMemoize(listener);
+  // Observers are always invoked in the (event)-only form, so they always take the basic-shaped
+  // memoize wrapper regardless of declared arity.
+  if (opts.memoize) target = (role === 'observer' || listener.length < 2) ? wrapBasicMemoize(listener) : wrapNextMemoize(listener);
   target.priority = priority;
-  if (target !== listener) listener.priority = priority;
+  target.$role = role;
+  if (target !== listener) {
+    listener.priority = priority;
+    listener.$role = role;
+  }
   return target;
 };
 
 /**
- * EventEmitter.
+ * EventEmitter with two explicit listener roles, declared at REGISTRATION (never inferred from
+ * a function's arity — parameter count is a call-convention detail, not a semantic contract):
  *
- * The difference is that I'm looking at each raw listeners to determine how many arguments it's expecting.
- * If it expects more than 1 we block and wait for it to finish.
+ *   PARTICIPANTS — `on()` / `once()` / `onModels()` / `onKeys()` / ... The event awaits them.
+ *     They receive the ambient `event.resolver` (transaction participants — their writes share
+ *     the unit's fate), their throw/rejection is the event's failure (aborts a carried unit —
+ *     see Resolver#createSystemEvent), and a non-undefined return value (sync or resolved)
+ *     SHORT-CIRCUITS the event with that value. Plain functions — sync or async; the legacy
+ *     AG15 done-callback form `(event, next)` is still honored by arity as a CALL CONVENTION
+ *     only (next(value) === return value).
+ *
+ *   OBSERVERS — `observe()` / `observeModels()` / `observeKeys()`. Fire-and-forget on every
+ *     event: never awaited, failures deterministically isolated (sync throws swallowed, async
+ *     rejections attached to a no-op handler — never an unhandled rejection), return values
+ *     ignored (an un-awaited value can never shape an awaited outcome), and they receive the
+ *     DETACHED resolver (no transaction scope, ever — reads see committed state, writes land
+ *     immediately and survive any ambient rollback; see Resolver#detach and TRANSACTIONS.md
+ *     §4.18). Un-awaitable code cannot be a transaction participant — the role makes that
+ *     safe by construction instead of by discipline.
+ *
+ * Dispatch: observers first (priority order), then participants initiated synchronously in one
+ * flat priority order. A participant's SYNC non-undefined return short-circuits immediately —
+ * later participants never initiate (the cheap-veto power). Async participants run concurrently;
+ * the first resolved non-undefined value wins the short-circuit race (as before).
  *
  * Memoization is handled at registration time (see `prepareListener`) — `emit()` itself has
- * zero memo-aware branching. Listeners that opt in to `{ memoize: true }` are swapped for a
- * memoizing wrapper of the right arity; everything else is registered as-is. The hot loop
- * stays a tight dispatch.
+ * zero memo-aware branching. The hot loop stays a tight dispatch.
  */
 class Emitter extends EventEmitter {
   #cache = new Map();
@@ -180,54 +205,75 @@ class Emitter extends EventEmitter {
 
   #getListeners(event) {
     if (!this.#cache.has(event)) {
-      const [basicFuncs, nextFuncs] = this.rawListeners(event).reduce((prev, wrapper) => {
+      const observers = [];
+      const participants = [];
+      this.rawListeners(event).forEach((wrapper) => {
         const { listener = wrapper } = wrapper;
         wrapper.priority = listener.priority ?? wrapper.priority ?? 0;
-        return prev[listener.length < 2 ? 0 : 1].push(wrapper) && prev;
-      }, [[], []]);
-      this.#cache.set(event, { basicFuncs: basicFuncs.sort(Emitter.sort), nextFuncs: nextFuncs.sort(Emitter.sort) });
+        // Call-convention flag (legacy AG15 done-callback form), NOT a semantic role.
+        wrapper.$useNext = listener.length >= 2;
+        if ((listener.$role ?? wrapper.$role) === 'observer') observers.push(wrapper);
+        else participants.push(wrapper);
+      });
+      this.#cache.set(event, { observers: observers.sort(Emitter.sort), participants: participants.sort(Emitter.sort) });
     }
     return this.#cache.get(event);
   }
 
   emit(event, data) {
-    const { basicFuncs, nextFuncs } = this.#getListeners(event);
+    const { observers, participants } = this.#getListeners(event);
 
     // No listeners → no work. Skip the Promise allocation and empty loops entirely.
-    if (basicFuncs.length === 0 && nextFuncs.length === 0) return Promise.resolve();
+    if (observers.length === 0 && participants.length === 0) return Promise.resolve();
 
-    return new Promise((resolve, reject) => {
-      // Basic functions run first; if they return a value they abort the flow of execution.
-      // An ASYNC basic listener is fire-and-forget by design (its promise is deliberately not
-      // awaited and never short-circuits) — but its rejection must still be attached to a handler:
-      // a discarded rejected promise is an unhandled rejection, which is fatal on modern Node.
-      // Deterministically swallowed (not raced into emit's own promise, which would surface the
-      // failure only when it happened to lose a timing race — worse than never). A listener that
-      // wants its async failure to MEAN something must use the next-style (arity >= 2) form.
-      //
-      // Basic listeners receive a DETACHED resolver (no transaction scope — see Resolver#detach)
-      // in place of the ambient one: being un-awaitable, they can never be transaction
-      // participants, so participant-grade session access was a category error — their writes
-      // raced the carrying transaction's settle for membership (sometimes in, sometimes silently
-      // dropped). Detached, their reads see committed state and their writes land immediately,
-      // unconditionally, and fate-independently. Next-style listeners — the participants — still
-      // get the ambient resolver and share the mutation's fate. Everything else on the event
-      // (query, context, ...) is shared by reference with the next-style listeners' event.
-      const basicData = basicFuncs.length && data?.resolver?.detach ? { ...data, resolver: data.resolver.detach() } : data;
-      basicFuncs.forEach((fn) => {
-        const value = fn(basicData);
-        if (value instanceof Promise) { value.catch(() => {}); return; }
-        if (value !== undefined) throw new AbortEarlyError(value);
+    // OBSERVERS first (priority order) — fire-and-forget, never awaited, never short-circuit,
+    // failures deterministically isolated (a discarded rejected promise would be an unhandled
+    // rejection — fatal on modern Node — so it gets a no-op handler; a sync throw is swallowed
+    // the same way, deterministically, never raced into the event's own outcome). They receive
+    // the DETACHED resolver (see Resolver#detach): un-awaitable code can never be a transaction
+    // participant, so participant-grade session access would make its writes race the carrying
+    // transaction's settle for membership. Everything else on the event (query, context, ...)
+    // is shared by reference with the participants' event.
+    if (observers.length) {
+      const observerData = data?.resolver?.detach ? { ...data, resolver: data.resolver.detach() } : data;
+      observers.forEach((fn) => {
+        try {
+          const value = fn(observerData);
+          if (value instanceof Promise) value.catch(() => {});
+        } catch { /* isolated by role — an observer's failure can never be the event's failure */ }
       });
+    }
 
-      // Next functions are async and control the timing of the next phase
-      Promise.all(nextFuncs.map((fn) => {
-        return new Promise((next, err) => {
-          Promise.resolve().then(() => fn(data, next)).catch(err);
-        }).then((result) => {
-          if (result !== undefined) throw new AbortEarlyError(result);
-        }).catch(reject);
-      })).then(() => resolve()); // Resolve to undefined
+    if (participants.length === 0) return Promise.resolve();
+
+    // PARTICIPANTS — initiated synchronously in one flat priority order. A SYNC non-undefined
+    // return short-circuits immediately (later participants never initiate — the cheap veto);
+    // a sync throw from a plain participant likewise aborts initiation (fail fast). Async
+    // participants (and legacy done-callback ones, whose sync throws are captured as their own
+    // rejection) run concurrently; the first RESOLVED non-undefined value wins the
+    // short-circuit race, and any rejection is the event's failure.
+    return new Promise((resolve, reject) => {
+      const pending = [];
+      participants.forEach((fn) => {
+        if (fn.$useNext) {
+          // Legacy AG15 call convention: (event, next) — next(value) === return value. An async
+          // listener's rejection lands on its RETURNED promise (it never calls next), so that
+          // promise must be chained into err or the pending promise would hang forever.
+          pending.push(new Promise((next, err) => {
+            try {
+              const r = fn(data, next);
+              if (r instanceof Promise) r.catch(err);
+            } catch (e) { err(e); }
+          }));
+        } else {
+          const value = fn(data);
+          if (value instanceof Promise) pending.push(value);
+          else if (value !== undefined) throw new AbortEarlyError(value);
+        }
+      });
+      Promise.all(pending.map(p => p.then((result) => {
+        if (result !== undefined) throw new AbortEarlyError(result);
+      }))).then(() => resolve(), reject);
     }).catch((e) => {
       if (e instanceof AbortEarlyError) return e.data;
       throw e;
@@ -235,7 +281,7 @@ class Emitter extends EventEmitter {
   }
 
   on(event, listener, options) {
-    const target = prepareListener(listener, normalizeOptions(options));
+    const target = prepareListener(listener, normalizeOptions(options), 'participant');
     this.#incGeneric(event);
     this.#invalidate(event);
     return super.on(event, target);
@@ -246,24 +292,43 @@ class Emitter extends EventEmitter {
   }
 
   once(event, listener, options) {
-    const target = prepareListener(listener, normalizeOptions(options));
+    const target = prepareListener(listener, normalizeOptions(options), 'participant');
     this.#incGeneric(event);
     this.#invalidate(event);
     return super.once(event, target);
   }
 
   prependListener(event, listener, options) {
-    const target = prepareListener(listener, normalizeOptions(options));
+    const target = prepareListener(listener, normalizeOptions(options), 'participant');
     this.#incGeneric(event);
     this.#invalidate(event);
     return super.prependListener(event, target);
   }
 
   prependOnceListener(event, listener, options) {
-    const target = prepareListener(listener, normalizeOptions(options));
+    const target = prepareListener(listener, normalizeOptions(options), 'participant');
     this.#incGeneric(event);
     this.#invalidate(event);
     return super.prependOnceListener(event, target);
+  }
+
+  /**
+   * Register an OBSERVER: fire-and-forget on every matching event — never awaited, failures
+   * isolated, return value ignored, detached resolver in `event.resolver`. Use for telemetry,
+   * audit, logging, and any side effect that must not share (or threaten) the mutation's fate.
+   */
+  observe(event, listener, options) {
+    const target = prepareListener(listener, normalizeOptions(options), 'observer');
+    this.#incGeneric(event);
+    this.#invalidate(event);
+    return super.on(event, target);
+  }
+
+  observeOnce(event, listener, options) {
+    const target = prepareListener(listener, normalizeOptions(options), 'observer');
+    this.#incGeneric(event);
+    this.#invalidate(event);
+    return super.once(event, target);
   }
 
   removeListener(event, listener) {
@@ -311,34 +376,48 @@ class Emitter extends EventEmitter {
    * Syntactic sugar to listen on query keys
    */
   onKeys(...args) {
-    return this.#createWrapper('key', false, ...args);
+    return this.#createWrapper('key', false, 'participant', ...args);
   }
 
   /**
    * Syntactic sugar to listen once on query keys
    */
   onceKeys(...args) {
-    return this.#createWrapper('key', true, ...args);
+    return this.#createWrapper('key', true, 'participant', ...args);
   }
 
   /**
    * Syntactic sugar to listen on query models
    */
   onModels(...args) {
-    return this.#createWrapper('model', false, ...args);
+    return this.#createWrapper('model', false, 'participant', ...args);
   }
 
   /**
    * Syntactic sugar to listen once on query models
    */
   onceModels(...args) {
-    return this.#createWrapper('model', true, ...args);
+    return this.#createWrapper('model', true, 'participant', ...args);
   }
 
-  #createWrapper(prop, once, eventName, arr, listener, options) {
+  /**
+   * Observer-role variants of onKeys/onModels (see observe()).
+   */
+  observeKeys(...args) {
+    return this.#createWrapper('key', false, 'observer', ...args);
+  }
+
+  observeModels(...args) {
+    return this.#createWrapper('model', false, 'observer', ...args);
+  }
+
+  #createWrapper(prop, once, role, eventName, arr, listener, options) {
     arr = Util.ensureArray(arr);
 
-    const wrapper = listener.length < 2 ? (event) => {
+    // Observers are always invoked (event)-only; participants keep their declared call
+    // convention (plain vs legacy done-callback) — the wrapper must mirror it so the emit
+    // dispatch reads the right convention off the wrapper's own arity.
+    const wrapper = (role === 'observer' || listener.length < 2) ? (event) => {
       if (arr.includes(`${event.query[prop]}`)) {
         if (once) this.removeListener(eventName, wrapper);
         return listener(event);
@@ -364,7 +443,7 @@ class Emitter extends EventEmitter {
     // super.on regardless of `once` — the wrapper itself self-removes on a matching emit,
     // which preserves the "only fires once on a MATCHING event" semantic. Using super.once
     // would let Node auto-remove on the first emit even when the model didn't match.
-    const target = prepareListener(wrapper, normalizeOptions(options));
+    const target = prepareListener(wrapper, normalizeOptions(options), role);
     this.#wrapperFilter.set(target, { prop, arr });
     this.#incFilter(eventName, prop, arr);
     this.#invalidate(eventName);

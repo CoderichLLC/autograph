@@ -1108,9 +1108,15 @@ is answered by which shape they wrote, not by timing.
 - The twin **cannot acquire a scope in place** (`transaction({ isolated: false })` throws on
   it); `.transaction()`/`.withTransaction()` still work — they scope a clone, which is the
   sanctioned way for a hook to run an explicit unit of work.
-- Enforcement is convention-strength: `context.autograph.resolver` (the ambient one) remains
-  reachable from any hook. `event.resolver` is the sanctioned path; going around it is opting out
-  of the guarantee explicitly.
+- Enforcement is mechanical, not convention: the context handed to events **poisons the
+  transport's resolver slot** — `event.context[namespace].resolver` throws on access (read or
+  write) with a message pointing at `event.resolver`. There is no legitimate hook-side use of the
+  slot: it is mutable and time-sensitive (the operation-scope wrapper swaps a txn clone in per
+  field — an un-awaited hook body could read the NEXT field's transaction and silently join the
+  wrong unit), while every hook intent has a first-class expression on `event.resolver` (itself,
+  `.detach()`, `.transaction()`, the arity choice). Only the event's view is guarded — the real
+  context object is untouched (transport code reads the live slot), every other context property
+  reads/writes straight through, and `event.resolver.getContext()` reaches the real object.
 - Pleasant consequence: the old `postCommit` gotcha ("a write through `event.resolver` throws —
   its scope has settled") dissolves for the fire-and-forget form, which is what most durability
   observers are (§4.14).

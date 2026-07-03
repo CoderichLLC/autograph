@@ -82,7 +82,7 @@ describe('Emitter', () => {
       expect(fn).toBeCalledTimes(1);
     });
 
-    test('order', async () => {
+    test('order: participants initiate in ONE flat registration/priority order — arity does not create phases', async () => {
       const fn1 = jest.fn();
       const fn2 = jest.fn((event, next) => next());
       const fn3 = jest.fn();
@@ -92,11 +92,73 @@ describe('Emitter', () => {
       await Emitter.emit('order');
       const [[order1], [order2], [order3]] = [fn1.mock.invocationCallOrder, fn2.mock.invocationCallOrder, fn3.mock.invocationCallOrder];
       expect(order1).toBeLessThan(order2);
-      expect(order1).toBeLessThan(order3);
-      expect(order2).toBeGreaterThan(order1);
-      expect(order2).toBeGreaterThan(order3);
-      expect(order3).toBeGreaterThan(order1);
-      expect(order3).toBeLessThan(order2);
+      expect(order2).toBeLessThan(order3);
+    });
+
+    test('order: observers initiate before participants, regardless of registration order', async () => {
+      const participant = jest.fn();
+      const observer = jest.fn();
+      Emitter.on('observerOrder', participant);
+      Emitter.observe('observerOrder', observer);
+      await Emitter.emit('observerOrder');
+      expect(observer.mock.invocationCallOrder[0]).toBeLessThan(participant.mock.invocationCallOrder[0]);
+    });
+  });
+
+  describe('Observers — fire-and-forget by role, not by arity', () => {
+    test('an observer\'s return value never short-circuits, and later participants still run', async () => {
+      const observer = jest.fn(() => ({ abort: 'ignored' }));
+      const participant = jest.fn();
+      Emitter.observe('obsNoAbort', observer);
+      Emitter.on('obsNoAbort', participant);
+      const value = await Emitter.emit('obsNoAbort');
+      expect(observer).toBeCalledTimes(1);
+      expect(participant).toBeCalledTimes(1);
+      expect(value).toBeUndefined();
+    });
+
+    test('an observer\'s SYNC throw is isolated — the event succeeds', async () => {
+      const observer = jest.fn(() => { throw new Error('observer boom'); });
+      const participant = jest.fn();
+      Emitter.observe('obsSyncThrow', observer);
+      Emitter.on('obsSyncThrow', participant);
+      await expect(Emitter.emit('obsSyncThrow')).resolves.toBeUndefined();
+      expect(participant).toBeCalledTimes(1);
+    });
+
+    test('an observer\'s ASYNC rejection is deterministically swallowed', async () => {
+      const observer = jest.fn(async () => { throw new Error('observer async boom'); });
+      Emitter.observe('obsAsyncThrow', observer);
+      await expect(Emitter.emit('obsAsyncThrow')).resolves.toBeUndefined();
+      expect(observer).toBeCalledTimes(1);
+    });
+
+    test('observeOnce fires exactly once', async () => {
+      const fn = jest.fn();
+      Emitter.observeOnce('obsOnce', fn);
+      await Emitter.emit('obsOnce');
+      await Emitter.emit('obsOnce');
+      expect(fn).toBeCalledTimes(1);
+    });
+
+    test('an observeModels listener filters by model and can be removed by its original reference', async () => {
+      const fn = jest.fn();
+      Emitter.observeModels('obsModels', ['M'], fn);
+      await Emitter.emit('obsModels', { query: { model: 'M' } });
+      await Emitter.emit('obsModels', { query: { model: 'miss' } });
+      expect(fn).toBeCalledTimes(1);
+      Emitter.removeListener('obsModels', fn);
+      await Emitter.emit('obsModels', { query: { model: 'M' } });
+      expect(fn).toBeCalledTimes(1);
+    });
+
+    test('an async PARTICIPANT\'s resolved value now short-circuits (return value === next(value))', async () => {
+      const fn1 = jest.fn(async () => ({ abort: 'async-participant' }));
+      const fn2 = jest.fn((event, next) => setImmediate(() => next()));
+      Emitter.on('asyncParticipantAbort', fn1);
+      Emitter.on('asyncParticipantAbort', fn2);
+      const value = await Emitter.emit('asyncParticipantAbort');
+      expect(value).toEqual({ abort: 'async-participant' });
     });
   });
 
@@ -186,8 +248,8 @@ describe('Emitter', () => {
       Emitter.on('basicThrow', fn2);
       await expect(Emitter.emit('basicThrow')).rejects.toThrow('bad');
       expect(fn1).toThrow('bad');
-      expect(fn2).toBeCalledTimes(0);
-      expect(fn3).toBeCalledTimes(0);
+      expect(fn2).toBeCalledTimes(0); // registered after fn1 — never initiated (fail fast)
+      expect(fn3).toBeCalledTimes(1); // registered BEFORE fn1 — flat order initiated it first
     });
 
     test('parallel nexts (the first to resolve wins)...', async () => {
