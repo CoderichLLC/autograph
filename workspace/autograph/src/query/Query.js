@@ -52,7 +52,7 @@ const createMergedProxy = (input, doc) => new Proxy(input, {
 // - input: undefined on reads (skipped by stringify), required to distinguish mutations
 // - session: DataLoaders are shared across a whole request, including with every isolated
 //   transaction cloned from it (see Resolver#clone) — an otherwise-identical read issued with a
-//   transaction's session attached (see Resolver#resolve's peekSession use) must not share a cache
+//   transaction's session attached (see Resolver#resolve) must not share a cache
 //   entry with the same read issued without one (or with a *different* session), or a transactional
 //   read's result leaks into a plain read that should never have been able to see it (or vice
 //   versa). Tagged via TransactionScope.tagSession — never the raw session, which for MongoDB has

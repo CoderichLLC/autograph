@@ -125,16 +125,17 @@ emitter.on('postRollback',({ schema, context, resolver, query }) => { ... }); //
 **`postCommit` / `postRollback` — the durable-outcome events.** `pre/postMutation` bracket the
 *write* (both run inside any ambient transaction and share its fate); `postCommit`/`postRollback`
 bracket the *transaction*. `postCommit` fires once per mutation when its write is truly durable —
-after the carrying transaction's real commit (a `*Many`/RI wrap's own commit, or the host's
-end-of-request `resolver.commit()` under `autoTransaction`), or immediately after the
+after the carrying transaction's real commit (a `*Many`/RI wrap's own commit, or the gqlMutation
+field scope's commit — per field, or at the hoisted operation's single commit under `@transaction`), or immediately after the
 `postResponse` phase for a write no transaction carried. `postRollback` is the compensation hook —
 the write succeeded but was then undone by its transaction rolling back. Use `postMutation` for
 anything that must share the mutation's fate (atomic follow-up writes via `event.resolver`,
 shaping `query.result`) or complete before the response; use `postCommit` only for irreversible
 external side effects (email, webhooks, queue publishes). Fire-and-forget semantics: they cannot
 shape the response, listener failures are isolated (never rejecting `commit()` or the mutation),
-and under `autoTransaction` a `postCommit` write through `event.resolver` throws (its scope has
-settled) — start a fresh unit with `event.resolver.transaction()` instead.
+and writes from inside them are new units of work: an arity<2 listener's `event.resolver` is
+detached (see below) so its writes just work; an arity>=2 listener under a carried scope holds
+the now-settled ambient resolver — start a fresh unit with `event.resolver.transaction()` there.
 
 **The events sort into three layers** (see TRANSACTIONS.md §4.15/§4.16). *DB layer*:
 `preMutation`/`validate` shape what lands in the database; `postMutation` participates in the
@@ -148,13 +149,18 @@ paths). *Durability layer*: `postCommit`/`postRollback` observe what became dura
 (`PreOperationError`). A `postMutation` failure — a *participant* failure — **aborts the whole
 transaction** when one carries the write (a plain `throw` is the abort signal, same as every DB
 trigger/ORM convention; opt into tolerance with your own `try/catch`); when nothing carries the
-write it is already durable, and the failure surfaces as `PostOperationError` with `.result`.
+write it is already durable, and the failure surfaces as `PostOperationError` with `.result`
+(via GraphQL this uncarried branch is rare — every gqlMutation is carried by its field scope;
+it mainly applies to direct agMutations in scripts/REPLs/background jobs).
 `preResponse`/`postResponse` failures — response-layer failures — are always `PostOperationError`
 (data committed, only response work failed; never rollback-worthy). `postCommit`/`postRollback`
 failures are isolated and cannot affect anything.
-Note: async **basic** (arity < 2) listeners are fire-and-forget on every event — their rejections
-are deterministically swallowed (never an unhandled rejection); use the next-style (arity ≥ 2)
-form when a hook's async failure must mean something.
+Note: **basic** (arity < 2) listeners are fire-and-forget observers on every event — their async
+rejections are deterministically swallowed (never an unhandled rejection), and they receive a
+**detached resolver** in `event.resolver` (no transaction scope, ever: reads see committed state
+only; writes land immediately and survive any ambient rollback — see TRANSACTIONS.md §4.18). The
+unit of work is exactly what the mutation awaits: use the next-style (arity ≥ 2) form when a
+hook's failure must mean something or its writes must share the mutation's fate.
 
 `query` is the single source of truth. Key properties:
 
@@ -249,7 +255,7 @@ Two independent mechanisms, both built on `TransactionScope`:
 
 - **Manual** — `resolver.transaction({ isolated = true, coupled = true })` / `.commit()` / `.rollback()`. An explicit "break out into my own transaction" demarcation. `isolated` clones the resolver (its own DataLoader cache); `coupled` (default) offers whatever's currently ambient to the driver as a parent and accepts whatever relationship comes back — pass `coupled: false` to force a wholly independent transaction regardless of driver capability.
 - **Automatic, always-on** — RI cascades (`onDelete: cascade/nullify/restrict`) and `*Many` batch ops (`createMany`/`updateMany`/`pushMany`/`pullMany`/`spliceMany`/`deleteMany`) are unconditionally wrapped in their own scope in `QueryResolver.js` (via `resolver.withTransaction()` — the same public API a manual caller uses), regardless of the flag below — autograph is both the opener and definitive closer of these bounded operations, so no external signal is needed.
-- **Automatic, opt-in** — `new Resolver({ autoTransaction: true })` gives the resolver its own root scope at construction (cheap — no driver session until the first write). Every operation for that resolver's lifetime (i.e. the whole request, given the one-`Resolver`-per-request convention) shares it once bound. Left opt-in because `Resolver` is also used in contexts with no "end of request" to hook (scripts, admin tools, REPL, background jobs) — the host **must** call `resolver.commit()`/`.rollback()` at a deterministic completion point (e.g. an Apollo Server `willSendResponse`/`didEncounterErrors` plugin) when this is enabled; there is no timing-heuristic auto-commit.
+- **Automatic, per-gqlMutation** — every root Mutation field (gqlMutation) is its own unit of work: `Schema#toObject()` wraps every root Mutation resolver (user-defined included, since user precedence is applied inside AG's resolver merge — see `OperationScope.js`) to run the field through `withTransaction()` against an isolated clone, swapping `context[namespace].resolver` to the clone for the duration (root mutation fields are spec-serial, so assign+restore is race-free). The field's write and its participant (postMutation) hooks share one transaction — a participant throw rolls the write back; commit lands before the field resolves. The caller-facing partial-success contract across fields is unchanged. agMutations (`resolver.match().save()` etc.) only ever JOIN an ambient scope, never create one. Annotating the operation `mutation @transaction { a, b, c }` (directive declared in framework typeDefs; name configurable) **escalates the unit of work from field to operation — the operation executes as if it were a single resolver**: the FIRST live root field's invocation HOISTS the entire unit, executing every live root selection sequentially (real resolver fns; args coerced from the document AST via graphql's `getArgumentValues`; faithful sibling `info`s; same-key selections deduped exactly like executor field merging) against one shared clone, then settles the transaction BEFORE returning anything — subsequent field invocations are replay stubs (recorded result, or recorded error at their own path). Because the unit's fate is sealed before any field materializes into `data`, `data` can never exhibit a rolled-back payload — regardless of field nullability (no designated committer, no settle-state short-circuit, no non-null interplay, no nullability restriction). A mid-operation response-layer (`PostOperationError`) failure no longer aborts: the hoist completes the unit and commits. **The response contract** (TRANSACTIONS.md §4.17): every wrapper-thrown error carries `extensions.{code, committed}` — `code` classifies the phase (`PRE_OPERATION_ERROR`/`POST_OPERATION_ERROR`/`MUTATION_ERROR`/`OPERATION_ABORTED`), `committed` is the unit's durable fate. Deliberately NO `result` extension — response payloads only flow through GraphQL completion (selection sets, custom resolvers, crud visibility); a committed-but-response-layer-failed field is `null` in `data` with `committed: true` on its error (refetchable). The invariant, no scenario-dependent readings: a populated `data` field is ALWAYS a real committed result. Hoist caveats: tracing attributes the unit's work to the first field; a non-null rollback surfaces at the FIRST field's path (cause embedded); schema-less direct invocations can't hoist and degrade to per-field units; `getArgumentValues` is graphql-realm-sensitive (dual-package hosts fail loud — rollback — never miscoerce). An already-open host scope makes the wrapper stand down. The request resolver is never scoped in place by autograph; a host that assembles its own executable schema scopes it itself with `transaction({ isolated: false })` and owns `commit()`/`rollback()` (TRANSACTIONS.md §4.4/§4.7). There is no `autoTransaction` flag or `enableAutoTransaction()` anymore, no lazy scopes (every scope binds a session on first use, read or write), and no timing-heuristic auto-commit anywhere.
 
 A scope only actually calls `client.transaction()` for data sources whose `supports` array includes `'transactions'` — sources that don't participate run exactly as if no scope existed. See `TransactionScope.js` for the identity-based coupled/independent mechanism.
 
@@ -308,5 +314,7 @@ function nextId() {
 - Fix `query.flags.debug` propagation (currently missing from cache hits and recursive mutation paths)
 - Embedded document pipeline events (`construct: 'createdBy'` etc. currently don't fire for embeds)
 - Rename `$field.fkField` → `$field.joinKey` for clarity (both `linkBy` and `fkField` default to `linkTo.pkField` but serve different purposes — `linkBy` is for virtual/reverse joins; `fkField`/`joinKey` is for persisted FK fields)
-- Tests overhaul: Scalar `@field()` coverage, re-enable/expand transaction test coverage (manual,
-  coupled vs. independent, RI/`*Many` atomicity, sibling-hook race under one scope)
+- Tests overhaul: Scalar `@field()` coverage still open. ~~Re-enable/expand transaction test
+  coverage~~ — done (manual, coupled vs. independent, RI/`*Many` atomicity, sibling-hook race,
+  settle-state, operation scope, detached resolvers; see `TransactionScope.test.js`,
+  `Resolver.test.js`, `OperationScope.test.js`, and the TestSuite "Transactions (auto)" section)

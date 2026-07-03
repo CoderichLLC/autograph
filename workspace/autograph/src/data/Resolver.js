@@ -36,18 +36,26 @@ module.exports = class Resolver {
   // meant every isolated transaction (i.e. every RI/*Many auto-wrap) paid for cold cache misses on
   // data the calling resolver may have already fetched moments earlier, for no correctness benefit
   // — transactional read visibility is governed entirely by which DB session a query uses (see
-  // TransactionScope#peekSession), not by which DataLoader instance served it. Sharing also means
+  // TransactionScope#getSession), not by which DataLoader instance served it. Sharing also means
   // `this.clear(model)` (already called unconditionally after every write) transparently
   // invalidates the calling resolver's view too, immediately — no separate propagation needed.
-  constructor({ schema, xschema, context, autoTransaction = false, register = true, dataLoaders }) {
+  constructor({ schema, xschema, context, register = true, dataLoaders }) {
     this.#schema = schema.parse?.() || schema;
     this.#xschema = xschema;
     this.#context = context;
     this.#dataLoaders = dataLoaders ?? this.#createDataLoaders();
-    this.#transactionScope = autoTransaction ? new TransactionScope() : undefined;
     this.model = this.match; // Alias
     if (register) Util.set(this.#context, `${this.#schema.namespace}.resolver`, this);
   }
+
+  // One detached (scope-less) twin per REQUEST, not per resolver instance — keyed by the shared
+  // #dataLoaders map, which is the one identity every clone of a request has in common (see
+  // clone()). Events fired from an RI/*Many wrap carry the txn CLONE as event.resolver; keying
+  // by the loaders map means clone.detach() and the root resolver's detach() return the same
+  // instance, which keeps Emitter memoization (keyed per resolver) stable across a request.
+  static #detachedResolvers = new WeakMap();
+
+  #isDetached = false; // true only on instances created BY detach() — they are their own twin
 
   getSchema() {
     return this.#schema;
@@ -73,11 +81,16 @@ module.exports = class Resolver {
 
   clear(model) {
     this.#dataLoaders[model].clearAll();
+    // The detached twin (see detach()) deliberately does NOT share this loaders map, so writes
+    // must invalidate its cache explicitly — keyed by the shared map, so a write through any
+    // clone of this request reaches the same detached instance.
+    Resolver.#detachedResolvers.get(this.#dataLoaders)?.clear(model);
     return this;
   }
 
   clearAll() {
     Object.values(this.#dataLoaders).forEach(loader => loader.clearAll());
+    Resolver.#detachedResolvers.get(this.#dataLoaders)?.clearAll();
     return this;
   }
 
@@ -89,6 +102,47 @@ module.exports = class Resolver {
       register: false,
       dataLoaders: this.#dataLoaders,
     });
+  }
+
+  /**
+   * The detached twin of this resolver — no transaction scope, ever. Reads are sessionless
+   * (committed state only); writes land immediately and unconditionally, outside any transaction
+   * that may be ambient on this resolver, and therefore survive its rollback.
+   *
+   * This is what the Emitter hands to basic-style (arity < 2) listeners in place of the ambient
+   * resolver: a fire-and-forget listener is structurally incapable of being awaited, so it can
+   * never be a transaction participant — the unit of work is exactly what the mutation awaits.
+   * Handing un-awaitable work a sessioned resolver made its writes race the carrying
+   * transaction's settle for membership (sometimes in, sometimes silently dropped); detachment
+   * turns that nondeterminism into a deterministic contract. A hook whose write must share the
+   * mutation's fate must be a participant: the next-style (arity >= 2) form, which still
+   * receives the ambient resolver.
+   *
+   * Unlike clone(), the detached twin gets FRESH DataLoaders: the ambient resolver's shared
+   * cache can hold raw results fetched through an open transaction's session (uncommitted-view
+   * data), which a sessionless consumer must never be served. Writes through any resolver of
+   * the request still invalidate the twin's cache (see clear()), so it never serves stale
+   * committed state either. Memoized per request — see #detachedResolvers.
+   */
+  detach() {
+    // A detached twin is its own twin — it can never acquire a scope, so events fired from its
+    // writes hand it straight back instead of minting a twin-of-twin. (A merely scope-LESS
+    // resolver doesn't qualify: the ambient resolver can acquire a scope mid-request — e.g. the
+    // operation scope — and a captured reference to it must not silently become transactional.)
+    if (this.#isDetached) return this;
+
+    let detached = Resolver.#detachedResolvers.get(this.#dataLoaders);
+    if (!detached) {
+      detached = new Resolver({
+        schema: this.#schema,
+        xschema: this.#xschema,
+        context: this.#context,
+        register: false,
+      });
+      detached.#isDetached = true;
+      Resolver.#detachedResolvers.set(this.#dataLoaders, detached);
+    }
+    return detached;
   }
 
   driver(model) {
@@ -121,39 +175,16 @@ module.exports = class Resolver {
   }
 
   /**
-   * This resolver's own TransactionScope, if any — set once, either by `autoTransaction` at
-   * construction, or by a prior `.transaction()`/`.withTransaction()` call on this exact
-   * reference, and never mutated again after that. Read directly (no ambient lookup) by
-   * `resolve()` and by QueryResolver's RI/*Many auto-wrap when it calls `.withTransaction()` on
-   * this resolver to find its parent.
+   * This resolver's own TransactionScope, if any — set by a prior
+   * `.transaction()`/`.withTransaction()` call on this exact reference (a host uses
+   * `transaction({ isolated: false })` for an in-place, whole-request scope — §4.7's escape
+   * hatch). Read directly (no ambient lookup) by `resolve()`, by QueryResolver's RI/*Many
+   * auto-wrap when it calls `.withTransaction()` on this resolver to find its parent, and by
+   * the operation-scope wrapper to detect a host-managed scope it must stand down for (see
+   * OperationScope.js).
    */
   get transactionScope() {
     return this.#transactionScope;
-  }
-
-  /**
-   * Retroactively turn on `autoTransaction` (§4.4) for this exact resolver reference, as if
-   * `{ autoTransaction: true }` had been passed to the constructor. Idempotent — a no-op if this
-   * resolver already has a scope (from the constructor, or an earlier call to this method).
-   *
-   * For "operation mode": a consumer that constructs one `Resolver` per request but only wants
-   * *some* requests to be transactional (e.g. a GraphQL operation with more than one top-level
-   * mutation field, wanting all-or-nothing semantics across them) can call this from a hook that
-   * runs after the operation is known but before any resolver has dispatched — e.g. Apollo
-   * Server's `didResolveOperation`, which fires after parsing/validation and before execution.
-   * Counting top-level mutation fields is transport-specific and deliberately NOT autograph's
-   * job; this method is the one piece of surface area autograph needs to expose for a host to
-   * build that decision on top of.
-   *
-   * Calling this AFTER something has already dispatched through this resolver does not
-   * retroactively cover whatever already ran non-transactionally — same as `autoTransaction` at
-   * construction, only operations from this point forward participate.
-   *
-   * @returns {Resolver} - this resolver, for chaining
-   */
-  enableAutoTransaction() {
-    this.#transactionScope ??= new TransactionScope();
-    return this;
   }
 
   /**
@@ -186,7 +217,11 @@ module.exports = class Resolver {
    *   concurrently with sibling code sharing this same resolver instance (e.g. two postMutation
    *   hooks on the same event) — mutating this resolver's own `#transactionScope` in place
    *   (isolated: false) is only safe when you know nothing else concurrently holds this exact
-   *   reference.
+   *   reference. `isolated: false` on a request resolver is the HOST escape hatch (§4.7): a host
+   *   that assembles its own executable schema (bypassing Schema#toObject's operation-scope
+   *   wrap) scopes the whole request in place this way, OWNS its settle (`commit()`/`rollback()`
+   *   at a deterministic completion point), and the operation-scope wrapper stands down whenever
+   *   it finds the resulting open scope.
    * @param {boolean} options.coupled - Offer this resolver's own scope as parent, accepting
    *   whatever relationship the driver hands back (default true) — on MongoDB that's always the
    *   same physical session, so rolling back propagates to the parent. Pass false to force a
@@ -201,20 +236,24 @@ module.exports = class Resolver {
     // would from then on reach only the new (coupled, no-op-commit) child, leaving the original
     // transaction unreachable and uncommitted until the driver's own timeout aborts it.
     if (!isolated && parent) throw new Error('Resolver already has an active transaction scope; transaction({ isolated: false }) would orphan it. Use isolated: true (the default), or settle the current transaction first.');
+    // The detached twin must never carry a scope in place — other fire-and-forget listeners
+    // share this exact instance; an explicit unit of work inside a hook uses the default
+    // (isolated) form, which scopes a CLONE.
+    if (!isolated && this.#isDetached) throw new Error('Cannot scope a detached resolver in place; use isolated: true (the default) for an explicit unit of work.');
     const target = isolated ? this.clone() : this;
-    // eager: true — an explicit transaction() call (this method, unlike autoTransaction's
-    // implicit whole-request root scope) binds a real session on its FIRST operation, read or
-    // write, not just its first write. You asked for a transaction; a plain BEGIN in any database
-    // starts a real one whether or not you end up writing — reads through it get real
-    // snapshot-isolated visibility for its whole lifetime, not just read-your-own-writes bolted
-    // onto whatever a write happened to bind. See Resolver#resolve's use of scope.eager.
-    target.#transactionScope = new TransactionScope({ parent: coupled ? parent : null, independent: !coupled, eager: true });
+    // Every scope binds a real session on its FIRST operation, read or write — not just its
+    // first write. You asked for a transaction; a plain BEGIN in any database starts a real one
+    // whether or not you end up writing — reads through it get real snapshot-isolated visibility
+    // for its whole lifetime, not just read-your-own-writes bolted onto whatever a write
+    // happened to bind. (A lazy variant — reads never bind — existed for the removed
+    // request-lifetime autoTransaction mode and died with it.)
+    target.#transactionScope = new TransactionScope({ parent: coupled ? parent : null, independent: !coupled });
     return target;
   }
 
   /**
-   * Commit this resolver's active transaction, if any. A no-op if `autoTransaction` was never
-   * enabled and `.transaction()` was never called (the common case for read-only requests).
+   * Commit this resolver's active transaction, if any. A no-op if this resolver never got a
+   * scope (`.transaction()` was never called on it — the common case for read-only requests).
    */
   commit() {
     return this.#transactionScope ? this.#transactionScope.commit() : Promise.resolve();
@@ -292,9 +331,9 @@ module.exports = class Resolver {
   async resolve(query) {
     const { doc, model, crud, isMutation, flags } = query.toObject();
 
-    // This resolver's own scope, set once (by `autoTransaction` at construction, or by a prior
-    // .transaction() call) and never mutated again after that — safe to read directly, no ambient
-    // lookup needed. Anything that wants a *different* scope (RI/*Many's auto-wrap, a manual
+    // This resolver's own scope (set by a prior .transaction() call — e.g. a gqlMutation's field
+    // clone, or a host's in-place transaction({ isolated: false })) — safe to read directly, no
+    // ambient lookup needed. Anything that wants a *different* scope (RI/*Many's auto-wrap, a manual
     // nested transaction) gets there by calling .transaction()/.withTransaction() on the specific
     // resolver reference it holds, the same way any caller would — see QueryResolver's #withTransaction usage.
     const scope = this.#transactionScope;
@@ -306,7 +345,7 @@ module.exports = class Resolver {
         const { client, supports } = this.#schema.models[model].source;
         const driverQuery = tquery.toDriver().toObject();
         // Only a data source that actually advertises transaction support participates in this
-        // resolver's scope — `autoTransaction`/`.transaction()` express intent, not capability a
+        // resolver's scope — a scope expresses intent, not capability a
         // given source doesn't have.
         const useScope = scope && supports.includes('transactions') ? scope : undefined;
 
@@ -375,14 +414,10 @@ module.exports = class Resolver {
         const { supports, client } = this.#schema.models[model].source;
         if (!supports.includes('transactions')) return dispatch();
 
-        // scope.eager (explicit transaction()/withTransaction() — manual, or the internal
-        // RI/*Many auto-wrap): binds a session on first use, read or write, so it gets a real,
-        // snapshot-isolated view for its whole lifetime. Otherwise (autoTransaction's implicit
-        // whole-request root scope): reads only reuse a session a write already bound (read-your-
-        // own-writes) — never trigger one themselves, so a read-only request stays free.
-        const sessionPromise = scope.eager ? scope.getSession(client) : Promise.resolve(scope.peekSession(client));
-
-        return sessionPromise.then((session) => {
+        // An open scope binds a session on first use, read or write, so it gets a real,
+        // snapshot-isolated view for its whole lifetime — a transaction's reads are part of the
+        // transaction, the same way BEGIN makes them in any database.
+        return scope.getSession(client).then((session) => {
           if (session) tquery.toObject().options = { ...tquery.toObject().options, session };
           return dispatch();
         });
@@ -631,9 +666,9 @@ module.exports = class Resolver {
       && (Emitter.hasListenersFor('postCommit', qModel, qKey) || Emitter.hasListenersFor('postRollback', qModel, qKey))) {
       const emitSettled = eventName => Promise.resolve().then(() => Emitter.emit(eventName, event)).catch(() => {});
       if (carried) {
-        // Defer to the session's true settle. Under autoTransaction that's the host's
-        // end-of-request commit; for an RI/*Many wrap it's the wrapper's own commit after every
-        // element's full lifecycle.
+        // Defer to the session's true settle. For a gqlMutation that's its field scope's commit
+        // (per field — or the LAST root field's, under @transaction); for an RI/*Many wrap it's
+        // the wrapper's own commit after every element's full lifecycle.
         this.#transactionScope.addSettled(this.#schema.models[qModel].source.client, outcome => emitSettled(outcome === 'commit' ? 'postCommit' : 'postRollback'));
       } else {
         // No transaction carried this write — it is already durable. Emitted at the END of the

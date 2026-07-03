@@ -102,32 +102,6 @@ describe('TransactionScope', () => {
     });
   });
 
-  describe('peekSession — read-your-own-writes without triggering a new session', () => {
-    test('returns undefined before any write has bound a session', () => {
-      const { client } = createMockClient();
-      const scope = new TransactionScope();
-      expect(scope.peekSession(client)).toBeUndefined();
-    });
-
-    test('returns the bound session once a write has claimed one, without opening another', async () => {
-      const { client } = createMockClient();
-      const scope = new TransactionScope();
-      const session = await scope.getSession(client);
-
-      expect(scope.peekSession(client)).toBe(session);
-      expect(client.transaction).toHaveBeenCalledTimes(1);
-    });
-
-    test('falls back to the parent scope when this scope has not claimed its own session yet', async () => {
-      const { client } = createMockClient();
-      const parentScope = new TransactionScope();
-      const parentSession = await parentScope.getSession(client);
-      const childScope = new TransactionScope({ parent: parentScope });
-
-      expect(childScope.peekSession(client)).toBe(parentSession);
-    });
-  });
-
   describe('commit()/rollback() only touch sessions this scope actually owns', () => {
     test('a coupled scope\'s commit() never calls the shared handle\'s commit() — only the real owner\'s does', async () => {
       const { client, handles } = createMockClient();
@@ -206,16 +180,6 @@ describe('TransactionScope', () => {
       await scope.rollback();
 
       expect(() => scope.enqueue(client, () => Promise.resolve())).toThrow(/already rolledBack/);
-    });
-
-    test('peekSession() hands out nothing once settled — a settled scope has no session to offer', async () => {
-      const { client } = createMockClient();
-      const scope = new TransactionScope();
-      const session = await scope.getSession(client);
-      expect(scope.peekSession(client)).toBe(session);
-
-      await scope.commit();
-      expect(scope.peekSession(client)).toBeUndefined();
     });
 
     test('joining (coupled) a parent that has already settled rejects clearly', async () => {

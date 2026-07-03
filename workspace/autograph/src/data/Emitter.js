@@ -204,8 +204,18 @@ class Emitter extends EventEmitter {
       // Deterministically swallowed (not raced into emit's own promise, which would surface the
       // failure only when it happened to lose a timing race — worse than never). A listener that
       // wants its async failure to MEAN something must use the next-style (arity >= 2) form.
+      //
+      // Basic listeners receive a DETACHED resolver (no transaction scope — see Resolver#detach)
+      // in place of the ambient one: being un-awaitable, they can never be transaction
+      // participants, so participant-grade session access was a category error — their writes
+      // raced the carrying transaction's settle for membership (sometimes in, sometimes silently
+      // dropped). Detached, their reads see committed state and their writes land immediately,
+      // unconditionally, and fate-independently. Next-style listeners — the participants — still
+      // get the ambient resolver and share the mutation's fate. Everything else on the event
+      // (query, context, ...) is shared by reference with the next-style listeners' event.
+      const basicData = basicFuncs.length && data?.resolver?.detach ? { ...data, resolver: data.resolver.detach() } : data;
       basicFuncs.forEach((fn) => {
-        const value = fn(data);
+        const value = fn(basicData);
         if (value instanceof Promise) { value.catch(() => {}); return; }
         if (value !== undefined) throw new AbortEarlyError(value);
       });

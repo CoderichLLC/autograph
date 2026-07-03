@@ -55,14 +55,6 @@ module.exports = () => describe('TestSuite', () => {
   beforeAll(() => {
     ({ resolver, ObjectId } = global);
     context = resolver.getContext();
-
-    // /**
-    //  * This is a concrete example of how to accidently use an expired session
-    //  * This bug has been fixed in Emitter.js to create a clone for "basic" functions
-    //  */
-    // Emitter.onModels('preMutation', ['Person'], (event) => {
-    //   event.resolver.match('Book').where({ name: 'nothing' }).save();
-    // });
   });
 
   describe('Create', () => {

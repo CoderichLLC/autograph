@@ -164,8 +164,9 @@ module.exports = class QueryResolver extends QueryBuilder {
   // to keep in sync with the "does this delete need transactional demarcation" decision.
   //
   // RI cascades are self-contained: autograph itself is both the opener and the definitive closer
-  // of this unit of work (unlike a whole GraphQL request, whose end AG cannot observe), so it's
-  // safe to unconditionally wrap them, regardless of `autoTransaction`. `this.#resolver.withTransaction`
+  // of this unit of work (the same principle the operation scope satisfies in-band at the GraphQL
+  // layer — see OperationScope.js), so it's
+  // safe to unconditionally wrap them. `this.#resolver.withTransaction`
   // is the exact same public method a manual caller uses — always `{ isolated: true }` (its
   // default), since this can be triggered from code sharing a resolver instance with concurrent
   // siblings (e.g. two postMutation hooks on the same event) and must never mutate that shared

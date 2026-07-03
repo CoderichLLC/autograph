@@ -14,7 +14,6 @@
 module.exports = class TransactionScope {
   parent;
   independent;
-  eager; // if true, reads bind a session too (getSession), not just writes — see Resolver#resolve
   #state = 'open'; // 'open' | 'committed' | 'rolledBack' — set exactly once, synchronously, by commit()/rollback()
   #settlement; // memoized commit()/rollback() promise — repeat calls return it rather than re-settling
   #pending = new Map(); // client -> Promise<Entry>, claimed synchronously — see #claim
@@ -60,17 +59,16 @@ module.exports = class TransactionScope {
     }
   }
 
-  constructor({ parent = null, independent = false, eager = false } = {}) {
+  constructor({ parent = null, independent = false } = {}) {
     this.parent = parent;
     this.independent = independent;
-    this.eager = eager;
   }
 
   /**
    * 'open' until commit()/rollback() is called on this scope, then 'committed'/'rolledBack' —
    * settled scopes refuse new sessions/operations (loud AG-level error instead of a raw driver
-   * "session ended" error) and hand out no sessions via peekSession (a read through a settled
-   * scope degrades to a plain, committed-state read — see Resolver#resolve).
+   * "session ended" error); a read through a settled scope degrades to a plain, committed-state
+   * read — see Resolver#resolve.
    */
   get state() {
     return this.#state;
@@ -115,15 +113,6 @@ module.exports = class TransactionScope {
   // which point #claim(client) has already resolved and populated #entries.
   #entry(client) {
     return this.#entries.get(client);
-  }
-
-  // Opportunistic, non-claiming lookup for reads: if a write earlier in this scope (or an
-  // ancestor it's coupled to) already bound a session for this client, reuse it (read-your-own-
-  // writes within the transaction) — but never trigger a new client.transaction() just to serve
-  // a read that would otherwise need none. A settled scope has no session to offer.
-  peekSession(client) {
-    if (this.#state !== 'open') return undefined;
-    return this.#entries.get(client)?.handle.session ?? this.parent?.peekSession(client);
   }
 
   // Every physical driver call funnels through here (via the static run() front door, or directly

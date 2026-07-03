@@ -161,7 +161,7 @@ describe('Resolver (transaction regressions)', () => {
     });
 
     // A transaction() call binds a session on its first operation — read or write — not just its
-    // first write (see TransactionScope#eager). Before this, a transaction that only reads never
+    // first write. Before this, a transaction that only reads never
     // bound any session at all, so it had no real snapshot: its "isolation" was an accident of a
     // DataLoader cache nothing else could reach, not a real guarantee. This asserts the real one.
     test('a read-only manual transaction keeps a consistent snapshot even after another transaction commits in the meantime', async () => {
@@ -265,7 +265,7 @@ describe('Resolver (transaction regressions)', () => {
     // calling resolver already fetched) and correctness: a resolver that already cached a doc must
     // not keep returning that stale copy after an isolated transaction commits a change to it.
     // Read visibility itself is governed entirely by which DB session a query uses (see
-    // TransactionScope#peekSession), not by which DataLoader instance served it — sharing the cache
+    // TransactionScope#getSession), not by which DataLoader instance served it — sharing the cache
     // doesn't change what's visible when, only whether a request has to re-fetch to see it.
     test('the resolver a transaction was cloned from does not see stale cached data after the transaction commits a change', async () => {
       const person = await resolver.match('Person').save({ name: 'cache-share-check', emailAddress: 'cache-share-check@example.com' });
@@ -301,64 +301,22 @@ describe('Resolver (transaction regressions)', () => {
     });
   });
 
-  describe('enableAutoTransaction() — retroactive "operation mode"', () => {
-    // Each test builds its own resolver (register: false, so it never hijacks
-    // context.autograph.resolver) rather than mutating the shared `global.resolver` — enabling
-    // autoTransaction on the shared instance would leak an unresolved transaction into every
-    // later test in this file, since nothing else would ever call .commit()/.rollback() on it.
+  describe('transaction({ isolated: false }) — the host escape hatch (in-place whole-request scope)', () => {
+    // A host that assembles its own executable schema (bypassing Schema#toObject's operation-
+    // scope wrap) scopes the whole request in place this way and owns commit()/rollback() at its
+    // own completion point (§4.7). The rollback side of that integration is covered end-to-end
+    // by OperationScope.test.js's host-managed test. Each test here builds its own resolver
+    // (register: false, so it never hijacks context.autograph.resolver) rather than mutating the
+    // shared `global.resolver` — an in-place scope on the shared instance would leak an
+    // unresolved transaction into every later test in this file.
     const freshResolver = () => new Resolver({ schema: resolver.getSchema(), context, register: false });
 
-    test('is a no-op if the resolver already has a scope (from the constructor)', () => {
-      const withAuto = new Resolver({ schema: resolver.getSchema(), context, register: false, autoTransaction: true });
-      const original = withAuto.transactionScope;
-      expect(withAuto.enableAutoTransaction()).toBe(withAuto); // returns this, for chaining
-      expect(withAuto.transactionScope).toBe(original); // same scope object, not replaced
-    });
+    test('commits multiple writes together when the host commits the request', async () => {
+      const txnResolver = freshResolver().transaction({ isolated: false });
+      expect(txnResolver).toBeInstanceOf(Resolver); // returns this, for chaining
 
-    test('is idempotent — calling it twice does not discard an already-bound session', async () => {
-      const txnResolver = freshResolver();
-      txnResolver.enableAutoTransaction();
-      const created = await txnResolver.match('Person').save({ name: 'op-mode-idempotent', emailAddress: 'op-mode-idempotent@example.com' });
-      const scopeAfterFirstWrite = txnResolver.transactionScope;
-
-      txnResolver.enableAutoTransaction(); // second call — must not reset anything
-      expect(txnResolver.transactionScope).toBe(scopeAfterFirstWrite);
-      expect(await txnResolver.match('Person').id(created.id).one()).not.toBeNull(); // still sees its own write
-
-      await txnResolver.rollback();
-    });
-
-    // The scenario that motivated this: a GraphQL operation with multiple top-level mutation
-    // fields (fully spec-sequential) whose caller wants all-or-nothing semantics across them,
-    // without the host having decided autoTransaction: true for every request up front. A host
-    // integration would call this from something like Apollo's didResolveOperation — which runs
-    // after the operation is parsed/validated but before any resolver dispatches — once it's
-    // determined the operation's shape warrants it (e.g. more than one top-level mutation field).
-    test('makes two otherwise-independent sequential mutations atomic together', async () => {
-      const txnResolver = freshResolver();
-      txnResolver.enableAutoTransaction();
-
-      // Field "a" of the operation.
-      const first = await txnResolver.match('Person').save({ name: 'op-mode-batch', emailAddress: 'op-mode-batch-a@example.com' });
-
-      // Field "b" of the operation — fails (duplicate name, unique index).
-      await expect(
-        txnResolver.match('Person').save({ name: 'op-mode-batch', emailAddress: 'op-mode-batch-b@example.com' }),
-      ).rejects.toThrow(/duplicate/gi);
-
-      // Host's error path (e.g. Apollo's didEncounterErrors -> resolver.rollback()).
-      await txnResolver.rollback();
-
-      // Field "a"'s write must NOT have stuck either — that's the whole point of operation mode.
-      expect(await resolver.match('Person').id(first.id).one()).toBeNull();
-    });
-
-    test('commits both fields together when the whole operation succeeds', async () => {
-      const txnResolver = freshResolver();
-      txnResolver.enableAutoTransaction();
-
-      const a = await txnResolver.match('Person').save({ name: 'op-mode-success-a', emailAddress: 'op-mode-success-a@example.com' });
-      const b = await txnResolver.match('Person').save({ name: 'op-mode-success-b', emailAddress: 'op-mode-success-b@example.com' });
+      const a = await txnResolver.match('Person').save({ name: 'host-hatch-a', emailAddress: 'host-hatch-a@example.com' });
+      const b = await txnResolver.match('Person').save({ name: 'host-hatch-b', emailAddress: 'host-hatch-b@example.com' });
       await txnResolver.commit();
 
       expect(await resolver.match('Person').id(a.id).one()).not.toBeNull();
@@ -368,13 +326,13 @@ describe('Resolver (transaction regressions)', () => {
       await resolver.match('Person').id(b.id).delete();
     });
 
-    test('calling it late does not retroactively cover a write that already ran non-transactionally', async () => {
+    test('scoping in place late does not retroactively cover a write that already ran non-transactionally', async () => {
       const txnResolver = freshResolver();
 
-      const before = await txnResolver.match('Person').save({ name: 'op-mode-too-late', emailAddress: 'op-mode-too-late@example.com' });
-      txnResolver.enableAutoTransaction(); // enabled AFTER the first write already committed on its own
+      const before = await txnResolver.match('Person').save({ name: 'host-hatch-late', emailAddress: 'host-hatch-late@example.com' });
+      txnResolver.transaction({ isolated: false }); // scoped AFTER the first write already committed on its own
 
-      const after = await txnResolver.match('Person').save({ name: 'op-mode-too-late-2', emailAddress: 'op-mode-too-late-2@example.com' });
+      const after = await txnResolver.match('Person').save({ name: 'host-hatch-late-2', emailAddress: 'host-hatch-late-2@example.com' });
       await txnResolver.rollback(); // only covers `after`
 
       expect(await resolver.match('Person').id(before.id).one()).not.toBeNull(); // unaffected — already committed
@@ -810,6 +768,132 @@ describe('Resolver (transaction regressions)', () => {
       await resolver.match('Book').id(book.id).delete();
       await resolver.match('Person').id(friend.id).delete();
       await resolver.match('Person').id(author.id).delete();
+    });
+  });
+
+  describe('detached resolvers — arity<2 listeners are never transaction participants', () => {
+    // The unit of work is exactly what the mutation awaits. A basic-style (arity < 2) listener
+    // is structurally incapable of being awaited, so it can never be a participant — the Emitter
+    // hands it a DETACHED resolver (no scope, sessionless reads of committed state, writes land
+    // immediately and fate-independently) instead of the ambient one. Next-style (arity >= 2)
+    // listeners remain participants and still receive the ambient resolver.
+    test('an arity<2 listener receives a detached, scope-less resolver; an arity>=2 listener receives the ambient one', async () => {
+      let basicResolver;
+      let nextResolver;
+      const basicHook = (event) => { basicResolver = event.resolver; };
+      const nextHook = (event, next) => { nextResolver = event.resolver; next(); };
+      Emitter.onModels('postMutation', ['Person'], basicHook);
+      Emitter.onModels('postMutation', ['Person'], nextHook);
+
+      try {
+        const txn = resolver.transaction();
+        await txn.match('Person').save({ name: 'detach-identity', emailAddress: 'detach-identity@example.com' });
+
+        expect(nextResolver).toBe(txn); // participant — shares the mutation's fate
+        expect(basicResolver).not.toBe(txn); // observer — detached
+        expect(basicResolver.transactionScope).toBeUndefined();
+        expect(basicResolver).toBe(resolver.detach()); // one stable twin per request, clone-agnostic
+
+        await txn.rollback();
+      } finally {
+        Emitter.removeListener('postMutation', basicHook);
+        Emitter.removeListener('postMutation', nextHook);
+      }
+    });
+
+    test('a detached write survives the carrying transaction\'s rollback (fate-independent by contract)', async () => {
+      let pendingWrite;
+      const hook = (event) => {
+        pendingWrite = event.resolver.match('Color').save({ type: 'red' });
+      };
+      Emitter.onModels('postMutation', ['Person'], hook);
+
+      try {
+        const txn = resolver.transaction();
+        const person = await txn.match('Person').save({ name: 'detach-survives', emailAddress: 'detach-survives@example.com' });
+        await txn.rollback();
+
+        const color = await pendingWrite; // deterministic — never raced the settle for membership
+        expect(await resolver.match('Person').id(person.id).one()).toBeNull(); // the mutation rolled back...
+        expect(await resolver.match('Color').id(color.id).one()).not.toBeNull(); // ...the detached write did not
+
+        await resolver.match('Color').id(color.id).delete();
+      } finally {
+        Emitter.removeListener('postMutation', hook);
+      }
+    });
+
+    test('detached reads see committed state only — never the open transaction\'s uncommitted writes', async () => {
+      let observed;
+      const hook = (event) => {
+        observed = event.resolver.match('Person').id(event.query.result.id).one();
+      };
+      Emitter.onModels('postMutation', ['Person'], hook);
+
+      try {
+        const txn = resolver.transaction();
+        await txn.match('Person').save({ name: 'detach-visibility', emailAddress: 'detach-visibility@example.com' });
+        expect(await observed).toBeNull(); // sessionless — the txn hasn't committed
+        await txn.rollback();
+      } finally {
+        Emitter.removeListener('postMutation', hook);
+      }
+    });
+
+    test('writes through any resolver of the request invalidate the detached twin\'s (separate) cache', async () => {
+      const detached = resolver.detach();
+      const color = await resolver.match('Color').save({ type: 'blue' });
+
+      // Prime the twin's own DataLoader cache with this exact query shape.
+      const primed = await detached.match('Color').id(color.id).one();
+      expect(primed.isDefault).toBeFalsy();
+
+      await resolver.match('Color').id(color.id).save({ isDefault: true });
+
+      const afterWrite = await detached.match('Color').id(color.id).one();
+      expect(afterWrite.isDefault).toBe(true); // not the stale primed copy
+
+      await resolver.match('Color').id(color.id).delete();
+    });
+
+    test('the detached twin can never acquire a scope in place — explicit units of work go through .transaction()', async () => {
+      const detached = resolver.detach();
+      expect(() => detached.transaction({ isolated: false })).toThrow(/detached/);
+      expect(detached.detach()).toBe(detached); // its own twin — no twin-of-twin chains
+
+      // The explicit path still works: .transaction() scopes a CLONE, never the twin itself.
+      const txn = detached.transaction();
+      expect(txn).not.toBe(detached);
+      expect(detached.transactionScope).toBeUndefined();
+      await txn.rollback();
+    });
+
+    test('a postCommit arity<2 listener can write through event.resolver without a fresh transaction() incantation', async () => {
+      // Previously documented gotcha: under a host-managed scope, a postCommit write through
+      // event.resolver threw (its scope had settled). Detachment dissolves it for the
+      // fire-and-forget form — the twin has no settled scope to trip over.
+      let pendingWrite;
+      const hook = (event) => {
+        pendingWrite = event.resolver.match('Color').save({ type: 'green' });
+      };
+      Emitter.onModels('postCommit', ['Person'], hook);
+
+      let person;
+      try {
+        const txn = resolver.transaction();
+        person = await txn.match('Person').save({ name: 'detach-postcommit', emailAddress: 'detach-postcommit@example.com' });
+        await txn.commit();
+      } finally {
+        // BEFORE the cleanup deletes — the delete's own postCommit would re-fire the hook and
+        // launch a stray fire-and-forget write racing the suite's afterAll disconnect.
+        Emitter.removeListener('postCommit', hook);
+      }
+
+      const color = await pendingWrite;
+      expect(await resolver.match('Color').id(color.id).one()).not.toBeNull();
+
+      await resolver.match('Color').id(color.id).delete();
+      await resolver.match('Person').id(person.id).delete();
     });
   });
 });

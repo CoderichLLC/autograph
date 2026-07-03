@@ -191,7 +191,7 @@ describe('Query', () => {
   describe('toCacheKey (regression)', () => {
     // Bug: DataLoaders are shared across a whole request, including with every isolated
     // transaction cloned from it (see Resolver#clone). Two otherwise-identical reads — one issued
-    // with a transaction's session attached (see Resolver#resolve's peekSession use), one without
+    // with a transaction's session attached (see Resolver#resolve), one without
     // — computed the SAME cache key, so a transactional read's result leaked into the shared
     // front-door DataLoader cache and was returned to a plain, non-transactional read for the same
     // query (and vice versa). Fixed by folding a stable session tag into the cache key.

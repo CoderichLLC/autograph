@@ -6,6 +6,7 @@ const Emitter = require('../data/Emitter');
 const createFrameworkTypeDefs = require('./SchemaDirectives');
 const { parseSchema, resolveNodeValue } = require('./SchemaParser');
 const { generateApi, getConnectionArguments } = require('./SchemaApi');
+const { wrapOperationScope } = require('./OperationScope');
 
 const interfaceKinds = [Kind.INTERFACE_TYPE_DEFINITION, Kind.INTERFACE_TYPE_EXTENSION];
 const modelKinds = [Kind.OBJECT_TYPE_DEFINITION, Kind.OBJECT_TYPE_EXTENSION].concat(interfaceKinds);
@@ -28,6 +29,7 @@ module.exports = class Schema {
     this.#config.directives.field ??= 'field';
     this.#config.directives.link ??= 'link';
     this.#config.directives.index ??= 'index';
+    this.#config.directives.transaction ??= 'transaction';
     this.#typeDefs = createFrameworkTypeDefs(this.#config.directives);
   }
 
@@ -239,7 +241,13 @@ module.exports = class Schema {
   toObject() {
     return {
       typeDefs: this.#typeDefs,
-      resolvers: this.#resolvers,
+      // Root Mutation resolvers (user-defined included — they were merged in with precedence
+      // above) leave here wrapped in the operation-scope decorator: a multi-root-field mutation
+      // operation carrying @transaction is one all-or-nothing unit of work, with no host
+      // integration. Without the directive the wrapper is a pure passthrough (spec-standard
+      // partial-success semantics). The wrap is unwrap-and-rewrap idempotent, so merge() paths
+      // that feed one Schema's toObject() into another cannot double-wrap. See OperationScope.js.
+      resolvers: wrapOperationScope(this.#resolvers, this.#config.namespace, this.#config.directives.transaction),
     };
   }
 

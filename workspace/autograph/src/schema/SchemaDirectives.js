@@ -2,7 +2,7 @@ const { parse } = require('graphql');
 const Pipeline = require('../data/Pipeline');
 
 module.exports = function createFrameworkTypeDefs(directives) {
-  const { model, field, link, index } = directives;
+  const { model, field, link, index, transaction } = directives;
 
   return parse(`
     scalar AutoGraphMixed
@@ -64,5 +64,12 @@ module.exports = function createFrameworkTypeDefs(directives) {
       on: [AutoGraphMixed!]!
       type: AutoGraphIndexEnum!
     ) repeatable on OBJECT
+
+    # Executable (request-document) directive — the caller's opt-in to operation-scope
+    # transactions: \`mutation @${transaction} { a, b, c }\` makes the operation's root mutation
+    # fields one all-or-nothing unit of work (see OperationScope.js). Declared here so document
+    # validation accepts it; without it on the operation, spec-standard partial-success
+    # semantics apply.
+    directive @${transaction} on MUTATION
   `);
 };
