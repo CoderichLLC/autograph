@@ -78,16 +78,20 @@ const walkSelectionSet = (selectionSet, fragments) => {
   return result;
 };
 
-// Memoized per `info` object: within one GraphQL request the same field resolver runs once per
-// parent — N DataLoader cache hits, each handed the SAME info — and the walk is identical every
-// time. The tree is read-only to every consumer (docTransform only reads fields/embedded), so
-// sharing it is safe; only doc INSTANCES must stay per-call. (modelName does not shape the
-// tree — the walk is selection-driven.)
+// Memoized per `info.fieldNodes` ARRAY, not per `info`: graphql-js builds a fresh info object
+// for every resolver invocation (N parents resolving the same link field = N distinct infos),
+// but it memoizes collectSubfields — so all N siblings share the fieldNodes array by IDENTITY
+// within a request. Keying on the array collapses those N identical walks to one, and the
+// per-request lifetime holds (fresh arrays per execution context; WeakMap entries GC with the
+// request). Infos sharing fieldNodes share fragments too (same document), so the walk inputs
+// are provably identical. The tree is read-only to every consumer (docTransform only reads
+// fields/embedded), so sharing it is safe; only doc INSTANCES must stay per-call. (modelName
+// does not shape the tree — the walk is selection-driven.)
 const selectionTrees = new WeakMap();
 
 exports.buildSelectionTree = (info, modelName) => {
   if (!info || !info.fieldNodes || !info.fieldNodes.length) return null;
-  if (selectionTrees.has(info)) return selectionTrees.get(info);
+  if (selectionTrees.has(info.fieldNodes)) return selectionTrees.get(info.fieldNodes);
   let out = null;
   try {
     const fragments = info.fragments || {};
@@ -104,7 +108,7 @@ exports.buildSelectionTree = (info, modelName) => {
   } catch {
     out = null;
   }
-  selectionTrees.set(info, out);
+  selectionTrees.set(info.fieldNodes, out);
   return out;
 };
 

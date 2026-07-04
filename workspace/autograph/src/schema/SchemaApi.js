@@ -238,7 +238,7 @@ function generateApi(schema) {
       Query: queryModels.reduce((prev, model) => {
         return Object.assign(prev, {
           [`get${model}`]: (doc, args, context, info) => context[schema.namespace].resolver.match(model).args(args).info(info).one({ required: true }),
-          [`find${model}`]: (doc, args, context, info) => context[schema.namespace].resolver.match(model).args(args).info(info).resolve(info),
+          [`find${model}`]: (doc, args, context, info) => context[schema.namespace].resolver.match(model).args(args).resolve(info),
         });
       }, {
         node: (doc, args, context, info) => {
@@ -277,7 +277,7 @@ function generateApi(schema) {
               [field]: (doc, args, context, info) => {
                 if (!doc.$) doc = context[schema.namespace].resolver.toResultSet(model, doc); // Ensure resultSet
                 const where = isVirtual ? { [linkBy]: doc[linkField] } : { [fkField]: doc[field] };
-                return context[schema.namespace].resolver.match(fieldModel).where(where).args(args).info(info).resolve(info);
+                return context[schema.namespace].resolver.match(fieldModel).where(where).args(args).resolve(info);
               },
             });
             // Interface models also need a __resolveType so GraphQL can pick the concrete type for

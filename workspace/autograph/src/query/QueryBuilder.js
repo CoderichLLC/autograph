@@ -45,6 +45,10 @@ module.exports = class QueryBuilder {
    * For use in GraphQL resolver methods to return the "correct" response
    */
   resolve(info) {
+    // The caller is returning this query as the field's result, so the field's selection set
+    // IS this model's selection — attach it so user-authored resolvers get selection-aware
+    // eager/lazy scheduling without needing to know about .info().
+    this.info(info);
     switch (getGQLReturnType(info)) {
       case 'array': return this.many();
       case 'number': return this.count();

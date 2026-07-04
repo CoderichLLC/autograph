@@ -44,7 +44,8 @@
     - cache hits returned the SAME object — caller mutations bled into every later read (violated the documented "safe to mutate" contract); first caller's selection shaping served to all; **`$`-magic bound to the ROOT resolver — `doc.$.save()` on a doc read through a txn clone ESCAPED the transaction**
     - now: cache stores raw rows; transform runs per call with the CALLING resolver + calling query's info; array fields shallow-copied out of the raw row (deep-mutation isolation)
     - cost: cache hits re-run deserialize/docTransform (the price of the contract; a derived memo layer is the future optimization if measured)
-    - offsets: `buildSelectionTree` memoized per `info` object (same field resolver × N parents = one walk); QueryPlanner internal reads no longer narrow `.select()` (internal reads are SUPERSET — pre-queries share one cache identity + merge bucket with same-shaped user reads; select-islands eliminated)
+    - `QueryBuilder.resolve(info)` now self-attaches its `info` (the field's selection IS the model's selection at that terminal) — user-authored resolvers ending in `.resolve(info)` get selection-aware eager/lazy scheduling for free; bare `.one()`/`.many()` terminals remain all-lazy (correct, unoptimized)
+    - offsets: `buildSelectionTree` memoized per `info.fieldNodes` array (graphql-js memoizes collectSubfields, so N sibling parents share the array by identity — N walks collapse to one; per-`info` keying would never hit, since graphql builds a fresh info per invocation); QueryPlanner internal reads no longer narrow `.select()` (internal reads are SUPERSET — pre-queries share one cache identity + merge bucket with same-shaped user reads; select-islands eliminated)
   - PostgresDriver: production-pure (all pg-mem emulation moved to test harness `PgMemShim`); real `BEGIN ISOLATION LEVEL REPEATABLE READ` + native rollback
 
 ## v0.15.x (BREAKING)

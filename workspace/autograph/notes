@@ -1,33 +1,18 @@
 Known Issues:
-  * Transactions (currently removed)
-    - Very tricky to get right
-    - MutateMany should NOT be a transaction of multiple MutateOnes - need to refactor
-    - Trying to re-use a non-isolated transaction runs into race conditions:
-      * The moment a transaction/session is created on the Resolver it opens up other queries to "hop" onto the transaction in an uncontrolled/adhoc manner
-  * There is a potential race condition/issue when using $magic methods... I'm seeing Transaction committed/aborted messages when using them in nested transactions
-    - Currently not in use
-    - Possibly due to Transaction issue (currently removed)
   * Schema/Resolver not capable of handling intersection tables (eg. TST Audience/Contact)
   * MongoClient - not all queries (mutations) go through $aggregateQuery and so you lose things like $project the result
   * You only need to $addFields for mongo regex when it's not already a String (eg. Boolean)
   * Tests overhaul
     - Need to make sure that Scalar @field() is working
-    - Failing tests are blowing up due to Jest and Circular Reference
-      * This may be because of messed up Transactions
   * .flags({ debug: true })
     - You will never see debug info when the result is cached and no driver called
     - query.flags.debug should not be at driver level
     - debug flag is not always propagated (findMany, pullMany, etc)
 
 Improvement Considerations:
-  * Proxy transformations
   * Resolver.graphql()
     - This requires executableSchema...
   * Ability to trigger validation?
-  * Easy select('a b c d') syntax
-    - GraphQL API passes in .args() and only selects what it needs.... is this ok for DataLoader Cache?
-    - I disabled it... when selecting "count" only there are problems
-  * Can you derive transaction support by virtue of function definition existing?
   * There are times you may NOT want resolver to CRUD an attribute
     - eg. NetworkPlace.parent should be set via meta because of side-effects
   * Upsert???
@@ -39,7 +24,6 @@ Improvement Considerations:
     - Transactions
     - Batches
     - Referential Integrity (no need to ensureId)
-    - Composite index keys (probably need to move these tests elsewhere)
   * Allow @field(path: "some.path") in order to hoist
   * Support for GUID (node interface)
     - autograph.legacyMode (move to config)
