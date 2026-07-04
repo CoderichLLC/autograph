@@ -36,7 +36,7 @@ exports.setup = async () => {
       }
     },
     dataSource: {
-      supports: ['transactions'],
+      supports: ['transactions', 'joins'],
       client: global.mongoClient,
     },
   }));

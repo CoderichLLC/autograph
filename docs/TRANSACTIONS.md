@@ -272,7 +272,11 @@ resolvers do run) stands down when it finds the open scope.
 - Per-source capability is still respected underneath: `scope.getSession()` still checks
   `dataSource.supports.includes('transactions')` for the specific client involved and falls back to
   a no-op stub for sources that don't support it. A scope expresses *intent*; it does not force
-  capability a given source doesn't have.
+  capability a given source doesn't have. `supports` is **consumer-declared** (never probed — the
+  consumer knows both the driver and the deployment; the same MongoDriver is transactional on a
+  replica set and not on a standalone) and defaults to `[]`. The tooth of declaring no support:
+  writes through a scope dispatch sessionless and are durable when awaited (uncarried semantics),
+  `commit()` is a no-op, and **`rollback()` cannot undo anything** — declared is consented.
 
 ### 4.5 RI and `*Many`: always-on, unconditional, self-contained transactions — via the *same* public API a manual caller uses
 

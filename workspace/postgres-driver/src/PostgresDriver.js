@@ -96,6 +96,42 @@ module.exports = class PostgresDriver {
     );
   }
 
+  // No real SAVEPOINT support yet — when offered a parent handle (an ambient scope this call is
+  // nested under), hand it back unchanged rather than silently opening a second, unrelated
+  // transaction. TransactionScope reacts to that identity (handle === parentHandle) to know this
+  // is a coupled/shared-fate relationship. A future revision could implement real nested
+  // transactions via SAVEPOINT/RELEASE SAVEPOINT and return a distinct handle instead.
+  transaction(parentHandle) {
+    if (parentHandle) return Promise.resolve(parentHandle);
+
+    // A Postgres transaction IS a dedicated connection running BEGIN..COMMIT/ROLLBACK — the
+    // opaque session token AG threads back (query.options.session) is simply "which executor to
+    // call .query() on" (see #run). REPEATABLE READ gives true snapshot isolation natively:
+    // reads see a stable snapshot from transaction start, other transactions' uncommitted (and
+    // post-snapshot committed) writes are invisible, and concurrent-write conflicts surface as
+    // 'could not serialize access' — which execute()'s retry exists for.
+    return this.#pool.connect().then((client) => {
+      const level = this.#config.transaction?.isolationLevel ?? 'REPEATABLE READ';
+      return client.query(`BEGIN ISOLATION LEVEL ${level}`).then(() => {
+        let closed = false;
+        const session = { query: (...args) => client.query(...args) };
+
+        // Because we allow queries in parallel we want to prevent calling this more than once.
+        const close = (cmd) => {
+          if (closed) return Promise.resolve();
+          closed = true;
+          return client.query(cmd).finally(() => client.release());
+        };
+
+        return Object.defineProperties({}, {
+          session: { value: session, enumerable: true },
+          commit: { value: () => close('COMMIT') },
+          rollback: { value: () => close('ROLLBACK') },
+        });
+      });
+    });
+  }
+
   async findOne(plan) {
     const hasExtra = plan.arrayJoins?.length || plan.jsFilters?.length || plan.deduplicateByPk;
     const builder = hasExtra ? plan.sql : plan.sql.limit(1);
@@ -199,42 +235,6 @@ module.exports = class PostgresDriver {
   }
 
   disconnect() { return this.#pool.end(); }
-
-  // No real SAVEPOINT support yet — when offered a parent handle (an ambient scope this call is
-  // nested under), hand it back unchanged rather than silently opening a second, unrelated
-  // transaction. TransactionScope reacts to that identity (handle === parentHandle) to know this
-  // is a coupled/shared-fate relationship. A future revision could implement real nested
-  // transactions via SAVEPOINT/RELEASE SAVEPOINT and return a distinct handle instead.
-  transaction(parentHandle) {
-    if (parentHandle) return Promise.resolve(parentHandle);
-
-    // A Postgres transaction IS a dedicated connection running BEGIN..COMMIT/ROLLBACK — the
-    // opaque session token AG threads back (query.options.session) is simply "which executor to
-    // call .query() on" (see #run). REPEATABLE READ gives true snapshot isolation natively:
-    // reads see a stable snapshot from transaction start, other transactions' uncommitted (and
-    // post-snapshot committed) writes are invisible, and concurrent-write conflicts surface as
-    // 'could not serialize access' — which execute()'s retry exists for.
-    return this.#pool.connect().then((client) => {
-      const level = this.#config.transaction?.isolationLevel ?? 'REPEATABLE READ';
-      return client.query(`BEGIN ISOLATION LEVEL ${level}`).then(() => {
-        let closed = false;
-        const session = { query: (...args) => client.query(...args) };
-
-        // Because we allow queries in parallel we want to prevent calling this more than once.
-        const close = (cmd) => {
-          if (closed) return Promise.resolve();
-          closed = true;
-          return client.query(cmd).finally(() => client.release());
-        };
-
-        return Object.defineProperties({}, {
-          session: { value: session, enumerable: true },
-          commit: { value: () => close('COMMIT') },
-          rollback: { value: () => close('ROLLBACK') },
-        });
-      });
-    });
-  }
 
   // Execute a knex builder using session (transaction client) or pool.
   #run(builder, session) {

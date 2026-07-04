@@ -49,6 +49,34 @@ module.exports = class MongoDriver {
     return Util.promiseRetry(() => this[plan.op](plan), 5, 5, e => e.hasErrorLabel && e.hasErrorLabel('TransientTransactionError'));
   }
 
+  // MongoDB has no savepoint primitive — a session supports exactly one active transaction, so
+  // there is no such thing as a "child" session. When offered a parent handle ({ session, commit,
+  // rollback }), we simply hand it back unchanged: TransactionScope reacts to that identity
+  // (handle === parentHandle) to know this is a coupled/shared-fate relationship, not a real
+  // nested transaction. Never invoked with a parent unless something ambient already exists
+  // (the operation scope, a manual transaction, or an RI/*Many wrap) — see TransactionScope#getHandle.
+  transaction(parentHandle) {
+    if (parentHandle) return Promise.resolve(parentHandle);
+
+    return this.#connection.then((client) => {
+      let closed = false;
+      const session = client.startSession(this.#config.session);
+      session.startTransaction(this.#config.transaction);
+
+      // Because we allow queries in parallel we want to prevent calling this more than once
+      const close = (operator) => {
+        if (!closed) return (closed = true && session[operator]().finally(() => session.endSession()));
+        return Promise.resolve();
+      };
+
+      return Object.defineProperties({}, {
+        session: { value: session, enumerable: true },
+        commit: { value: () => close('commitTransaction') },
+        rollback: { value: () => close('abortTransaction') },
+      });
+    });
+  }
+
   findOne(plan) {
     return this.collection(plan.model).aggregate(plan.$aggregate, plan.options).then(cursor => cursor.next());
   }
@@ -91,34 +119,6 @@ module.exports = class MongoDriver {
 
   disconnect() {
     return this.#connection.then(client => client.close());
-  }
-
-  // MongoDB has no savepoint primitive — a session supports exactly one active transaction, so
-  // there is no such thing as a "child" session. When offered a parent handle ({ session, commit,
-  // rollback }), we simply hand it back unchanged: TransactionScope reacts to that identity
-  // (handle === parentHandle) to know this is a coupled/shared-fate relationship, not a real
-  // nested transaction. Never invoked with a parent unless something ambient already exists
-  // (the operation scope, a manual transaction, or an RI/*Many wrap) — see TransactionScope#getHandle.
-  transaction(parentHandle) {
-    if (parentHandle) return Promise.resolve(parentHandle);
-
-    return this.#connection.then((client) => {
-      let closed = false;
-      const session = client.startSession(this.#config.session);
-      session.startTransaction(this.#config.transaction);
-
-      // Because we allow queries in parallel we want to prevent calling this more than once
-      const close = (operator) => {
-        if (!closed) return (closed = true && session[operator]().finally(() => session.endSession()));
-        return Promise.resolve();
-      };
-
-      return Object.defineProperties({}, {
-        session: { value: session, enumerable: true },
-        commit: { value: () => close('commitTransaction') },
-        rollback: { value: () => close('abortTransaction') },
-      });
-    });
   }
 
   static ObjectId = ObjectId;

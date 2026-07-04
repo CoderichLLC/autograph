@@ -54,6 +54,16 @@ function findModelPathsToField($schema, model, field) {
  * Parse typeDefs into a schema POJO. Returns { schema, typeDefs } where typeDefs is the
  * crud-pruned AST used for makeExecutableSchema (fields without 'r' in crud are removed).
  */
+// Consumer-declared capabilities — the consumer knows both the driver AND the deployment (the
+// same MongoDriver is transactional on a replica set and not on a standalone), so capability is
+// declared, never probed. Absent `supports` means []: the safest fully-functional fallbacks
+// everywhere (sessionless writes, QueryPlanner-resolved joins). Normalized in place — sources
+// are shared config objects, so every model attaching the same source sees the same array.
+const normalizeSource = (source) => {
+  if (source) source.supports ??= [];
+  return source;
+};
+
 function parseSchema(config, typeDefs) {
   const { directives, namespace } = config;
   const $schema = { models: {}, enums: {}, scalars: {}, indexes: [], namespace };
@@ -79,7 +89,7 @@ function parseSchema(config, typeDefs) {
           pkField: 'id',
           isEmbedded: true,
           isPersistable: true,
-          source: config.dataSources?.default,
+          source: normalizeSource(config.dataSources?.default),
           loader: config.dataLoaders?.default,
           generator: config.generators?.default,
           pipelines: pipelines.reduce((prev, key) => Object.assign(prev, { [key]: [] }), {}),
@@ -160,7 +170,7 @@ function parseSchema(config, typeDefs) {
               break;
             }
             case `${directives.model}-source`: {
-              model.source = config.dataSources?.[value];
+              model.source = normalizeSource(config.dataSources?.[value]);
               break;
             }
             case `${directives.model}-loader`: {

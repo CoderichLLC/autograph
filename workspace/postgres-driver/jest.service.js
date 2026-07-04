@@ -96,7 +96,7 @@ exports.setup = async () => {
       return value || nextId();
     },
     dataSource: {
-      supports: ['transactions'],
+      supports: ['transactions', 'joins'],
       client: global.postgresClient,
     },
   });

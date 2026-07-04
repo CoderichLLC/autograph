@@ -32,6 +32,14 @@
   - **`resolver.driver()` REMOVED** — use the vocabulary, `flags.native`, or your own client instance; TestSuite raw verification via test-harness `global.rawDriver`
   - **`Resolver.$loader` / `resolver.loader()` REMOVED** — a process-global, args-only-keyed, indefinite cache is unsound under transactions (caches provisional/rolled-back data; bleeds across contexts); per-model DataLoader covers batching, cross-request memoization belongs to the app
   - Driver contract changes (pre-publication): `driver(name)` no longer required; where operators arrive INTACT (never pre-flattened — drop reconstruction); vocabulary conformance section in TestSuite
+  - `dataSource.supports` HONORED with graceful fallbacks (consumer-declared; absent = `[]`; nothing throws except one loud edge)
+    - **MIGRATION: `'joins'` was previously unread (drivers joined regardless) — add it to existing configs (`supports: ['transactions', 'joins']`) or join-shaped queries downgrade to the planner fallback (correct but slower; unliftable paths reject)**
+    - no `'transactions'` → scopes inert for that source: sessionless writes (durable when awaited, uncarried semantics), `commit()` no-op, **`rollback()` cannot undo** (declared = consented)
+    - no `'joins'` → QueryPlanner resolves join-shaped where/sort (pre-query → `$in`; in-memory joined sort — correctness-first, not perf-neutral); drivers never receive `query.joins`
+    - WHERE lifts cover FK sub-paths (both link directions), embedded-prefix stored FKs (`pins.writer.name` → inject at local `pins.writer`), and bare virtual equality (`{ articles: id }` → foreign-pk condition); injected values re-ride the where pipelines (fixes latent string-vs-ObjectId mismatch in the cross-source path too)
+    - LOUD edges (reject, never silent over-matching): join-shaped SORT deeper than a first-segment FK (multi-valued — ill-defined) and WHERE on a virtual link behind an embedded prefix (no local column)
+    - `batches`/`referentialIntegrity` flag names dropped (declared/read nowhere)
+    - fixes latent crash: a source with NO `supports` key TypeError'd on its first scoped operation (i.e. every gqlMutation)
   - PostgresDriver: production-pure (all pg-mem emulation moved to test harness `PgMemShim`); real `BEGIN ISOLATION LEVEL REPEATABLE READ` + native rollback
 
 ## v0.15.x (BREAKING)

@@ -4,17 +4,27 @@ const Util = require('@coderich/util');
 const CHUNK_SIZE = 500;
 
 /**
- * QueryPlanner — cross-source join resolution.
+ * QueryPlanner — driver-less join resolution.
  *
- * When a query spans multiple data sources (e.g. Book on Postgres, Person on MongoDB),
- * a driver-level join is impossible. QueryPlanner intercepts those queries and resolves
- * them transparently through a two-phase pipeline:
+ * A driver-level join is impossible in two cases, and BOTH ride the same two-phase pipeline:
+ *   - CROSS-SOURCE: the query spans data sources (e.g. Book on Postgres, Person on MongoDB)
+ *   - CAPABILITY: the root model's source does not declare 'joins' in `supports` — the
+ *     consumer's statement (they know the driver AND the deployment) that the driver must
+ *     never receive `query.joins`. Honored, never thrown: the fallback is fully functional.
  *
- *   Phase 1 (pre):  cross-source WHERE paths → pre-query the foreign source → inject $in
- *   Phase 2 (post): cross-source SORT paths  → batch-fetch sort values    → in-memory sort + paginate
+ *   Phase 1 (pre):  driver-less WHERE paths → pre-query the join target → inject $in
+ *   Phase 2 (post): driver-less SORT paths  → batch-fetch sort values  → in-memory sort + paginate
  *
- * Same-source WHERE/SORT/limit/skip are passed through to the driver unchanged.
- * Drivers never see any cross-source artefacts.
+ * Driver-joinable WHERE/SORT/limit/skip are passed through to the driver unchanged.
+ * Drivers never see any artefact of either case. (Historical naming: plan fields say
+ * `crossSource*` — read as "planner-resolved".) WHERE lifts cover FK-first-segment sub-paths,
+ * embedded-prefix stored FKs ('pins.writer.name' → inject at the local 'pins.writer' column),
+ * and bare virtual equality ('articles' → condition on the foreign pk). The loud edges — cases
+ * that REJECT on a joins-incapable source rather than letting the driver silently drop the
+ * constraint: a WHERE on a virtual link behind an embedded prefix (no local column to inject
+ * at), and any join-shaped SORT deeper than a first-segment FK (sorting by a multi-valued
+ * joined attribute is ill-defined). NOTE the in-memory sort fallback is correctness-first,
+ * not perf-neutral: it fetches the full unpaginated result to sort/paginate in process.
  */
 module.exports = class QueryPlanner {
   #schema;
@@ -74,30 +84,62 @@ module.exports = class QueryPlanner {
     const flatWhere = Util.flatten(where, { safe: true });
     const flatSort = Util.flatten(sort, { safe: true });
 
-    // WHERE: group cross-source FK sub-path conditions by the FK field name
+    // Joins execute in the ROOT source's driver ($lookup / SQL JOIN on the root table), so the
+    // capability that decides planner-vs-driver is the ROOT source's. A sourceless model (bare
+    // test schemas) keeps the legacy driver path.
+    const rootJoins = !rootSource || rootSource.supports.includes('joins');
+
+    // WHERE: group planner-resolved conditions by their FK prefix. The FK segment may sit past
+    // an EMBEDDED prefix ('pins.writer.name' — Pin embedded on Writer, Pin.writer the FK): the
+    // walk finds the first FK/virtual segment, and the lift injects at the full prefix path
+    // ('pins.writer' is a real local column on the embedded docs). A BARE virtual path
+    // ('articles' with no sub-path) lifts too — its condition is the foreign model's own pk.
     const whereGroupsByField = {};
     const sameSourceWhere = {};
 
     for (const [path, value] of Object.entries(flatWhere)) {
-      const [fieldName, ...subParts] = path.split('.');
-      const field = model.fields[fieldName];
+      const segments = path.split('.');
 
-      // Only pre-query when filtering BY a property of the related model (sub-path present)
-      if (!field?.isFKReference || !subParts.length || !field.model?.source || field.model.source === rootSource) {
+      // Walk to the first FK/virtual segment (embedded prefixes pass through; unknown/operator
+      // segments end the walk — they can never lead to an FK).
+      let fkIndex = -1;
+      let fkField = null;
+      for (let i = 0; i < segments.length; i += 1) {
+        let f;
+        try { f = model.resolvePath(segments.slice(0, i + 1).join('.')); } catch { break; }
+        if (!f) break;
+        if (f.isVirtual || f.isFKReference) { fkIndex = i; fkField = f; break; }
+      }
+
+      const foreignSource = fkField?.model?.source;
+      const subPath = fkIndex >= 0 ? segments.slice(fkIndex + 1).join('.') : '';
+      // Lift when the root driver can't be handed the join (foreign source, or no 'joins'
+      // capability). A bare STORED FK at any depth is a plain local column — never a join.
+      const needsLift = fkField && foreignSource && (foreignSource !== rootSource || !rootJoins);
+      const isBareStoredFK = fkField && !fkField.isVirtual && !subPath;
+
+      if (!needsLift || isBareStoredFK) {
         sameSourceWhere[path] = value;
+      } else if (fkField.isVirtual && fkIndex > 0) {
+        // A virtual link behind an embedded prefix has no local column to inject at — the only
+        // genuinely unliftable WHERE shape. Loud beats silently dropping the constraint.
+        throw new Error(`Unsupported where: join path "${path}" cannot be planner-resolved (virtual link behind an embedded prefix) and the data source does not support driver joins`);
       } else {
-        if (!whereGroupsByField[fieldName]) {
-          whereGroupsByField[fieldName] = {
-            fieldName,
+        const groupKey = segments.slice(0, fkIndex + 1).join('.');
+        if (!whereGroupsByField[groupKey]) {
+          whereGroupsByField[groupKey] = {
             conditions: {},
-            // Where to inject the $in result on THIS model's where clause
-            localInjectField: field.isVirtual ? model.pkField : fieldName,
+            // Where to inject the $in result on THIS model's where clause: the FK prefix path
+            // itself (stored side — a local, possibly embedded-dotted column), or the root pk
+            // (virtual side).
+            localInjectField: fkField.isVirtual ? model.pkField : groupKey,
             // Which field to SELECT from the foreign model (gives us the values to inject)
-            foreignSelectField: field.isVirtual ? field.linkBy : field.fkField,
-            foreignModelName: field.model.name,
+            foreignSelectField: fkField.isVirtual ? fkField.linkBy : fkField.fkField,
+            foreignModelName: fkField.model.name,
           };
         }
-        whereGroupsByField[fieldName].conditions[subParts.join('.')] = value;
+        // Bare virtual equality filters BY the foreign model's pk itself.
+        whereGroupsByField[groupKey].conditions[subPath || fkField.model.pkField] = value;
       }
     }
 
@@ -113,7 +155,8 @@ module.exports = class QueryPlanner {
       const field = model.fields[fieldName];
       const dir = String(direction || 'asc').toLowerCase();
       const isCrossSource = Boolean(
-        field?.isFKReference && subParts.length && field.model?.source && field.model.source !== rootSource,
+        field?.isFKReference && subParts.length && field.model?.source
+        && (field.model.source !== rootSource || !rootJoins),
       );
 
       let localFKField = null;
@@ -138,6 +181,18 @@ module.exports = class QueryPlanner {
 
     const crossSourceSort = sortSpec.filter(s => s.isCrossSource);
 
+    // SORT is only planner-resolved when the FK is the path's FIRST segment (the in-memory
+    // sort above). Deeper join-shaped sorts — an embedded prefix ('pins.writer.name') means
+    // sorting by a MULTI-VALUED joined attribute (which pin?), and a bare virtual sort
+    // ('articles') means sorting by a collection — are ill-defined; they would otherwise flow
+    // to #finalize, land in query.joins, and be silently DROPPED by a driver that doesn't
+    // join. Loud beats silent over-matching.
+    if (!rootJoins) {
+      sortSpec.filter(s => !s.isCrossSource).forEach((s) => {
+        if (model.isJoinPath(s.path)) throw new Error(`Unsupported sort: join path "${s.path}" requires driver join support ('joins' is not in the data source's supports) — only sorts whose first segment is the FK can be planner-resolved`);
+      });
+    }
+
     return {
       hasCrossSource: crossSourceWhere.length > 0 || crossSourceSort.length > 0,
       model,
@@ -160,11 +215,11 @@ module.exports = class QueryPlanner {
    * Returns null if any pre-query produces no results (guaranteed empty primary result).
    */
   async #preResolve(plan, tquery) {
-    const { crossSourceWhere, crossSourceSort, sameSourceWhere, op } = plan;
+    const { crossSourceWhere, crossSourceSort, sameSourceWhere, model, op } = plan;
     const rawQuery = tquery.toObject();
 
-    // Start from the same-source where paths only
-    const rewrittenWhere = Util.unflatten(sameSourceWhere, { safe: true });
+    // Start from the driver-joinable where paths only (already transformed — see below)
+    const rewrittenFlat = { ...sameSourceWhere };
 
     const preQueryResults = await Promise.all(
       crossSourceWhere.map(({ conditions, localInjectField, foreignSelectField, foreignModelName }) => this.#resolver.match(foreignModelName)
@@ -179,9 +234,17 @@ module.exports = class QueryPlanner {
 
     for (const { localInjectField, ids } of preQueryResults) {
       if (!ids.length) return null; // short-circuit — no primary results possible
-      // Inject as array; Query.#finalize() normalises arrays to { $in: [...] }
-      rewrittenWhere[localInjectField] = ids;
+      // Injected values are DESERIALIZED foreign values (string ids), and the rewritten query
+      // re-enters POST-transform — so this entry alone must ride the where pipelines here
+      // ($cast/generator: string → ObjectId on ObjectId-keyed models) or it silently matches
+      // nothing. sameSourceWhere is already transformed; re-transforming it would double-apply.
+      // Injected as an array; Query.#finalize() normalises arrays to { $in: [...] }.
+      const args = { query: rawQuery, resolver: this.#resolver, context: this.#resolver.getContext() };
+      const entry = model.transformers.where.transform(Util.unflatten({ [localInjectField]: ids }, { safe: true }), args);
+      Object.assign(rewrittenFlat, Util.flatten(entry, { safe: true }));
     }
+
+    const rewrittenWhere = Util.unflatten(rewrittenFlat, { safe: true });
 
     if (!crossSourceSort.length) {
       // No cross-source sort — only the WHERE needed rewriting; pass sort/pagination through

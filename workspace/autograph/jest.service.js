@@ -27,7 +27,7 @@ exports.setup = async (mergeConfig) => {
       }
     },
     dataSource: {
-      supports: ['transactions'],
+      supports: ['transactions', 'joins'],
       client: mongoClient,
     },
   });
