@@ -80,14 +80,6 @@ const wrapNextMemoize = (listener) => {
   return wrapper;
 };
 
-const normalizeOptions = (options) => {
-  if (options == null) return {};
-  if (typeof options !== 'object' || Array.isArray(options)) {
-    throw new TypeError(`Emitter listener options must be an object (received ${typeof options}); did you mean { priority: <n>, memoize: <bool> }?`);
-  }
-  return options;
-};
-
 // Registration-time prep: stamp the listener's ROLE and priority, and swap in a memoizing
 // wrapper when opted in. Priority/role are set on both the wrapper and the original listener so
 // `#getListeners` can read them through either side of the (potential) once-wrap that
@@ -107,26 +99,71 @@ const prepareListener = (listener, opts, role) => {
   return target;
 };
 
+// ---- 0.16 filter-object registration (see docs/superpowers/specs/2026-07-03-emitter-filter-api-design.md) ----
+// Normalization/validation is registration-time (cold path) and LOUD — same doctrine as the
+// where Vocabulary allowlist: a typo'd filter must never become a silent match-all (or match-
+// nothing) listener.
+const FILTER_KEYS = ['event', 'model', 'crud', 'priority', 'once', 'memoize'];
+const CRUD_WORDS = ['create', 'read', 'update', 'delete'];
+const CRUD_FLAGS = { c: 'create', r: 'read', u: 'update', d: 'delete' };
+
+const normalizeFilter = (filter) => {
+  if (typeof filter === 'string') filter = { event: filter }; // shorthand: on('setup', fn)
+  if (!Util.isPlainObject(filter)) throw new TypeError(`Emitter filter must be an event name or filter object (received ${typeof filter})`);
+  const unknown = Object.keys(filter).filter(k => !FILTER_KEYS.includes(k));
+  if (unknown.length) throw new TypeError(`Unknown Emitter filter key(s): ${unknown.join(', ')} — allowed: ${FILTER_KEYS.join(', ')}`);
+  const events = Util.ensureArray(filter.event ?? []).map(String);
+  if (!events.length) throw new TypeError('Emitter filter requires at least one event');
+  const models = filter.model == null ? null : Util.ensureArray(filter.model).map(String);
+  if (models && !models.length) throw new TypeError('Emitter filter "model" requires at least one value');
+  let cruds = null;
+  if (filter.crud != null) {
+    // Word array, single word, or a flag string of c|r|u|d characters — all normalize to words.
+    let parts;
+    if (Array.isArray(filter.crud)) parts = filter.crud;
+    else if (CRUD_WORDS.includes(filter.crud)) parts = [filter.crud];
+    else parts = `${filter.crud}`.split('');
+    cruds = parts.map((part) => {
+      const word = CRUD_WORDS.includes(part) ? part : CRUD_FLAGS[part];
+      if (!word) throw new TypeError(`Unknown crud filter "${part}" — allowed: flag string of [${Object.keys(CRUD_FLAGS).join('')}] or words [${CRUD_WORDS.join(', ')}]`);
+      return word;
+    });
+  }
+  if (cruds && !cruds.length) throw new TypeError('Emitter filter "crud" requires at least one value');
+  return { events, models, cruds, opts: { priority: filter.priority, memoize: filter.memoize }, once: Boolean(filter.once) };
+};
+
 /**
  * EventEmitter with two explicit listener roles, declared at REGISTRATION (never inferred from
  * a function's arity — parameter count is a call-convention detail, not a semantic contract):
  *
- *   PARTICIPANTS — `on()` / `once()` / `onModels()` / `onKeys()` / ... The event awaits them.
- *     They receive the ambient `event.resolver` (transaction participants — their writes share
- *     the unit's fate), their throw/rejection is the event's failure (aborts a carried unit —
- *     see Resolver#createSystemEvent), and a non-undefined return value (sync or resolved)
+ *   PARTICIPANTS — `on(filter, fn)`. The event awaits them. They receive the ambient
+ *     `event.resolver` (transaction participants — their writes share the unit's fate), their
+ *     throw/rejection is the event's failure (aborts a carried unit — see
+ *     Resolver#createSystemEvent), and a non-undefined return value (sync or resolved)
  *     SHORT-CIRCUITS the event with that value. Plain functions — sync or async; the legacy
  *     AG15 done-callback form `(event, next)` is still honored by arity as a CALL CONVENTION
  *     only (next(value) === return value).
  *
- *   OBSERVERS — `observe()` / `observeModels()` / `observeKeys()`. Fire-and-forget on every
- *     event: never awaited, failures deterministically isolated (sync throws swallowed, async
- *     rejections attached to a no-op handler — never an unhandled rejection), return values
- *     ignored (an un-awaited value can never shape an awaited outcome), and they receive the
- *     DETACHED resolver (no transaction scope, ever — reads see committed state, writes land
- *     immediately and survive any ambient rollback; see Resolver#detach and TRANSACTIONS.md
- *     §4.18). Un-awaitable code cannot be a transaction participant — the role makes that
- *     safe by construction instead of by discipline.
+ *   OBSERVERS — `observe(filter, fn)`. Fire-and-forget on every event: never awaited, failures
+ *     deterministically isolated (sync throws swallowed, async rejections attached to a no-op
+ *     handler — never an unhandled rejection), return values ignored (an un-awaited value can
+ *     never shape an awaited outcome), and they receive the DETACHED resolver (no transaction
+ *     scope, ever — reads see committed state, writes land immediately and survive any ambient
+ *     rollback; see Resolver#detach and TRANSACTIONS.md §4.18). Un-awaitable code cannot be a
+ *     transaction participant — the role makes that safe by construction instead of by
+ *     discipline.
+ *
+ * `filter` is an event name (shorthand for `{ event: name }`) or a
+ * `{ event, model, crud, priority, once, memoize }` bag — `event` is required (scalar or array),
+ * everything else optional; dimensions AND together, values within a dimension OR (see
+ * `normalizeFilter`). Both `on()` and `observe()` return a `dispose()` function that atomically
+ * unregisters the whole registration (every event it fanned out to); calling it twice is a no-op.
+ * `once`, `addListener`, `prependListener`, `prependOnceListener`, `onModels`, `onceModels`,
+ * `onKeys`, `onceKeys`, `observeOnce`, `observeModels`, `observeKeys` were removed in 0.16 — the
+ * methods still exist but throw with migration guidance (see the poisoned stubs below); letting
+ * the base `EventEmitter` silently resurface them would produce listeners with no role stamping
+ * and no index bookkeeping.
  *
  * Dispatch: observers first (priority order), then participants initiated synchronously in one
  * flat priority order. A participant's SYNC non-undefined return short-circuits immediately —
@@ -139,45 +176,33 @@ const prepareListener = (listener, opts, role) => {
 class Emitter extends EventEmitter {
   #cache = new Map();
 
-  // Per-event listener index for the model-aware fast path.
-  //   genericCount — listeners registered without a model/key filter (Emitter.on/once direct).
-  //   byModel/byKey — wrapper listeners registered via onModels/onKeys, keyed by their filter value.
-  // hasListenersFor(event, model, key) answers "would any listener body actually run for this
-  // event+model+key combination?" without invoking the wrappers themselves. Resolver uses this
-  // to skip the entire emit chain for queries with no relevant hooks.
-  #listenerIndex = new Map(); // event → { genericCount, byModel: Map<string, count>, byKey: Map<string, count> }
-  #wrapperFilter = new WeakMap(); // registered listener (after prepareListener wrap) → { prop, arr } for decrement on remove
-
   #invalidate(event) {
     this.#cache.delete(event);
   }
 
+  #listenerIndex = new Map(); // event → { genericCount, byModel: Map<model, count> }
+  #wrapperFilter = new WeakMap(); // registered target → models array, for decrement on remove
+
   #getIndex(event) {
     let entry = this.#listenerIndex.get(event);
     if (!entry) {
-      entry = { genericCount: 0, byModel: new Map(), byKey: new Map() };
+      entry = { genericCount: 0, byModel: new Map() };
       this.#listenerIndex.set(event, entry);
     }
     return entry;
   }
 
-  #incFilter(event, prop, arr) {
-    const entry = this.#getIndex(event);
-    const map = prop === 'model' ? entry.byModel : entry.byKey;
-    for (const v of arr) {
-      const k = `${v}`;
-      map.set(k, (map.get(k) ?? 0) + 1);
-    }
+  #incFilter(event, models) {
+    const { byModel } = this.#getIndex(event);
+    for (const m of models) byModel.set(m, (byModel.get(m) ?? 0) + 1);
   }
 
-  #decFilter(event, prop, arr) {
+  #decFilter(event, models) {
     const entry = this.#listenerIndex.get(event);
     if (!entry) return;
-    const map = prop === 'model' ? entry.byModel : entry.byKey;
-    for (const v of arr) {
-      const k = `${v}`;
-      const c = (map.get(k) ?? 0) - 1;
-      if (c <= 0) map.delete(k); else map.set(k, c);
+    for (const m of models) {
+      const c = (entry.byModel.get(m) ?? 0) - 1;
+      if (c <= 0) entry.byModel.delete(m); else entry.byModel.set(m, c);
     }
   }
 
@@ -191,15 +216,15 @@ class Emitter extends EventEmitter {
   }
 
   /**
-   * Returns true iff any registered listener's filter (or lack thereof) would match an event
-   * with the given model/key. Resolver's #createSystemEvent uses this as the fast-path guard.
+   * Returns true iff any registered listener's filter (or lack thereof) COULD match an event
+   * with the given model. Conservative: crud-only filters count as generic. Resolver's
+   * #createSystemEvent uses this as the fast-path guard.
    */
-  hasListenersFor(event, model, key) {
+  hasListenersFor(event, model) {
     const entry = this.#listenerIndex.get(event);
     if (!entry) return false;
     if (entry.genericCount > 0) return true;
     if (model != null && entry.byModel.get(`${model}`) > 0) return true;
-    if (key != null && entry.byKey.get(`${key}`) > 0) return true;
     return false;
   }
 
@@ -280,55 +305,82 @@ class Emitter extends EventEmitter {
     });
   }
 
-  on(event, listener, options) {
-    const target = prepareListener(listener, normalizeOptions(options), 'participant');
-    this.#incGeneric(event);
-    this.#invalidate(event);
-    return super.on(event, target);
-  }
-
-  addListener(event, listener, options) {
-    return this.on(event, listener, options);
-  }
-
-  once(event, listener, options) {
-    const target = prepareListener(listener, normalizeOptions(options), 'participant');
-    this.#incGeneric(event);
-    this.#invalidate(event);
-    return super.once(event, target);
-  }
-
-  prependListener(event, listener, options) {
-    const target = prepareListener(listener, normalizeOptions(options), 'participant');
-    this.#incGeneric(event);
-    this.#invalidate(event);
-    return super.prependListener(event, target);
-  }
-
-  prependOnceListener(event, listener, options) {
-    const target = prepareListener(listener, normalizeOptions(options), 'participant');
-    this.#incGeneric(event);
-    this.#invalidate(event);
-    return super.prependOnceListener(event, target);
+  /**
+   * Register a PARTICIPANT (see class doc). `filter` is an event name (shorthand) or a
+   * { event, model, crud, priority, once, memoize } bag — event scalar-or-array required, the
+   * rest optional; AND across dimensions, OR within. Returns a disposer that atomically
+   * unregisters the whole registration (every event it fanned out to).
+   */
+  on(filter, listener, ...rest) {
+    if (rest.length) throw new TypeError('Emitter.on(event, fn, options) was removed in 0.16 — fold options into the filter: on({ event, priority, memoize }, fn)');
+    return this.#register('participant', filter, listener);
   }
 
   /**
    * Register an OBSERVER: fire-and-forget on every matching event — never awaited, failures
-   * isolated, return value ignored, detached resolver in `event.resolver`. Use for telemetry,
-   * audit, logging, and any side effect that must not share (or threaten) the mutation's fate.
+   * isolated, return value ignored, detached resolver in `event.resolver`. Same filter contract
+   * and disposer return as on().
    */
-  observe(event, listener, options) {
-    const target = prepareListener(listener, normalizeOptions(options), 'observer');
-    this.#incGeneric(event);
-    this.#invalidate(event);
-    return super.on(event, target);
+  observe(filter, listener, ...rest) {
+    if (rest.length) throw new TypeError('Emitter.observe(event, fn, options) was removed in 0.16 — fold options into the filter: observe({ event, priority, memoize }, fn)');
+    return this.#register('observer', filter, listener);
   }
 
-  observeOnce(event, listener, options) {
-    const target = prepareListener(listener, normalizeOptions(options), 'observer');
-    this.#incGeneric(event);
-    this.#invalidate(event);
-    return super.once(event, target);
+  #register(role, filterInput, listener) {
+    if (typeof listener !== 'function') throw new TypeError(`Emitter listener must be a function (received ${typeof listener})`);
+    const { events, models, cruds, opts, once } = normalizeFilter(filterInput);
+
+    const registrations = []; // [eventName, target] pairs — what the disposer must unwind
+    let disposed = false;
+    const dispose = () => {
+      if (disposed) return;
+      disposed = true;
+      registrations.forEach(([eventName, target]) => this.removeListener(eventName, target));
+    };
+
+    const filtered = Boolean(models || cruds);
+    events.forEach((eventName) => {
+      let target;
+      if (!filtered && !once) {
+        // Bare registration — no wrapper at all (non-query events like 'setup' depend on this;
+        // a predicate reading event.query would never match them).
+        target = prepareListener(listener, opts, role);
+        this.#incGeneric(eventName);
+      } else {
+        const matches = event => (!models || models.includes(`${event?.query?.model}`))
+          && (!cruds || cruds.includes(event?.query?.crud));
+        // Observers are always invoked (event)-only; participants keep their declared call
+        // convention (the legacy done-callback form is mirrored by arity so emit() reads the
+        // right convention off the wrapper — a non-matching legacy participant must still
+        // next() or the event would hang).
+        const wrapper = (role === 'observer' || listener.length < 2) ? (event) => {
+          if (!matches(event)) return undefined;
+          if (once) dispose(); // remove BEFORE invoking — preserves the old once*/observeOnce semantic
+          return listener(event);
+        } : (event, next) => {
+          if (!matches(event)) return next();
+          if (once) dispose();
+          return listener(event, next);
+        };
+        // Without this back-link, removeListener(event, originalFn) could never find the wrapper
+        // (same convention the memoize wrappers rely on).
+        wrapper.listener = listener;
+        target = prepareListener(wrapper, opts, role);
+        if (models) {
+          this.#wrapperFilter.set(target, models);
+          this.#incFilter(eventName, models);
+        } else {
+          // crud-only (or bare-once) filters index as generic — conservative: hasListenersFor
+          // may say yes for a query the crud predicate then rejects, never no for one it runs.
+          this.#incGeneric(eventName);
+        }
+      }
+      registrations.push([eventName, target]);
+      this.#invalidate(eventName);
+      super.on(eventName, target);
+    });
+
+    return dispose;
   }
 
   removeListener(event, listener) {
@@ -336,9 +388,9 @@ class Emitter extends EventEmitter {
     // Node's EventEmitter resolves both direct-reference and .listener-equality matches.
     const raw = this.rawListeners(event).find(l => l === listener || l.listener === listener);
     if (raw) {
-      const filter = this.#wrapperFilter.get(raw);
-      if (filter) {
-        this.#decFilter(event, filter.prop, filter.arr);
+      const models = this.#wrapperFilter.get(raw);
+      if (models) {
+        this.#decFilter(event, models);
         this.#wrapperFilter.delete(raw);
       } else {
         this.#decGeneric(event);
@@ -356,9 +408,9 @@ class Emitter extends EventEmitter {
     if (event) {
       // Decrement counts for every registered listener on this event before clearing.
       for (const raw of this.rawListeners(event)) {
-        const filter = this.#wrapperFilter.get(raw);
-        if (filter) {
-          this.#decFilter(event, filter.prop, filter.arr);
+        const models = this.#wrapperFilter.get(raw);
+        if (models) {
+          this.#decFilter(event, models);
           this.#wrapperFilter.delete(raw);
         } else {
           this.#decGeneric(event);
@@ -372,83 +424,32 @@ class Emitter extends EventEmitter {
     return super.removeAllListeners(event);
   }
 
-  /**
-   * Syntactic sugar to listen on query keys
-   */
-  onKeys(...args) {
-    return this.#createWrapper('key', false, 'participant', ...args);
-  }
+  /* ---- removed in 0.16: poisoned, not deleted — the EventEmitter base class would otherwise
+     resurface these with NO role stamping and NO fast-path index bookkeeping (silently broken
+     listeners). Loud beats silent. ---- */
+  /* eslint-disable class-methods-use-this */
+  once() { throw new Error('Emitter.once() was removed in 0.16 — use on({ event, once: true }, fn)'); }
 
-  /**
-   * Syntactic sugar to listen once on query keys
-   */
-  onceKeys(...args) {
-    return this.#createWrapper('key', true, 'participant', ...args);
-  }
+  addListener() { throw new Error('Emitter.addListener() was removed in 0.16 — use on(filter, fn)'); }
 
-  /**
-   * Syntactic sugar to listen on query models
-   */
-  onModels(...args) {
-    return this.#createWrapper('model', false, 'participant', ...args);
-  }
+  prependListener() { throw new Error('Emitter.prependListener() was removed in 0.16 — use on({ event, priority: <n> }, fn)'); }
 
-  /**
-   * Syntactic sugar to listen once on query models
-   */
-  onceModels(...args) {
-    return this.#createWrapper('model', true, 'participant', ...args);
-  }
+  prependOnceListener() { throw new Error('Emitter.prependOnceListener() was removed in 0.16 — use on({ event, priority: <n>, once: true }, fn)'); }
 
-  /**
-   * Observer-role variants of onKeys/onModels (see observe()).
-   */
-  observeKeys(...args) {
-    return this.#createWrapper('key', false, 'observer', ...args);
-  }
+  onModels() { throw new Error('Emitter.onModels() was removed in 0.16 — use on({ event, model }, fn)'); }
 
-  observeModels(...args) {
-    return this.#createWrapper('model', false, 'observer', ...args);
-  }
+  onceModels() { throw new Error('Emitter.onceModels() was removed in 0.16 — use on({ event, model, once: true }, fn)'); }
 
-  #createWrapper(prop, once, role, eventName, arr, listener, options) {
-    arr = Util.ensureArray(arr);
+  onKeys() { throw new Error('Emitter.onKeys() was removed in 0.16 — use on({ event, model, crud }, fn); query.key was model+crud composed'); }
 
-    // Observers are always invoked (event)-only; participants keep their declared call
-    // convention (plain vs legacy done-callback) — the wrapper must mirror it so the emit
-    // dispatch reads the right convention off the wrapper's own arity.
-    const wrapper = (role === 'observer' || listener.length < 2) ? (event) => {
-      if (arr.includes(`${event.query[prop]}`)) {
-        if (once) this.removeListener(eventName, wrapper);
-        return listener(event);
-      }
-      return undefined;
-    } : (event, next) => {
-      if (arr.includes(`${event.query[prop]}`)) {
-        if (once) this.removeListener(eventName, wrapper);
-        return listener(event, next);
-      }
-      return next();
-    };
-    // Without this, Emitter.removeListener(event, originalFn) can never find this wrapper —
-    // it's neither reference-equal to `listener` nor (absent this line) linked back to it via
-    // `.listener`, the same convention wrapBasicMemoize/wrapNextMemoize already rely on (see
-    // removeListener's `l === listener || l.listener === listener` match) — so a hook registered
-    // via onModels/onKeys/onceModels/onceKeys could never actually be removed again.
-    wrapper.listener = listener;
+  onceKeys() { throw new Error('Emitter.onceKeys() was removed in 0.16 — use on({ event, model, crud, once: true }, fn)'); }
 
-    // Register via super.on directly (not this.on) so we can record the filter info in the
-    // per-(event, model|key) index instead of bumping the generic count. The model-aware
-    // listener fast path in #createSystemEvent depends on this distinction. Note: always
-    // super.on regardless of `once` — the wrapper itself self-removes on a matching emit,
-    // which preserves the "only fires once on a MATCHING event" semantic. Using super.once
-    // would let Node auto-remove on the first emit even when the model didn't match.
-    const target = prepareListener(wrapper, normalizeOptions(options), role);
-    this.#wrapperFilter.set(target, { prop, arr });
-    this.#incFilter(eventName, prop, arr);
-    this.#invalidate(eventName);
-    return super.on(eventName, target);
-  }
+  observeOnce() { throw new Error('Emitter.observeOnce() was removed in 0.16 — use observe({ event, once: true }, fn)'); }
+
+  observeModels() { throw new Error('Emitter.observeModels() was removed in 0.16 — use observe({ event, model }, fn)'); }
+
+  observeKeys() { throw new Error('Emitter.observeKeys() was removed in 0.16 — use observe({ event, model, crud }, fn)'); }
+  /* eslint-enable class-methods-use-this */
 
   static sort(a, b) {
     if (a.priority > b.priority) return -1;

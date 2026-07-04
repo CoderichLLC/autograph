@@ -59,7 +59,7 @@ describe('OperationScope — every gqlMutation is a transaction; @transaction es
     test('a single gqlMutation runs carried: the scope lives on a CLONE, never the request resolver', async () => {
       let captured;
       const spy = (event, next) => { captured = event.resolver; next(); };
-      Emitter.onKeys('postMutation', ['createPerson'], spy);
+      Emitter.on({ event: 'postMutation', model: 'Person', crud: 'c' }, spy);
 
       try {
         const { result, requestResolver } = await execute(`mutation {
@@ -86,7 +86,7 @@ describe('OperationScope — every gqlMutation is a transaction; @transaction es
         if (`${event.query.input?.name}` === 'opscope-abort-participant') throw new Error('participant failure');
         next();
       };
-      Emitter.onModels('postMutation', ['Person'], participant);
+      Emitter.on({ event: 'postMutation', model: 'Person' }, participant);
 
       try {
         const { result } = await execute(`mutation {
@@ -109,7 +109,7 @@ describe('OperationScope — every gqlMutation is a transaction; @transaction es
         if (`${event.query.input?.name}` === 'opscope-field-poperr') throw new Error('presenter-boom');
         next();
       };
-      Emitter.onModels('preResponse', ['Person'], presenterBoom);
+      Emitter.on({ event: 'preResponse', model: 'Person' }, presenterBoom);
 
       try {
         const { result } = await execute(`mutation {
@@ -149,8 +149,8 @@ describe('OperationScope — every gqlMutation is a transaction; @transaction es
       const scopes = [];
       const pm = (event, next) => { order.push('postMutation'); scopes.push(event.resolver); next(); };
       const pc = (event, next) => { order.push('postCommit'); next(); };
-      Emitter.onKeys('postMutation', ['createPerson'], pm);
-      Emitter.onKeys('postCommit', ['createPerson'], pc);
+      Emitter.on({ event: 'postMutation', model: 'Person', crud: 'c' }, pm);
+      Emitter.on({ event: 'postCommit', model: 'Person', crud: 'c' }, pc);
 
       try {
         const { result } = await execute(`mutation {
@@ -175,7 +175,7 @@ describe('OperationScope — every gqlMutation is a transaction; @transaction es
     test('two root fields commit together as ONE transaction — same scope, sealed before the response returns', async () => {
       const scopes = [];
       const spy = (event, next) => { scopes.push(event.resolver); next(); };
-      Emitter.onKeys('postMutation', ['createPerson'], spy);
+      Emitter.on({ event: 'postMutation', model: 'Person', crud: 'c' }, spy);
 
       try {
         const { result, requestResolver } = await execute(`mutation @transaction {
@@ -295,7 +295,7 @@ describe('OperationScope — every gqlMutation is a transaction; @transaction es
       // anything, so executor abandonment can no longer amputate the unit: a's data was complete
       // (only its presentation broke), b executes, the unit commits.
       const presenterBoom = presenterBoomFor('opscope-nn-poperr-a');
-      Emitter.onModels('preResponse', ['Person'], presenterBoom);
+      Emitter.on({ event: 'preResponse', model: 'Person' }, presenterBoom);
 
       try {
         const { result } = await execute(`mutation @transaction {
@@ -316,7 +316,7 @@ describe('OperationScope — every gqlMutation is a transaction; @transaction es
 
     test('a response-layer failure on the LAST field commits — and the earlier field still presents its durable result', async () => {
       const presenterBoom = presenterBoomFor('opscope-nn-last-b');
-      Emitter.onModels('preResponse', ['Person'], presenterBoom);
+      Emitter.on({ event: 'preResponse', model: 'Person' }, presenterBoom);
 
       try {
         const { result } = await execute(`mutation @transaction {
@@ -342,8 +342,8 @@ describe('OperationScope — every gqlMutation is a transaction; @transaction es
       const order = [];
       const pm = (event, next) => { order.push('postMutation'); next(); };
       const pc = (event, next) => { order.push('postCommit'); next(); };
-      Emitter.onKeys('postMutation', ['createPerson'], pm);
-      Emitter.onKeys('postCommit', ['createPerson'], pc);
+      Emitter.on({ event: 'postMutation', model: 'Person', crud: 'c' }, pm);
+      Emitter.on({ event: 'postCommit', model: 'Person', crud: 'c' }, pc);
 
       try {
         const { result } = await execute(`mutation @transaction {
@@ -529,6 +529,61 @@ describe('OperationScope — every gqlMutation is a transaction; @transaction es
 
       await resolver.match('Person').id(result.data.a.id).delete();
       await resolver.match('Person').id(result.data.b.id).delete();
+    });
+
+    test('fail-loud: a live root field NOT in the wrapped map aborts the unit — never silent partial atomicity', async () => {
+      // The one way a real selection escapes the unit: its resolver was merged into the
+      // executable schema AFTER toObject() (host-side mergeResolvers / stitching). The executor
+      // invokes it directly — the hoist can neither carry nor suppress it — so a declared-atomic
+      // operation would silently degrade to partial atomicity. Instead every wrapped field
+      // refuses loudly, naming the foreign field, before any transaction opens.
+      const hostRan = { count: 0 };
+      const wrapped = wrapOperationScope({
+        Mutation: {
+          a: async (doc, args, context) => {
+            const person = await context.autograph.resolver.match('Person').save({ name: args.name, emailAddress: args.email });
+            return `${person.id}`;
+          },
+        },
+      }, 'autograph');
+      wrapped.Mutation.hostPing = () => { hostRan.count += 1; return 'pong'; }; // merged out-of-band: UNWRAPPED
+      const schema = makeExecutableSchema({
+        typeDefs: `directive @transaction on MUTATION
+          type Query { ping: String }
+          type Mutation {
+            a(name: String!, email: String!): String
+            hostPing: String
+          }`,
+        resolvers: wrapped,
+      });
+
+      const contextValue = { network: { id: 'networkId' } };
+      const requestResolver = new Resolver({ schema: $schema, context: contextValue });
+      expect(requestResolver).toBeDefined();
+
+      const result = await graphql({
+        schema,
+        contextValue,
+        source: `mutation @transaction {
+          __typename
+          a(name: "opscope-foreign", email: "opscope-foreign@example.com")
+          hostPing
+        }`,
+      });
+
+      // The wrapped field refuses — naming the foreign field — with nothing committed.
+      expect(result.data.a).toBeNull();
+      const errA = result.errors.find(e => e.path?.[0] === 'a');
+      expect(errA.message).toMatch(/hostPing/);
+      expect(errA.message).toMatch(/not carried by the unit/);
+      expect(errA.extensions).toMatchObject({ code: 'OPERATION_ABORTED', committed: false });
+      expect(await rowsByEmail('opscope-foreign@example.com')).toHaveLength(0);
+      // __typename is never foreign (the executor's own concern, always safe alongside).
+      expect(result.data.__typename).toBe('Mutation');
+      // The foreign field is executor-invoked, outside the unit's reach — it DID run bare. That
+      // unreachability is exactly why the unit must refuse loudly instead of excluding silently.
+      expect(hostRan.count).toBe(1);
+      expect(result.data.hostPing).toBe('pong');
     });
   });
 

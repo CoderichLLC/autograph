@@ -4,7 +4,7 @@
   - Transactions re-introduced (`TransactionScope`) — reference-threaded, never ambient (no ALS)
     - **Every gqlMutation is its own transaction** (isolated clone; `context.autograph.resolver` swapped per field; commit before field resolves)
     - **Inside a custom mutation resolver body, data is PROVISIONAL until the field commits** — inline irreversible side effects (email/webhook) are now rollback-exposed; move them to `postCommit`
-    - `mutation @transaction { a, b, c }` escalates to one operation-level unit (executes via first-field hoist; rollback ⇒ `data: null`)
+    - `mutation @transaction { a, b, c }` escalates to one operation-level unit (executes via first-field hoist; rollback ⇒ `data: null`); a root field merged outside `toObject()` fails the unit loudly (`OPERATION_ABORTED`) — never silently excluded
     - Wrapper errors carry `extensions.{code, committed}` (`PRE_OPERATION_ERROR`/`POST_OPERATION_ERROR`/`MUTATION_ERROR`/`OPERATION_ABORTED`); no `result` on the wire
     - agMutations (`resolver.match().save()` etc.) only JOIN scopes, never create; RI/`*Many` auto-wrap their own
     - `enableAutoTransaction()` / `autoTransaction` flag REMOVED; host escape hatch = `transaction({ isolated: false })`
@@ -13,12 +13,13 @@
     - Post-phase failures role-graded: `postMutation` throw aborts a carried unit; `preResponse`/`postResponse` throw = `PostOperationError` (commits anyway, `.result` carries the write)
     - Scripts/out-of-band unchanged: awaited ⇒ durable (only `*Many`/RI auto-wrap, bounded within the call)
   - Emitter: listener role declared at REGISTRATION, not arity
-    - `on*()` = PARTICIPANT: awaited, ambient resolver, throw aborts the mutation, non-undefined return short-circuits (sync return stops later listeners; async return now short-circuits too)
-    - `observe*()` = OBSERVER: fire-and-forget, DETACHED resolver (committed-only reads; fate-independent writes), failures swallowed, return ignored, runs first
-    - **BREAKING: arity<2 listeners via `on()` are now participants** (were fire-and-forget basics) — migrate observers to `observe*()`
+    - `on()` = PARTICIPANT: awaited, ambient resolver, throw aborts the mutation, non-undefined return short-circuits (sync return stops later listeners; async return now short-circuits too)
+    - `observe()` = OBSERVER: fire-and-forget, DETACHED resolver (committed-only reads; fate-independent writes), failures swallowed, return ignored, runs first
+    - **BREAKING: arity<2 listeners via `on()` are now participants** (were fire-and-forget basics) — migrate observers to `observe()`
     - Legacy `(event, next)` form still works (call convention only)
     - One flat priority order per role (no more basics/nexts phases)
     - `event.context[namespace].resolver` is POISONED in hooks (throws) — use `event.resolver` (`.detach()`/`.transaction()` for other fates)
+    - Registration collapsed to TWO methods: `on(filter, fn)` / `observe(filter, fn)` — filter = `{ event, model, crud, priority, once, memoize }` (scalar-or-array; string shorthand for bare event; returns a disposer); `once`/`prepend*`/`onModels`/`onKeys`/`observe*` variants REMOVED (poisoned with migration hints); NO `keys` filter (use `model` + `crud`); `hasListenersFor(event, model)` drops the key param
   - Where Vocabulary: `$eq $ne $gt $gte $lt $lte $in $nin $exists $not $or $and` first-class in `.where()` AND GraphQL where-inputs (`src/query/Vocabulary.js`)
     - Allowlist validation — unknown `$`-operators now REJECT loudly (was silent passthrough; closes GQL injection surface)
     - Fixed: operators through the normal path silently matched NOTHING on Mongo (finalize flattening bug, incl. the known `$in` bug)
@@ -26,6 +27,7 @@
     - Portable semantics: `$exists` = "non-null value present"; `$ne`/`$nin` match missing/null (PG behavior aligned to Mongo)
     - Join paths inside `$or`/`$and` branches reject loudly
     - `flags({ native })` = TRUE driver dialect (unvalidated/untranslated, raw column keys, e.g. Mongo `$expr`) — still transactional/cached
+    - Legacy ARRAY-where (`.where([a, b])` OR form) normalizes to `$or` at the builder boundary (was silently match-all after the vocabulary rewrite)
   - **`resolver.driver()` REMOVED** — use the vocabulary, `flags.native`, or your own client instance; TestSuite raw verification via test-harness `global.rawDriver`
   - Driver contract changes (pre-publication): `driver(name)` no longer required; where operators arrive INTACT (never pre-flattened — drop reconstruction); vocabulary conformance section in TestSuite
   - PostgresDriver: production-pure (all pg-mem emulation moved to test harness `PgMemShim`); real `BEGIN ISOLATION LEVEL REPEATABLE READ` + native rollback

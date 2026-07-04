@@ -635,16 +635,16 @@ module.exports = class Resolver {
     // object allocation, an Emitter cache lookup, a Promise.resolve, and a .then microtask.
     // For a wide read like findNetworkPlace with thousands of inner sub-resolvers
     // (Category/Image/Workspace) that have no relevant hooks, this is a real win.
-    const { model: qModel, key: qKey } = query;
+    const { model: qModel } = query;
     if (
       !needsValidate
-      && !Emitter.hasListenersFor(`pre${type}`, qModel, qKey)
-      && !Emitter.hasListenersFor(`post${type}`, qModel, qKey)
-      && !Emitter.hasListenersFor('preResponse', qModel, qKey)
-      && !Emitter.hasListenersFor('postResponse', qModel, qKey)
+      && !Emitter.hasListenersFor(`pre${type}`, qModel)
+      && !Emitter.hasListenersFor(`post${type}`, qModel)
+      && !Emitter.hasListenersFor('preResponse', qModel)
+      && !Emitter.hasListenersFor('postResponse', qModel)
       // Mutations only: postCommit/postRollback need the full path (an event object to emit with,
       // and the settled registration below). Reads keep their 4-lookup hot path.
-      && (type === 'Query' || (!Emitter.hasListenersFor('postCommit', qModel, qKey) && !Emitter.hasListenersFor('postRollback', qModel, qKey)))
+      && (type === 'Query' || (!Emitter.hasListenersFor('postCommit', qModel) && !Emitter.hasListenersFor('postRollback', qModel)))
     ) {
       return Promise.resolve(thunk(tquery)).then((result) => {
         query.result = result;
@@ -706,7 +706,7 @@ module.exports = class Resolver {
     // for this write — it happened, then was undone; that's exactly what compensation hooks need.
     let emitDurable; // set when NO transaction scope carried this write (durable right now)
     if (type === 'Mutation' && resultEarly === undefined
-      && (Emitter.hasListenersFor('postCommit', qModel, qKey) || Emitter.hasListenersFor('postRollback', qModel, qKey))) {
+      && (Emitter.hasListenersFor('postCommit', qModel) || Emitter.hasListenersFor('postRollback', qModel))) {
       const emitSettled = eventName => Promise.resolve().then(() => Emitter.emit(eventName, event)).catch(() => {});
       if (carried) {
         // Defer to the session's true settle. For a gqlMutation that's its field scope's commit

@@ -84,6 +84,12 @@ module.exports = class QueryBuilder {
 
   where(clause) {
     this.#propCheck('where', false); // Allow redefine of "where" because we merge it
+    // Legacy OR form: an ARRAY of where clauses. Normalize to its canonical vocabulary spelling
+    // ($or) here at the builder boundary — a raw array is hostile to everything downstream:
+    // mergeDeep DISCARDS previously-merged object clauses when handed an array (type-mismatch
+    // overwrite), and Query#transformWhere's rest-destructure would spread the survivor into
+    // index keys ('0', '1') that the field transformer silently drops (match-all).
+    if (Array.isArray(clause)) clause = { $or: clause };
     const $clause = mergeDeep(this.#query.where || {}, clause);
     this.#query.where = $clause;
     this.#query.args.where = $clause;

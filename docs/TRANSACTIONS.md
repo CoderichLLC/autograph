@@ -677,13 +677,14 @@ succeeded (never rollback-worthy, by construction).
   GraphQL error-formatting layer) — not required, since AG's own commit/rollback logic already
   handles the classification.
 
-**A separate bug surfaced while verifying this, unrelated to transactions:** `Emitter.onModels`/
-`onKeys`/`onceModels`/`onceKeys` build their own wrapper closure around a registered listener but
-never set `.listener` on it — the convention `removeListener(event, originalFn)` needs to find a
-wrapped listener via `l.listener === listener` (the same convention `wrapBasicMemoize`/
-`wrapNextMemoize` already followed). Without it, a hook registered via `onModels`/`onKeys` could
+**A separate bug surfaced while verifying this, unrelated to transactions:** the `model`/`crud`-filtered
+registration path (`Emitter.on({ event, model })`/`on({ event, model, crud })`, since collapsed into
+the two-method filter-object API — see CLAUDE.md) built its own wrapper closure around a registered
+listener but never set `.listener` on it — the convention `removeListener(event, originalFn)` needs to
+find a wrapped listener via `l.listener === listener` (the same convention `wrapBasicMemoize`/
+`wrapNextMemoize` already followed). Without it, a hook registered via a `model`/`crud` filter could
 never actually be removed by its original function reference — it silently stayed registered
-forever. Fixed by setting `wrapper.listener = listener` in `#createWrapper`, matching the existing
+forever. Fixed by setting `wrapper.listener = listener` in `#register`, matching the existing
 memoize-wrapper pattern.
 
 **The "least surprise" question this section originally left open — no event fired after the true,
@@ -758,10 +759,10 @@ needed, now surfaced as ordinary Emitter events:
   failures are isolated (`allSettled` in `TransactionScope#settle`; an isolated catch on the
   non-transactional path) and can never reject `commit()` or a mutation that already succeeded. A
   `postCommit` failure can only be logged by the listener itself.
-- **Writes from inside these hooks are new units of work.** An OBSERVER (`Emitter.observe*`)
+- **Writes from inside these hooks are new units of work.** An OBSERVER (`Emitter.observe(filter, fn)`)
   receives a DETACHED resolver (§4.18), so `event.resolver.match(...).save(...)` simply works — a
   fresh, fate-independent write, which is exactly what a durability observer's follow-up write is.
-  A PARTICIPANT (`Emitter.on*`) still holds the ambient resolver, whose scope has settled by the
+  A PARTICIPANT (`Emitter.on(filter, fn)`) still holds the ambient resolver, whose scope has settled by the
   time `postCommit` fires — its writes reject with the settled-scope error; use
   `event.resolver.transaction()` (a settled scope is not offered as a parent — §4.13 #7) for an
   explicit fresh unit.
@@ -1057,10 +1058,15 @@ host's scope ambiently and the host calls `commit()`/`rollback()` (§4.7).
   get no per-field or `@transaction` scoping — they keep the §4.7/§4.11 host-managed contract
   via `transaction({ isolated: false })`.
 - **Root Mutation fields with no resolver in AG's merged map** (declared in SDL, resolved by
-  something merged outside AG) are not wrapped and not part of the hoisted unit — the executor
-  invokes them normally, outside the `@transaction` scope, and their agMutations through the
-  (restored, scope-less) request resolver run as uncarried writes. Such resolvers should use
-  `resolver.transaction()` themselves.
+  something merged outside AG) are not wrapped — the executor invokes them normally, with no
+  per-field unit, and their agMutations through the (scope-less) request resolver run as
+  uncarried writes. Such resolvers should use `resolver.transaction()` themselves. Under
+  `@transaction` this is no longer a silent degradation: a live selection of such a field
+  **fails the whole unit loudly** (`OPERATION_ABORTED`, before any transaction opens) — the
+  executor invokes the foreign field outside the unit's reach, so carrying on would make a
+  declared-atomic operation partially atomic without anyone knowing. (The foreign field itself
+  still executes bare — the refusal guarantees no *carried* field commits, which is why it is
+  loud rather than silent.)
 - **Cost.** Every gqlMutation now pays a session + commit round-trip (on MongoDB with
   `w: majority`, a real latency add per write). Deliberate: uniform participant semantics were
   judged worth it, and the known optimization — skip the scope for AG-*generated* single-write
@@ -1069,8 +1075,8 @@ host's scope ambiently and the host calls `commit()`/`rollback()` (§4.7).
 
 ### 4.18 Detached resolvers — OBSERVERS are never transaction participants
 
-> **Vocabulary update**: listener role is now DECLARED at registration (`Emitter.on*` =
-> participant, `Emitter.observe*` = observer), never inferred from a function's arity —
+> **Vocabulary update**: listener role is now DECLARED at registration (`Emitter.on(filter, fn)` =
+> participant, `Emitter.observe(filter, fn)` = observer), never inferred from a function's arity —
 > parameter count is a call-convention detail, not a semantic contract (`(event, next)` remains
 > honored as the legacy done-callback form). The reasoning below predates that change and uses
 > the old arity vocabulary; "arity < 2 / basic" reads as OBSERVER, "arity ≥ 2 / next-style" as
@@ -1092,8 +1098,8 @@ taxonomy with no leftover ambiguity:
 
 | Listener shape | Resolver received | Writes | Failure |
 |---|---|---|---|
-| `on*` (participant) | ambient | share the mutation's fate | aborts the carried unit (§4.15) |
-| `observe*` (detached observer) | detached twin | immediate, fate-independent | swallowed (§4.13) |
+| `on()` (participant) | ambient | share the mutation's fate | aborts the carried unit (§4.15) |
+| `observe()` (detached observer) | detached twin | immediate, fate-independent | swallowed (§4.13) |
 | `postCommit`/`postRollback` (durability observer) | per shape above | new units of work | isolated (§4.14) |
 
 Every hook author's question — "does my write share fate / survive rollback / wait for commit?" —

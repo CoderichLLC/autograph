@@ -165,4 +165,14 @@ describe('Where vocabulary — tier-1 operators through the NORMAL (transformed)
     expect(names(await scoped({ age: [10, 30] }))).toEqual(['vocab-alpha', 'vocab-charlie']); // bare array → $in
     expect(names(await scoped({ name: 'vocab-a*' }))).toEqual(['vocab-alpha']); // glob
   });
+
+  test('legacy ARRAY-where (the OR form) normalizes to $or at the builder boundary', async () => {
+    // Regression: `.where([clauseA, clauseB])` predates the vocabulary; mergeDeep spread the
+    // array into index keys ('0', '1') the where transformer silently DROPPED — match-all.
+    const rows = await resolver.match('Person')
+      .where({ emailAddress: 'vocab-*@example.com' })
+      .where([{ name: 'vocab-a*' }, { age: { $gte: 30 } }])
+      .many();
+    expect(names(rows)).toEqual(['vocab-alpha', 'vocab-charlie']); // glob + operator, per branch
+  });
 });

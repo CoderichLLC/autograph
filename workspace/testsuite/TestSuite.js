@@ -1329,9 +1329,9 @@ module.exports = () => describe('TestSuite', () => {
         }
         next();
       };
-      Emitter.onModels('postMutation', ['Person'], hookA);
-      Emitter.onModels('postMutation', ['Person'], hookB);
-      Emitter.onModels('postMutation', ['Color'], colorChain);
+      Emitter.on({ event: 'postMutation', model: 'Person' }, hookA);
+      Emitter.on({ event: 'postMutation', model: 'Person' }, hookB);
+      Emitter.on({ event: 'postMutation', model: 'Color' }, colorChain);
 
       // Seed targets so the *Many writes have docs to touch.
       await resolver.match('Color').save({ type: 'blue' });

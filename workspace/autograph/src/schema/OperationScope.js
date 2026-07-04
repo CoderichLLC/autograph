@@ -75,6 +75,10 @@ const { PreOperationError, PostOperationError } = require('../service/ErrorServi
  * before the executor reaches the actual failing field; the cause is embedded in the message and
  * classified in extensions). Direct invocations that fabricate `info` WITHOUT a schema cannot be
  * hoisted (no type information to coerce sibling arguments) — they degrade to per-field units.
+ * A live root field whose resolver was NOT wrapped by Schema#toObject() (merged into the
+ * executable schema out-of-band) fails the whole unit loudly (OPERATION_ABORTED, before any
+ * transaction opens) — the executor invokes such a field directly, outside the unit's reach, so
+ * silently excluding it would degrade a declared-atomic operation to partial atomicity.
  *
  * Context caveat: the wrapper restores `context[namespace].resolver` when the field settles, so
  * un-awaited async work spawned inside a field that re-reads the context resolver LATER sees
@@ -121,10 +125,13 @@ const isSkipped = (sel, variableValues = {}) => (sel.directives ?? []).some((dir
 // to be selected multiple times (identical field + args, enforced by validation) — the executor
 // invokes the resolver ONCE with the merged fieldNodes, and the hoist must do exactly the same
 // (two entries would run the write twice). Membership in `fields` (the resolver map itself)
-// excludes introspection fields and any declared-but-resolverless field — anything the wrapper
-// will never see invoked must never be part of the hoisted unit.
+// bounds the unit — but only introspection (`__typename`) is excluded SILENTLY: a REAL live
+// field not in the map (a resolver merged into the executable schema outside Schema#toObject())
+// is reported in `foreign` so the @transaction path can refuse loudly instead of degrading a
+// declared-atomic operation to silent partial atomicity.
 const liveSelections = (info, fields) => {
   const byKey = new Map();
+  const foreign = new Set();
   const walk = nodes => nodes.forEach((sel) => {
     if (isSkipped(sel, info.variableValues)) return;
     switch (sel.kind) {
@@ -133,6 +140,8 @@ const liveSelections = (info, fields) => {
           const key = (sel.alias ?? sel.name).value;
           if (byKey.has(key)) byKey.get(key).nodes.push(sel);
           else byKey.set(key, { key, name: sel.name.value, nodes: [sel] });
+        } else if (!sel.name.value.startsWith('__')) {
+          foreign.add(sel.name.value);
         }
         break;
       case 'FragmentSpread': { const fragment = info.fragments?.[sel.name.value]; if (fragment) walk(fragment.selectionSet.selections); break; }
@@ -141,7 +150,7 @@ const liveSelections = (info, fields) => {
     }
   });
   walk(info.operation.selectionSet.selections);
-  return [...byKey.values()];
+  return { selections: [...byKey.values()], foreign: [...foreign] };
 };
 
 const wrapField = (fn, fields, namespace, directiveName) => {
@@ -181,7 +190,15 @@ const wrapField = (fn, fields, namespace, directiveName) => {
         // the FIRST live selection, and replay of a completed hoist never re-arrives there first.
         let state = states.get(resolver);
         if (!state || state.operation !== info.operation || (state.done && info.path?.key === state.firstKey)) {
-          const selections = liveSelections(info, fields);
+          const { selections, foreign } = liveSelections(info, fields);
+          // A @transaction operation must be FULLY hoistable. A live root field with no wrapped
+          // resolver (merged into the executable schema outside Schema#toObject()) is invoked by
+          // the executor directly — the unit can neither carry nor suppress it — so it would
+          // execute OUTSIDE the transaction: silent partial atomicity on a declared-atomic
+          // operation. Refuse loudly BEFORE any transaction opens or any field runs. The state is
+          // deliberately never recorded, so every wrapped field's invocation re-derives the same
+          // refusal and reports it at its own response path.
+          if (foreign.length) throw decorate(new Error(`Operation aborted: @transaction operation selects root field(s) [${foreign.join(', ')}] not carried by the unit — resolver(s) not wrapped by Schema#toObject() (merged out-of-band?)`), false, 'OPERATION_ABORTED');
           state = { operation: info.operation, selections, firstKey: selections[0]?.key, results: new Map(), done: false };
           states.set(resolver, state);
         }

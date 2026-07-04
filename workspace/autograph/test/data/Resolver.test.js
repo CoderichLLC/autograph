@@ -357,8 +357,8 @@ describe('Resolver (transaction regressions)', () => {
       events = [];
       onCommit = track('postCommit');
       onRollback = track('postRollback');
-      Emitter.onModels('postCommit', ['Person', 'Color'], onCommit);
-      Emitter.onModels('postRollback', ['Person', 'Color'], onRollback);
+      Emitter.on({ event: 'postCommit', model: ['Person', 'Color'] }, onCommit);
+      Emitter.on({ event: 'postRollback', model: ['Person', 'Color'] }, onRollback);
     });
 
     afterEach(() => {
@@ -370,8 +370,8 @@ describe('Resolver (transaction regressions)', () => {
       const order = [];
       const postMutationHook = async (event, next) => { order.push('postMutation'); next(); };
       const commitHook = () => { order.push('postCommit'); };
-      Emitter.onModels('postMutation', ['Color'], postMutationHook);
-      Emitter.onModels('postCommit', ['Color'], commitHook);
+      Emitter.on({ event: 'postMutation', model: 'Color' }, postMutationHook);
+      Emitter.on({ event: 'postCommit', model: 'Color' }, commitHook);
 
       const color = await resolver.match('Color').save({ type: 'red' });
 
@@ -405,6 +405,49 @@ describe('Resolver (transaction regressions)', () => {
       expect(events).toEqual([{ name: 'postRollback', model: 'Person', result: expect.anything() }]);
     });
 
+    test('durable-outcome events carry the SAME event data as the rest of the lifecycle — query.crud discrimination works', async () => {
+      // One event object per lifecycle (Resolver#createSystemEvent builds it once; the settle
+      // callbacks close over it) — so authors' existing `query.crud` checks (create vs update vs
+      // delete) and every other query property work unchanged at the durability layer. Pinned
+      // here so a future refactor that rebuilds a reduced payload for postCommit/postRollback
+      // fails loudly.
+      const seen = [];
+      const commitSpy = (event) => { seen.push({ event, crud: event.query.crud }); };
+      const mutations = [];
+      const mutationSpy = (event, next) => { mutations.push(event); next(); };
+      Emitter.on({ event: 'postCommit', model: 'Color' }, commitSpy);
+      Emitter.on({ event: 'postMutation', model: 'Color' }, mutationSpy);
+
+      try {
+        const color = await resolver.match('Color').save({ type: 'blue' });
+        await resolver.match('Color').id(color.id).save({ type: 'green' });
+        await resolver.match('Color').id(color.id).delete();
+
+        expect(seen.map(s => s.crud)).toEqual(['create', 'update', 'delete']);
+        // The strongest parity guarantee: postCommit received the IDENTICAL event object its
+        // postMutation saw — full envelope ({ schema, context, resolver, query }), not a
+        // reduced durable-outcome payload.
+        seen.forEach((s, i) => expect(s.event).toBe(mutations[i]));
+        expect(Object.keys(seen[0].event)).toEqual(expect.arrayContaining(['schema', 'context', 'resolver', 'query']));
+      } finally {
+        Emitter.removeListener('postCommit', commitSpy);
+        Emitter.removeListener('postMutation', mutationSpy);
+      }
+
+      // Compensation side sees the same shape: the undone write's crud and result, intact.
+      const rolled = [];
+      const rollbackSpy = (event) => { rolled.push({ crud: event.query.crud, result: event.query.result }); };
+      Emitter.on({ event: 'postRollback', model: 'Person' }, rollbackSpy);
+      try {
+        const txn = resolver.transaction();
+        await txn.match('Person').save({ name: 'crud-parity-rb', emailAddress: 'crud-parity-rb@example.com' });
+        await txn.rollback();
+        expect(rolled).toEqual([{ crud: 'create', result: expect.objectContaining({ name: 'crud-parity-rb' }) }]);
+      } finally {
+        Emitter.removeListener('postRollback', rollbackSpy);
+      }
+    });
+
     test('a *Many batch emits one postCommit per element, at the batch\'s own commit', async () => {
       await resolver.match('Color').save([{ type: 'green' }, { type: 'purple' }]);
 
@@ -417,7 +460,7 @@ describe('Resolver (transaction regressions)', () => {
 
     test('postCommit still fires when only a post-write hook failed — the write itself is durable', async () => {
       const failingHook = async (event, next) => { throw new Error('side-effect failure'); };
-      Emitter.onModels('postMutation', ['Color'], failingHook);
+      Emitter.on({ event: 'postMutation', model: 'Color' }, failingHook);
 
       let caughtError;
       try {
@@ -440,7 +483,7 @@ describe('Resolver (transaction regressions)', () => {
 
     test('a preMutation short-circuit emits neither — nothing was written', async () => {
       const shortCircuit = () => ({ id: 'synthetic', type: 'blue' });
-      Emitter.onModels('preMutation', ['Color'], shortCircuit);
+      Emitter.on({ event: 'preMutation', model: 'Color' }, shortCircuit);
 
       const result = await resolver.match('Color').save({ type: 'blue' });
       Emitter.removeListener('preMutation', shortCircuit);
@@ -463,7 +506,7 @@ describe('Resolver (transaction regressions)', () => {
       // postResponse fires for reads too — record mutations only, so this suite's own
       // setup/cleanup reads don't pollute the assertions.
       observer = (event) => { if (event.query.isMutation) observed.push(event.query.result); };
-      Emitter.onModels('postResponse', ['Color'], observer);
+      Emitter.on({ event: 'postResponse', model: 'Color' }, observer);
     });
 
     afterEach(() => {
@@ -478,7 +521,7 @@ describe('Resolver (transaction regressions)', () => {
       const before = await resolver.match('Color').where({}).many();
       const override = { id: 'pm-override', type: 'blue' };
       const hook = () => override;
-      Emitter.onModels('postMutation', ['Color'], hook);
+      Emitter.on({ event: 'postMutation', model: 'Color' }, hook);
 
       const result = await resolver.match('Color').save({ type: 'blue' });
       Emitter.removeListener('postMutation', hook);
@@ -495,7 +538,7 @@ describe('Resolver (transaction regressions)', () => {
       const before = await resolver.match('Color').where({}).many();
       const override = { id: 'pr-override', type: 'red' };
       const hook = () => override;
-      Emitter.onModels('preResponse', ['Color'], hook);
+      Emitter.on({ event: 'preResponse', model: 'Color' }, hook);
 
       const result = await resolver.match('Color').save({ type: 'red' });
       Emitter.removeListener('preResponse', hook);
@@ -510,7 +553,7 @@ describe('Resolver (transaction regressions)', () => {
 
     test('its return value is ignored — a pure observer cannot reshape the response', async () => {
       const hijacker = event => ({ id: 'hijacked', type: 'green' }); // returned value must NOT become the result
-      Emitter.onModels('postResponse', ['Color'], hijacker);
+      Emitter.on({ event: 'postResponse', model: 'Color' }, hijacker);
 
       const result = await resolver.match('Color').save({ type: 'green' });
       Emitter.removeListener('postResponse', hijacker);
@@ -524,7 +567,7 @@ describe('Resolver (transaction regressions)', () => {
 
     test('a postResponse throw is a response-layer failure — PostOperationError, the write stays', async () => {
       const thrower = (event, next) => { throw new Error('observer exploded'); };
-      Emitter.onModels('postResponse', ['Color'], thrower);
+      Emitter.on({ event: 'postResponse', model: 'Color' }, thrower);
 
       let caughtError;
       try {
@@ -560,7 +603,7 @@ describe('Resolver (transaction regressions)', () => {
         if (event.query.model === 'Color') throw new Error('side-effect failure');
         next();
       };
-      Emitter.onModels('postMutation', ['Color'], hook);
+      Emitter.on({ event: 'postMutation', model: 'Color' }, hook);
 
       let caughtError;
       try {
@@ -588,7 +631,7 @@ describe('Resolver (transaction regressions)', () => {
         if (callCount === 2) throw new Error('participant failure on second element');
         next();
       };
-      Emitter.onModels('postMutation', ['Color'], hook);
+      Emitter.on({ event: 'postMutation', model: 'Color' }, hook);
 
       let caughtError;
       try {
@@ -615,7 +658,7 @@ describe('Resolver (transaction regressions)', () => {
         if (callCount === 2) throw new Error('presentation failure on second element');
         next();
       };
-      Emitter.onModels('preResponse', ['Color'], hook);
+      Emitter.on({ event: 'preResponse', model: 'Color' }, hook);
 
       let caughtError;
       try {
@@ -644,7 +687,7 @@ describe('Resolver (transaction regressions)', () => {
       const before = await resolver.match('Color').where({}).many();
 
       const hook = async (event) => { throw new Error('observer failure — isolated, logged-only'); };
-      Emitter.observeModels('postCommit', ['Color'], hook);
+      Emitter.observe({ event: 'postCommit', model: 'Color' }, hook);
 
       const results = await resolver.match('Color').save([{ type: 'red' }, { type: 'green' }]); // resolves — no error surfaces
       Emitter.removeListener('postCommit', hook);
@@ -678,8 +721,8 @@ describe('Resolver (transaction regressions)', () => {
         if (event.query.input?.name === 'race-post-failure') throw new Error('presenter failure (must not mask the real one)');
         next();
       };
-      Emitter.onModels('preMutation', ['Person'], delayHook);
-      Emitter.onModels('preResponse', ['Person'], postHook);
+      Emitter.on({ event: 'preMutation', model: 'Person' }, delayHook);
+      Emitter.on({ event: 'preResponse', model: 'Person' }, postHook);
 
       let caughtError;
       try {
@@ -711,7 +754,7 @@ describe('Resolver (transaction regressions)', () => {
         if (event.query.model === 'Person' && event.query.crud === 'update') throw new Error('presenter failure on cascade step');
         next();
       };
-      Emitter.onModels('preResponse', ['Person'], hook);
+      Emitter.on({ event: 'preResponse', model: 'Person' }, hook);
 
       let caughtError;
       try {
@@ -745,7 +788,7 @@ describe('Resolver (transaction regressions)', () => {
         if (event.query.model === 'Person' && event.query.crud === 'update') throw new Error('participant failure on cascade step');
         next();
       };
-      Emitter.onModels('postMutation', ['Person'], hook);
+      Emitter.on({ event: 'postMutation', model: 'Person' }, hook);
 
       let caughtError;
       try {
@@ -782,8 +825,8 @@ describe('Resolver (transaction regressions)', () => {
       let nextResolver;
       const basicHook = (event) => { basicResolver = event.resolver; };
       const nextHook = (event, next) => { nextResolver = event.resolver; next(); };
-      Emitter.observeModels('postMutation', ['Person'], basicHook);
-      Emitter.onModels('postMutation', ['Person'], nextHook);
+      Emitter.observe({ event: 'postMutation', model: 'Person' }, basicHook);
+      Emitter.on({ event: 'postMutation', model: 'Person' }, nextHook);
 
       try {
         const txn = resolver.transaction();
@@ -806,7 +849,7 @@ describe('Resolver (transaction regressions)', () => {
       const hook = (event) => {
         pendingWrite = event.resolver.match('Color').save({ type: 'red' });
       };
-      Emitter.observeModels('postMutation', ['Person'], hook);
+      Emitter.observe({ event: 'postMutation', model: 'Person' }, hook);
 
       try {
         const txn = resolver.transaction();
@@ -828,7 +871,7 @@ describe('Resolver (transaction regressions)', () => {
       const hook = (event) => {
         observed = event.resolver.match('Person').id(event.query.result.id).one();
       };
-      Emitter.observeModels('postMutation', ['Person'], hook);
+      Emitter.observe({ event: 'postMutation', model: 'Person' }, hook);
 
       try {
         const txn = resolver.transaction();
@@ -876,7 +919,7 @@ describe('Resolver (transaction regressions)', () => {
       const hook = (event) => {
         pendingWrite = event.resolver.match('Color').save({ type: 'green' });
       };
-      Emitter.observeModels('postCommit', ['Person'], hook);
+      Emitter.observe({ event: 'postCommit', model: 'Person' }, hook);
 
       let person;
       try {
@@ -910,7 +953,7 @@ describe('Resolver (transaction regressions)', () => {
         event.context.autograph.resolver.match('Person');
         next();
       };
-      Emitter.onModels('preMutation', ['Person'], hook);
+      Emitter.on({ event: 'preMutation', model: 'Person' }, hook);
 
       try {
         await expect(resolver.match('Person').save({ name: 'ctx-guard', emailAddress: 'ctx-guard@example.com' }))
@@ -932,7 +975,7 @@ describe('Resolver (transaction regressions)', () => {
           event.context.stash = 'passthrough'; // non-resolver writes reach the REAL context
         }
       };
-      Emitter.observeModels('postMutation', ['Person'], basicHook);
+      Emitter.observe({ event: 'postMutation', model: 'Person' }, basicHook);
 
       let person;
       try {
