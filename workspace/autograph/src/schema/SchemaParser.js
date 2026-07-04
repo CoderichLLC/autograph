@@ -454,7 +454,12 @@ function parseSchema(config, typeDefs) {
             for (const docField of docFields) {
               let value = docField.key in doc ? doc[docField.key] : docField.defaultValue;
               if (value === undefined) continue; // eslint-disable-line
-              if (docField.isArray) value = value == null ? value : Util.ensureArray(value);
+              // Arrays are shallow-COPIED, never shared by reference: `doc` is the raw cached
+              // row (the DataLoader stores raw driver results), so handing out its array would
+              // let a caller's push/splice mutate the cache for every later hit. Embedded and
+              // deserialize paths below re-map into new arrays anyway; this covers the plain
+              // (scalar/FK) assignment path.
+              if (docField.isArray) value = value == null ? value : [...Util.ensureArray(value)];
               const hasEmbedded = docField.isEmbedded;
               const hasDeserialize = docField.pipelines.deserialize.length > 0;
               const isEligible = (hasEmbedded || hasDeserialize) && value != null;

@@ -21,8 +21,17 @@ module.exports = class Loader {
     return this.#loader.clearAll();
   }
 
-  resolve(query) {
-    return this.#loader.load(query);
+  resolve(query, resolver = this.#resolver) {
+    // The cache stores the RAW driver result (see #resolve) — transformation happens HERE, per
+    // call, with the CALLER's resolver and the calling query's own info. That buys three
+    // guarantees per cache hit: fresh doc instances (mutation-safe — the documented contract),
+    // the caller's own selection shaping (info is not part of the cache key), and $-magic bound
+    // to the caller (a doc read through a txn clone writes through the txn clone, never the
+    // root resolver that built this shared map).
+    return this.#loader.load(query).then((data) => {
+      if (data == null) return null;
+      return resolver.toResultSet(this.#model, data, query.toObject().info);
+    });
   }
 
   #resolve(queries) {
@@ -70,9 +79,13 @@ module.exports = class Loader {
       return results.flat().sort((a, b) => a.i - b.i).map(({ query, $query, data }) => {
         if (data == null) return null; // Explicit return null;
         if ($query.isCursorPaging && Array.isArray(data)) data = Loader.#paginateResults(data, query.toObject());
-        // Pass this batch's GraphQL info so toResultSet can drive selection-aware
-        // eager/lazy. Different batches may carry different infos; each is handled per-batch.
-        return this.#resolver.toResultSet(this.#model, data, $query.info);
+        // Cache the RAW driver rows (cursor slicing is query-keyed, so it is cache-safe here).
+        // Transformation deliberately does NOT happen in this batch fn — the dataloader package
+        // memoizes this return value, and caching transformed docs (a past regression) meant
+        // shared mutable instances across cache hits, the FIRST caller's selection shaping
+        // served to every later caller, and $-magic bound to whichever resolver built this
+        // (request-shared) loader map. resolve() transforms per call instead.
+        return data;
       });
     });
   }

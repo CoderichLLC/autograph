@@ -427,7 +427,10 @@ module.exports = class Resolver {
 
         const dispatch = () => {
           this.#queryPlanner ??= new QueryPlanner(this.#schema, this);
-          return this.#queryPlanner.resolve(model, tquery, rq => this.#dataLoaders[model].resolve(rq));
+          // Pass `this` (the CALLING resolver — possibly a txn clone or the detached twin) so the
+          // per-call transform binds $-magic and pipelines to the caller, not to whichever
+          // resolver originally built the shared loader map.
+          return this.#queryPlanner.resolve(model, tquery, rq => this.#dataLoaders[model].resolve(rq, this));
         };
 
         // A SETTLED scope degrades reads to plain (committed-state, sessionless) reads rather

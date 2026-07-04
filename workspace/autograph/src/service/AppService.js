@@ -78,8 +78,17 @@ const walkSelectionSet = (selectionSet, fragments) => {
   return result;
 };
 
+// Memoized per `info` object: within one GraphQL request the same field resolver runs once per
+// parent — N DataLoader cache hits, each handed the SAME info — and the walk is identical every
+// time. The tree is read-only to every consumer (docTransform only reads fields/embedded), so
+// sharing it is safe; only doc INSTANCES must stay per-call. (modelName does not shape the
+// tree — the walk is selection-driven.)
+const selectionTrees = new WeakMap();
+
 exports.buildSelectionTree = (info, modelName) => {
   if (!info || !info.fieldNodes || !info.fieldNodes.length) return null;
+  if (selectionTrees.has(info)) return selectionTrees.get(info);
+  let out = null;
   try {
     const fragments = info.fragments || {};
     // A resolver can technically receive multiple fieldNodes (the same field selected with
@@ -91,25 +100,13 @@ exports.buildSelectionTree = (info, modelName) => {
     // Connection-shape: { count, edges { node { ... } }, pageInfo }. The actual model
     // selection sits two levels deep. If we see that shape, drill into it. Otherwise the tree
     // is already the model selection (get<Model>, mutations, plain findMany).
-    return (tree.embedded.edges && tree.embedded.edges.embedded.node) || tree;
+    out = (tree.embedded.edges && tree.embedded.edges.embedded.node) || tree;
   } catch {
-    return null;
+    out = null;
   }
+  selectionTrees.set(info, out);
+  return out;
 };
-
-// Returns the field NAMES selected at the model level. Backed by the realm-safe AST walker
-// above. Replaces the previous parseResolveInfo + simplifyParsedResolveInfoFragmentWithType
-// implementation which would crash under dual-graphql-realm conditions.
-exports.getGQLSelectFields = (model, info) => {
-  const tree = exports.buildSelectionTree(info, model);
-  return tree ? [...tree.fields] : [];
-};
-
-// exports.removeUndefinedDeep = (obj) => {
-//   return Util.unflatten(Object.entries(Util.flatten(obj)).reduce((prev, [key, value]) => {
-//     return value === undefined ? prev : Object.assign(prev, { [key]: value });
-//   }, {}));
-// };
 
 exports.JSONParse = (mixed) => {
   try {

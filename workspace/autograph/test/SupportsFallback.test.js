@@ -145,6 +145,17 @@ describe('joins fallback — planner-resolved, driver never sees query.joins', (
     expect(rows.map(r => r.name)).toEqual(['alice']);
   });
 
+  test('pre-query results share ONE cache identity with same-shaped user reads (superset select)', async () => {
+    resolver.clearAll();
+    const before = prepareSpy.mock.calls.length;
+    await resolver.match('Article').where({ 'writer.name': 'alice' }).many(); // lift pre-queries Writer by name
+    await resolver.match('Writer').where({ name: 'alice' }).many(); // same-shaped user read
+    // The pre-query deliberately does NOT narrow its select — so the user read is a DataLoader
+    // cache HIT on the pre-query's entry: exactly ONE Writer driver call serves both.
+    const writerCalls = prepareSpy.mock.calls.slice(before).map(([q]) => q.model).filter(m => m === 'Writer');
+    expect(writerCalls).toHaveLength(1);
+  });
+
   test('LOUD edges: join-shaped SORT deeper than a first-segment FK rejects', async () => {
     // Sorting by a multi-valued joined attribute (which pin?) is ill-defined — never silent.
     await expect(resolver.match('Writer').sort({ pins: { writer: { name: 'asc' } } }).many())

@@ -98,7 +98,12 @@ type Person @model {
 
 Every model gets a `DataLoader` instance on the `Resolver`. Results are cached for the lifetime of the resolver instance. Call `resolver.clear(model)` or `resolver.clearAll()` to invalidate.
 
-The DataLoader caches the **raw driver result**, not the transformed output — it is safe to mutate, spread, and `JSON.stringify` returned documents.
+The DataLoader caches the **raw driver result**, not the transformed output — transformation
+(deserialize, docTransform, `$`-magic Doc wrapping, selection shaping) runs PER CALL with the
+CALLING resolver and the calling query's `info`. Consequences: every cache hit returns fresh
+instances (safe to mutate, spread, and `JSON.stringify` — array fields are shallow-copied out of
+the raw row), each call site gets its own selection shaping, and a doc's `$` magic is bound to
+the resolver that read it (a doc read through a txn clone writes through the txn clone).
 
 ### Where Vocabulary
 

@@ -40,6 +40,11 @@
     - LOUD edges (reject, never silent over-matching): join-shaped SORT deeper than a first-segment FK (multi-valued — ill-defined) and WHERE on a virtual link behind an embedded prefix (no local column)
     - `batches`/`referentialIntegrity` flag names dropped (declared/read nowhere)
     - fixes latent crash: a source with NO `supports` key TypeError'd on its first scoped operation (i.e. every gqlMutation)
+  - DataLoader raw-cache contract RESTORED (regression: `toResultSet` had moved inside the batch fn, so the cache held transformed doc INSTANCES)
+    - cache hits returned the SAME object — caller mutations bled into every later read (violated the documented "safe to mutate" contract); first caller's selection shaping served to all; **`$`-magic bound to the ROOT resolver — `doc.$.save()` on a doc read through a txn clone ESCAPED the transaction**
+    - now: cache stores raw rows; transform runs per call with the CALLING resolver + calling query's info; array fields shallow-copied out of the raw row (deep-mutation isolation)
+    - cost: cache hits re-run deserialize/docTransform (the price of the contract; a derived memo layer is the future optimization if measured)
+    - offsets: `buildSelectionTree` memoized per `info` object (same field resolver × N parents = one walk); QueryPlanner internal reads no longer narrow `.select()` (internal reads are SUPERSET — pre-queries share one cache identity + merge bucket with same-shaped user reads; select-islands eliminated)
   - PostgresDriver: production-pure (all pg-mem emulation moved to test harness `PgMemShim`); real `BEGIN ISOLATION LEVEL REPEATABLE READ` + native rollback
 
 ## v0.15.x (BREAKING)

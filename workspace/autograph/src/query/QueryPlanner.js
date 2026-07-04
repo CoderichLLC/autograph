@@ -221,10 +221,13 @@ module.exports = class QueryPlanner {
     // Start from the driver-joinable where paths only (already transformed — see below)
     const rewrittenFlat = { ...sameSourceWhere };
 
+    // Deliberately NO .select() narrowing: internal reads stay SUPERSET (the default select) so
+    // the pre-query shares one DataLoader cache identity — and one merge bucket — with any
+    // same-shaped user read in the request. A narrowed select would be a private cache island
+    // (select is part of both the cache key and the merge fingerprint).
     const preQueryResults = await Promise.all(
       crossSourceWhere.map(({ conditions, localInjectField, foreignSelectField, foreignModelName }) => this.#resolver.match(foreignModelName)
         .where(conditions)
-        .select([foreignSelectField])
         .many()
         .then(docs => ({
           localInjectField,
@@ -301,12 +304,9 @@ module.exports = class QueryPlanner {
 
       if (!fkValues.length) return;
 
-      // Select just enough from the foreign model to build the sort map
-      const topSortField = sortPath ? sortPath.split('.')[0] : null;
-      const selectFields = [...new Set([foreignLookupField, topSortField].filter(Boolean))];
-
-      // Batch-fetch (chunked at CHUNK_SIZE to avoid oversized $in queries)
-      const foreignDocs = await this.#batchFetch(foreignModelName, foreignLookupField, fkValues, selectFields);
+      // Batch-fetch (chunked at CHUNK_SIZE to avoid oversized $in queries). Superset select —
+      // same doctrine as the pre-query above: no private cache islands.
+      const foreignDocs = await this.#batchFetch(foreignModelName, foreignLookupField, fkValues);
 
       // Build lookup map: foreignLookupField value → sort value
       // For virtual reverse-links a person can have many books — take the minimum sort value
@@ -444,12 +444,12 @@ module.exports = class QueryPlanner {
    * Fetch docs from a foreign model by a lookup field, chunked at CHUNK_SIZE
    * so no single $in query exceeds driver limits.
    */
-  async #batchFetch(modelName, lookupField, ids, selectFields) {
+  async #batchFetch(modelName, lookupField, ids) {
     const chunks = [];
     for (let i = 0; i < ids.length; i += CHUNK_SIZE) chunks.push(ids.slice(i, i + CHUNK_SIZE));
 
     const results = await Promise.all(
-      chunks.map(chunk => this.#resolver.match(modelName).where({ [lookupField]: chunk }).select(selectFields).many()),
+      chunks.map(chunk => this.#resolver.match(modelName).where({ [lookupField]: chunk }).many()),
     );
 
     return results.flat();
