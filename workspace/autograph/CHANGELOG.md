@@ -20,6 +20,7 @@
     - One flat priority order per role (no more basics/nexts phases)
     - `event.context[namespace].resolver` is POISONED in hooks (throws) — use `event.resolver` (`.detach()`/`.transaction()` for other fates)
     - Registration collapsed to TWO methods: `on(filter, fn)` / `observe(filter, fn)` — filter = `{ event, model, crud, priority, once, memoize }` (scalar-or-array; string shorthand for bare event; returns a disposer); `once`/`prepend*`/`onModels`/`onKeys`/`observe*` variants REMOVED (poisoned with migration hints); NO `keys` filter (use `model` + `crud`); `hasListenersFor(event, model)` drops the key param
+    - Registration validation is LOUD: unknown filter keys, unknown crud flags, empty `event`/`model`/`crud`, and the old trailing-options arg (`on(event, fn, options)`) all throw — nothing silently never-matches or silently drops priority/memoize
   - Where Vocabulary: `$eq $ne $gt $gte $lt $lte $in $nin $exists $not $or $and` first-class in `.where()` AND GraphQL where-inputs (`src/query/Vocabulary.js`)
     - Allowlist validation — unknown `$`-operators now REJECT loudly (was silent passthrough; closes GQL injection surface)
     - Fixed: operators through the normal path silently matched NOTHING on Mongo (finalize flattening bug, incl. the known `$in` bug)
@@ -27,8 +28,9 @@
     - Portable semantics: `$exists` = "non-null value present"; `$ne`/`$nin` match missing/null (PG behavior aligned to Mongo)
     - Join paths inside `$or`/`$and` branches reject loudly
     - `flags({ native })` = TRUE driver dialect (unvalidated/untranslated, raw column keys, e.g. Mongo `$expr`) — still transactional/cached
-    - Legacy ARRAY-where (`.where([a, b])` OR form) normalizes to `$or` at the builder boundary (was silently match-all after the vocabulary rewrite)
+    - Legacy ARRAY-where (`.where([a, b])` OR form) normalizes to `$or` at the builder boundary (was silently match-all after the vocabulary rewrite); `.where([])` now throws via `$or` validation (was also silently match-all)
   - **`resolver.driver()` REMOVED** — use the vocabulary, `flags.native`, or your own client instance; TestSuite raw verification via test-harness `global.rawDriver`
+  - **`Resolver.$loader` / `resolver.loader()` REMOVED** — a process-global, args-only-keyed, indefinite cache is unsound under transactions (caches provisional/rolled-back data; bleeds across contexts); per-model DataLoader covers batching, cross-request memoization belongs to the app
   - Driver contract changes (pre-publication): `driver(name)` no longer required; where operators arrive INTACT (never pre-flattened — drop reconstruction); vocabulary conformance section in TestSuite
   - PostgresDriver: production-pure (all pg-mem emulation moved to test harness `PgMemShim`); real `BEGIN ISOLATION LEVEL REPEATABLE READ` + native rollback
 

@@ -4,15 +4,12 @@ const Util = require('@coderich/util');
 const QueryResolver = require('../query/QueryResolver');
 const QueryPlanner = require('../query/QueryPlanner');
 const Emitter = require('./Emitter');
-const Loader = require('./Loader');
 const DataLoader = require('./DataLoader');
 const TransactionScope = require('./TransactionScope');
 const Pipeline = require('./Pipeline');
 const { inspect, buildSelectionTree } = require('../service/AppService');
 const { $QUERY, $RAW } = require('../service/Symbols');
 const { PreOperationError, PostOperationError } = require('../service/ErrorService');
-
-const loaders = {};
 
 module.exports = class Resolver {
   #schema;
@@ -228,20 +225,6 @@ module.exports = class Resolver {
    */
   get transactionScope() {
     return this.#transactionScope;
-  }
-
-  /**
-   * Execute a user-defined loader (curry in context)
-   */
-  loader(name) {
-    const context = this.#context;
-
-    return new Proxy(loaders[name], {
-      get(loader, fn, proxy) {
-        if (fn.startsWith('load')) return args => loader[fn](args, context);
-        return Reflect.get(loader, fn, proxy);
-      },
-    });
   }
 
   /**
@@ -776,11 +759,5 @@ module.exports = class Resolver {
       if (emitDurable) await emitDurable();
       throw err;
     }
-  }
-
-  static $loader(name, resolver, config) {
-    if (!name) return loaders;
-    if (!resolver) return loaders[name];
-    return (loaders[name] = new Loader(resolver, config));
   }
 };
