@@ -47,6 +47,12 @@
     - `QueryBuilder.resolve(info)` now self-attaches its `info` (the field's selection IS the model's selection at that terminal) — user-authored resolvers ending in `.resolve(info)` get selection-aware eager/lazy scheduling for free; bare `.one()`/`.many()` terminals remain all-lazy (correct, unoptimized)
     - offsets: `buildSelectionTree` memoized per `info.fieldNodes` array (graphql-js memoizes collectSubfields, so N sibling parents share the array by identity — N walks collapse to one; per-`info` keying would never hit, since graphql builds a fresh info per invocation); QueryPlanner internal reads no longer narrow `.select()` (internal reads are SUPERSET — pre-queries share one cache identity + merge bucket with same-shaped user reads; select-islands eliminated)
   - PostgresDriver: production-pure (all pg-mem emulation moved to test harness `PgMemShim`); real `BEGIN ISOLATION LEVEL REPEATABLE READ` + native rollback
+  - PostgresDriver: real NESTED transactions via SAVEPOINT (was: hand parent handle back = Mongo-style shared fate)
+    - a child scope's `rollback()` is now PARTIAL on PG (`ROLLBACK TO SAVEPOINT` — parent survives; on real PG this also un-poisons the 25P02 aborted state, making catch-and-continue hook tolerance actually work); child `commit()` = `RELEASE` (NOT durability — fate folds into the parent)
+    - `TransactionScope` gained the NESTED classification (distinct handle from `transaction(parentHandle)`): settled callbacks (`postCommit`, cache clears) are handed UP at nested commit and fire only at the true owner's seal — a savepoint released into a transaction that later rolls back reports `postRollback`; a nested rollback fires `postRollback` promptly
+    - sibling savepoint lifetimes serialize through a per-handle gate (savepoints are a linear stack per connection — overlapping siblings would destroy/undo each other); nested chains unaffected
+    - behavioral DIVERGENCE by driver capability (by design): the same child-scope rollback is shared-fate on Mongo, partial on PG (`NestedTransactions.test.js` pins PG; TestSuite pins the shared semantics both drivers meet)
+    - `PgMemShim` emulates SAVEPOINT/RELEASE/ROLLBACK TO as layered undo state (per-layer first-capture-wins pre-images)
 
 ## v0.15.x (BREAKING)
   - Removed all deprecations

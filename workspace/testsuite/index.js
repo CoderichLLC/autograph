@@ -1,8 +1,12 @@
-const { Schema, Resolver } = require('@coderich/autograph');
+const { Schema, Resolver, Emitter } = require('@coderich/autograph');
 const schemaDef = require('./schema');
 const TestSuite = require('./TestSuite');
 
 exports.testSuite = TestSuite;
+
+// Re-exported so driver packages' OWN test files (beyond the shared suite) can register hooks
+// against the resolver this package built, without declaring @coderich/autograph themselves.
+exports.Emitter = Emitter;
 
 /**
  * Creates a minimal ObjectId shim for non-MongoDB drivers.

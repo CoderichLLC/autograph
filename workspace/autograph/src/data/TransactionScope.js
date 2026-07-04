@@ -1,15 +1,20 @@
 /**
  * Identity-based transaction bookkeeping for one logical unit of work.
  *
- * A scope tracks, per data-source client, whether it "owns" that client's session outright or
- * merely shares (is `coupled` to) an ancestor's — decided entirely by whether `client.transaction()`
- * handed back the exact same session object it was offered. MongoDB can't nest transactions, so it
- * always hands the parent session back unchanged (coupled); a savepoint-capable driver could hand
- * back a distinct handle instead. This class never asks "which driver is this" — it only reacts to
- * object identity, so it stays driver-agnostic by construction.
+ * A scope tracks, per data-source client, its relationship to that client's session — decided
+ * entirely by object identity against what `client.transaction(parentHandle)` hands back. This
+ * class never asks "which driver is this"; three relationships fall out:
  *
- * A coupled client has nothing of its own to commit/rollback — its rollback propagates to the
- * parent because there is nothing partial to undo on a shared MongoDB session.
+ *   - COUPLED: the driver returned the offered parent handle unchanged (MongoDB — a session
+ *     supports exactly one transaction). Nothing of its own to commit/rollback; rollback
+ *     propagates to the parent because there is nothing partial to undo on a shared session.
+ *   - NESTED: offered a parent handle, got a DISTINCT one back (PostgresDriver — SAVEPOINT).
+ *     Rollback is real and partial (undoes only this scope's work, parent survives), but commit
+ *     is NOT durability — it merely folds this scope's work into the parent's fate, so settled
+ *     callbacks (postCommit/postRollback, cache clears) are handed UP to the parent at commit
+ *     and only fire when the true owner seals (see #settle).
+ *   - INDEPENDENT: no parent offered (top of a unit, or `coupled: false`). Own commit/rollback
+ *     are the real, durable thing.
  */
 module.exports = class TransactionScope {
   parent;
@@ -92,7 +97,9 @@ module.exports = class TransactionScope {
       this.#pending.set(client, (async () => {
         const parentHandle = (this.parent && !this.independent) ? await this.parent.#getHandle(client) : undefined;
         const handle = await client.transaction(parentHandle);
-        const entry = { handle, coupled: handle === parentHandle, queue: Promise.resolve() };
+        // nested = offered a parent, got a distinct handle back (a real sub-transaction, e.g. a
+        // Postgres SAVEPOINT): its rollback is partial and real; its commit defers fate to parent.
+        const entry = { handle, coupled: handle === parentHandle, nested: parentHandle !== undefined && handle !== parentHandle, queue: Promise.resolve() };
         this.#entries.set(client, entry);
         if (!entry.coupled && !TransactionScope.#owners.has(handle.session)) TransactionScope.#owners.set(handle.session, { scope: this, client });
         return entry;
@@ -137,6 +144,11 @@ module.exports = class TransactionScope {
   // fn receives the outcome ('commit' | 'rollback') when it eventually runs. `key`, if given,
   // dedupes: N writes to the same model only need one settle-time cache clear, not N.
   // If the true owner has already settled, fn runs immediately — its condition is already met.
+  //
+  // NESTED entries keep their callbacks HERE at registration (unlike coupled, which route to the
+  // parent immediately) because the routing depends on how this scope settles: a nested rollback
+  // is real and final (fire now), a nested commit is provisional (hand up to the parent) — see
+  // #settle. The client is retained alongside fn so #settle can re-route per entry.
   addSettled(client, fn, key) {
     if (this.#state !== 'open') return fn(this.#state === 'committed' ? 'commit' : 'rollback');
     const entry = this.#entry(client);
@@ -145,7 +157,7 @@ module.exports = class TransactionScope {
       if (this.#settledKeys.has(key)) return undefined;
       this.#settledKeys.add(key);
     }
-    this.#settled.push(fn);
+    this.#settled.push({ client, fn });
     return undefined;
   }
 
@@ -188,8 +200,21 @@ module.exports = class TransactionScope {
       await Promise.all(entries.filter(e => !e.coupled).map(e => e.handle.rollback()));
     }
 
+    // Route each settled callback by how its client's entry actually sealed. A NESTED commit
+    // (e.g. RELEASE SAVEPOINT) is not durability — the parent still owns the fate, so those
+    // callbacks are re-registered on the parent and fire with the PARENT's eventual outcome
+    // (a savepoint released into a transaction that later rolls back must report 'rollback').
+    // A nested ROLLBACK is real and final (the work is definitively undone) — fire now, like
+    // every independent settle. Keys are not forwarded: dedupe already applied at this level,
+    // and a duplicate cache-clear at the parent is harmless while a false dedupe is not.
+    const handoff = outcome === 'commit' && this.parent
+      ? this.#settled.filter(({ client }) => this.#entries.get(client)?.nested)
+      : [];
+    const local = this.#settled.filter(s => !handoff.includes(s));
+    handoff.forEach(({ client, fn }) => this.parent.addSettled(client, fn));
+
     // Settled callbacks are isolated (allSettled): the transaction's fate is already sealed above;
     // a throwing callback must never turn a successful commit into a rejected commit() promise.
-    await Promise.allSettled(this.#settled.map(fn => Promise.resolve().then(() => fn(outcome))));
+    await Promise.allSettled(local.map(({ fn }) => Promise.resolve().then(() => fn(outcome))));
   }
 };

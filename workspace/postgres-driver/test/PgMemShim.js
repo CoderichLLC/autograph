@@ -20,9 +20,18 @@
  *   - COMMIT propagates this transaction's IDs into every still-open context's
  *     `postSnapshotIds` (they pre-date those snapshots and must stay hidden from them).
  *   - UPDATE/DELETE inside a transaction capture PRE-IMAGES first (a SELECT of the affected
- *     rows, first-capture-wins = state at transaction start); ROLLBACK restores them
- *     (delete-and-reinsert), emulating real rollback for in-place mutations — this is what lets
- *     "delete rolls back cascades when a restrict throws mid-walk" pass under pg-mem.
+ *     rows, first-capture-wins per undo LAYER = state at that layer's start); ROLLBACK restores
+ *     them (delete-and-reinsert), emulating real rollback for in-place mutations — this is what
+ *     lets "delete rolls back cascades when a restrict throws mid-walk" pass under pg-mem.
+ *   - SAVEPOINT / RELEASE SAVEPOINT / ROLLBACK TO SAVEPOINT are fully emulated (pg-mem cannot
+ *     parse them) as LAYERS of the undo state: SAVEPOINT pushes a fresh layer (inserted-ids +
+ *     pre-images recorded since that point); ROLLBACK TO undoes the layers at/above the
+ *     savepoint (deepest-first images win backwards: the SHALLOWEST post-savepoint capture of a
+ *     row is its savepoint-time state) and re-opens a fresh layer (the savepoint survives);
+ *     RELEASE merges its layers down into the enclosing segment (earliest capture wins).
+ *     First-capture-wins is per LAYER (not per transaction): a row mutated before AND after a
+ *     savepoint carries two images — txn-start (outer layer) and savepoint-time (inner layer) —
+ *     so partial and full rollback each restore the right one.
  *
  * Parsing note: pre-image capture works by pattern-matching the SQL knex generates
  * (`update "T" set ... where ...` / `delete from "T" where ...`) — regular by construction
@@ -36,6 +45,9 @@ const SELECT_RE = /^\s*select/i;
 const BEGIN_RE = /^\s*begin/i;
 const COMMIT_RE = /^\s*commit/i;
 const ROLLBACK_RE = /^\s*rollback/i;
+const SAVEPOINT_RE = /^\s*savepoint\s+"?([\w$]+)"?/i;
+const RELEASE_RE = /^\s*release\s+savepoint\s+"?([\w$]+)"?/i;
+const ROLLBACK_TO_RE = /^\s*rollback\s+to\s+savepoint\s+"?([\w$]+)"?/i; // must be tested BEFORE ROLLBACK_RE (which also matches it)
 
 exports.wrapPool = (pool) => {
   const allPendingIds = new Set();
@@ -81,6 +93,31 @@ exports.wrapPool = (pool) => {
     });
   };
 
+  // One undo LAYER: the inserts and row pre-images recorded during one savepoint segment.
+  const newLayer = () => ({ preImages: new Map(), inserted: new Map() }); // preImages: `table\0id` -> { table, row }; inserted: table -> Set(_id)
+
+  // Restore a captured pre-image (delete-and-reinsert — pg-mem has no real rollback).
+  const restoreImage = async ({ table, row }) => {
+    const cols = Object.keys(row);
+    const values = cols.map((col) => {
+      const v = row[col];
+      if (v === null || v === undefined) return null;
+      if (Array.isArray(v) || (typeof v === 'object' && !(v instanceof Date))) return JSON.stringify(v);
+      return v;
+    });
+    await rawPoolQuery(`DELETE FROM "${table}" WHERE "_id" = $1`, [row._id]);
+    await rawPoolQuery(
+      `INSERT INTO "${table}" (${cols.map(c => `"${c}"`).join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')})`,
+      values,
+    );
+  };
+
+  const deleteRows = async (table, ids) => {
+    if (!ids.length) return;
+    const placeholders = ids.map((_, i) => `$${i + 1}`).join(', ');
+    await rawPoolQuery(`DELETE FROM "${table}" WHERE "_id" IN (${placeholders})`, ids);
+  };
+
   const rawConnect = pool.connect.bind(pool);
   pool.connect = (...connectArgs) => Promise.resolve(rawConnect(...connectArgs)).then((client) => {
     const rawQuery = client.query.bind(client);
@@ -96,6 +133,35 @@ exports.wrapPool = (pool) => {
     };
     let ctx = null;
 
+    // Undo the given layers (a partial or full rollback): delete their inserts, then restore
+    // pre-images — for each row the SHALLOWEST (earliest-captured) image among these layers wins,
+    // which is its state when the first of these layers began. Rows whose insert was just undone
+    // are skipped (their rollback IS the deletion). Returns the set of ids whose inserts were undone.
+    const undoLayers = async (layers) => {
+      const undone = new Set();
+      for (const layer of layers) {
+        for (const [table, ids] of layer.inserted) {
+          await deleteRows(table, [...ids]); // eslint-disable-line no-await-in-loop
+          for (const id of ids) {
+            undone.add(id);
+            ctx.ownPending.delete(id);
+            allPendingIds.delete(id);
+            ctx.ownPendingByModel.get(table)?.delete(id);
+          }
+        }
+      }
+      const restored = new Set();
+      for (const layer of layers) { // shallowest first — earliest capture wins
+        for (const [key, image] of layer.preImages) {
+          if (!restored.has(key) && !undone.has(image.row._id)) {
+            restored.add(key);
+            await restoreImage(image); // eslint-disable-line no-await-in-loop
+          }
+        }
+      }
+      return undone;
+    };
+
     return {
       query: async (sql, ...rest) => {
         const text = String(sql);
@@ -106,40 +172,57 @@ exports.wrapPool = (pool) => {
             ownPendingByModel: new Map(),
             exclusions: new Set(allPendingIds), // snapshot: pending elsewhere at txn start
             postSnapshotIds: new Set(), // committed elsewhere after txn start
-            preImages: new Map(), // `table\0id` -> { table, row } — txn-start state of mutated rows
+            layers: [newLayer()], // undo segments; layer 0 = the transaction's base segment
+            savepoints: new Map(), // name -> index of the layer that savepoint's segment starts at
           };
           txnContexts.add(ctx);
           return run('BEGIN'); // strip any isolation-level clause pg-mem can't parse
+        }
+
+        // Savepoint commands are fully emulated — pg-mem cannot parse them, so they NEVER reach
+        // it. Order matters: ROLLBACK TO SAVEPOINT also matches the plain-ROLLBACK regex below.
+        const sp = ctx ? text.match(SAVEPOINT_RE) : null;
+        if (sp) {
+          ctx.savepoints.set(sp[1], ctx.layers.length);
+          ctx.layers.push(newLayer());
+          return { rows: [], rowCount: 0 };
+        }
+        const rto = ctx ? text.match(ROLLBACK_TO_RE) : null;
+        if (rto) {
+          const idx = ctx.savepoints.get(rto[1]);
+          if (idx === undefined) throw new Error(`PgMemShim: no such savepoint "${rto[1]}"`);
+          await undoLayers(ctx.layers.slice(idx));
+          ctx.layers.length = idx;
+          ctx.layers.push(newLayer()); // the savepoint survives ROLLBACK TO — fresh segment
+          for (const [name, i] of ctx.savepoints) if (i > idx) ctx.savepoints.delete(name); // deeper savepoints are destroyed
+          return { rows: [], rowCount: 0 };
+        }
+        const rel = ctx ? text.match(RELEASE_RE) : null;
+        if (rel) {
+          const idx = ctx.savepoints.get(rel[1]);
+          if (idx === undefined) throw new Error(`PgMemShim: no such savepoint "${rel[1]}"`);
+          // Fold the released segment(s) into the enclosing one: earliest capture wins per row
+          // (the enclosing layer's image predates the released layer's); inserts union.
+          const target = ctx.layers[idx - 1];
+          for (const layer of ctx.layers.slice(idx)) {
+            for (const [key, image] of layer.preImages) if (!target.preImages.has(key)) target.preImages.set(key, image);
+            for (const [table, ids] of layer.inserted) {
+              if (!target.inserted.has(table)) target.inserted.set(table, new Set());
+              for (const id of ids) target.inserted.get(table).add(id);
+            }
+          }
+          ctx.layers.length = idx;
+          for (const [name, i] of ctx.savepoints) if (i >= idx) ctx.savepoints.delete(name); // this savepoint and deeper ones are gone
+          return { rows: [], rowCount: 0 };
         }
 
         if (COMMIT_RE.test(text) || ROLLBACK_RE.test(text)) {
           const isRollback = ROLLBACK_RE.test(text);
           if (ctx) {
             if (isRollback) {
-              // pg-mem rollback is a no-op — manually delete the rows this txn inserted...
-              for (const [model, ids] of ctx.ownPendingByModel) {
-                if (ids.size > 0) {
-                  const placeholders = [...ids].map((_, i) => `$${i + 1}`).join(', ');
-                  await rawPoolQuery(`DELETE FROM "${model}" WHERE "_id" IN (${placeholders})`, [...ids]); // eslint-disable-line no-await-in-loop
-                }
-              }
-              // ...and restore the pre-images of every row it updated or deleted.
-              for (const { table, row } of ctx.preImages.values()) {
-                const cols = Object.keys(row);
-                const values = cols.map((col) => {
-                  const v = row[col];
-                  if (v === null || v === undefined) return null;
-                  if (Array.isArray(v) || (typeof v === 'object' && !(v instanceof Date))) return JSON.stringify(v);
-                  return v;
-                });
-                /* eslint-disable no-await-in-loop */
-                await rawPoolQuery(`DELETE FROM "${table}" WHERE "_id" = $1`, [row._id]);
-                await rawPoolQuery(
-                  `INSERT INTO "${table}" (${cols.map(c => `"${c}"`).join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')})`,
-                  values,
-                );
-                /* eslint-enable no-await-in-loop */
-              }
+              // Full rollback = undo every layer (deletes all own inserts, restores every row's
+              // EARLIEST image — its transaction-start state).
+              await undoLayers(ctx.layers);
             } else {
               // Committed IDs post-date every other open snapshot — keep hiding them there.
               for (const other of txnContexts) {
@@ -154,9 +237,11 @@ exports.wrapPool = (pool) => {
         }
 
         // PRE-IMAGE capture: before an in-transaction UPDATE/DELETE executes, snapshot the
-        // rows it will touch so ROLLBACK can restore them. First capture per row wins (= the
-        // row's state at transaction start); rows this txn itself inserted are skipped (their
-        // rollback is deletion).
+        // rows it will touch so ROLLBACK (full or to-savepoint) can restore them. First capture
+        // per LAYER wins (= the row's state when the current savepoint segment began). Rows
+        // inserted in the CURRENT layer are skipped (this segment's rollback deletes them) —
+        // rows inserted in an EARLIER layer still need this layer's image, because a partial
+        // rollback keeps the row but must revert this segment's mutations.
         if (ctx) {
           const params = rest[0] || [];
           const update = text.match(UPDATE_RE);
@@ -178,10 +263,11 @@ exports.wrapPool = (pool) => {
               selectParams = where ? params : [];
             }
             const affected = await run(selectSql, selectParams);
+            const top = ctx.layers[ctx.layers.length - 1];
             for (const row of affected?.rows ?? []) {
               const key = `${table}\u0000${row._id}`;
-              if (row._id && !ctx.ownPending.has(row._id) && !ctx.preImages.has(key)) {
-                ctx.preImages.set(key, { table, row });
+              if (row._id && !top.inserted.get(table)?.has(row._id) && !top.preImages.has(key)) {
+                top.preImages.set(key, { table, row });
               }
             }
           }
@@ -192,6 +278,7 @@ exports.wrapPool = (pool) => {
         if (ctx) {
           const insert = text.match(INSERT_RE);
           if (insert && result?.rows) {
+            const top = ctx.layers[ctx.layers.length - 1];
             for (const row of result.rows) {
               const id = row._id;
               if (id) {
@@ -199,6 +286,8 @@ exports.wrapPool = (pool) => {
                 allPendingIds.add(id);
                 if (!ctx.ownPendingByModel.has(insert[1])) ctx.ownPendingByModel.set(insert[1], new Set());
                 ctx.ownPendingByModel.get(insert[1]).add(id);
+                if (!top.inserted.has(insert[1])) top.inserted.set(insert[1], new Set());
+                top.inserted.get(insert[1]).add(id);
               }
             }
           }

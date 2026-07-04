@@ -24,9 +24,12 @@ reads inside an explicit transaction should get real snapshot isolation (§4.6, 
 resolved in favor of yes, matching how a real database transaction behaves. See §4.10 for the
 concrete bugs each of these steps caught.
 
-Any future driver that supports true nested transactions (e.g. Postgres `SAVEPOINT`) is a secondary
-concern this design leaves room for, but is not assumed or required to exist — the current
-`PostgresDriver` does not implement real nested transactions; it decomposes exactly like Mongo does.
+True nested transactions are no longer hypothetical: `PostgresDriver` implements them via
+`SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (returning a distinct handle from `transaction(parentHandle)`),
+and `TransactionScope` classifies that relationship as NESTED — child rollback is real and partial
+(the parent survives), child commit folds the work into the parent's fate (settled callbacks hand
+up; durability is the true owner's seal). MongoDB continues to decompose (coupled/shared-fate).
+The design never asks which driver it's talking to — see §2.
 
 ## 1. Requirements
 
@@ -81,15 +84,29 @@ framework opinionated about a specific driver, exactly what it must avoid. Inste
 - `TransactionScope` always structurally offers a parent handle to the driver:
   `client.transaction(parentHandle)`, unconditionally, whenever a parent scope exists.
 - **What comes back decides everything, and it's decided entirely by identity, not by asking
-  "does this driver support nesting."** `MongoDriver.transaction(parentHandle)` and
-  `PostgresDriver.transaction(parentHandle)` both know they can't nest, so they simply return
-  `parentHandle` unchanged — that decomposition happens entirely inside the driver. A hypothetical
-  savepoint-capable driver would instead return a distinct handle.
-- `TransactionScope` reacts generically: `const coupled = handle === parentHandle;`. If coupled,
+  "does this driver support nesting."** `MongoDriver.transaction(parentHandle)` knows it can't
+  nest, so it returns `parentHandle` unchanged — that decomposition happens entirely inside the
+  driver. `PostgresDriver.transaction(parentHandle)` opens a `SAVEPOINT` on the parent's
+  connection and returns a distinct handle (commit = `RELEASE`, rollback = `ROLLBACK TO`).
+- `TransactionScope` reacts generically to the identity: COUPLED (`handle === parentHandle`) —
   this scope's `commit()` is a true no-op and its `rollback()` propagates to the parent (there is
-  nothing partial to undo). If not coupled, commit/rollback act on the distinct handle directly.
-  **This single rule works for Mongo/Postgres's decomposition and a savepoint-capable driver's real
-  nesting without autograph ever knowing which one it's talking to.**
+  nothing partial to undo). NESTED (offered a parent, got a distinct handle) — `rollback()` is
+  real and PARTIAL (only this scope's work is undone; the parent survives), while `commit()`
+  seals nothing durable: it folds the work into the parent's fate, so settled callbacks
+  (`postCommit`/`postRollback` emission, cache clears) are handed UP to the parent and fire at
+  the true owner's seal with the true owner's outcome — a savepoint released into a transaction
+  that later rolls back reports `postRollback`. INDEPENDENT (no parent offered) — own
+  commit/rollback are the real, durable thing.
+  **These identity rules work for Mongo's decomposition and Postgres's real nesting without
+  autograph ever knowing which one it's talking to.**
+- One Postgres-specific discipline lives inside the driver, invisible to AG: savepoints are a
+  LINEAR STACK per connection (releasing one destroys every later one; rolling one back undoes
+  every interleaved write after it), so sibling savepoint lifetimes serialize through a
+  per-handle gate. Nested chains use their own handle's gate — strict nesting cannot deadlock.
+  A pleasant consequence on real Postgres: any statement error aborts the surrounding
+  transaction (25P02) until *something* rolls back — `ROLLBACK TO SAVEPOINT` is that something,
+  so a participant hook's catch-and-continue tolerance around a failed nested write (RI/`*Many`/
+  manual child) actually works on PG, where without savepoints it could not.
 
 ## 3. Why the old (pre-0.15) stack-based approach broke
 
@@ -131,7 +148,7 @@ class TransactionScope {
   parent;                      // parent TransactionScope | null — logical nesting only, see §2
   independent;                 // if true, never offers `parent`'s handle to the driver at all
   #pending = new Map();        // client -> Promise<Entry>, claimed SYNCHRONOUSLY — see #claim
-  #entries = new Map();        // client -> Entry ({ handle, coupled, queue }), populated once claimed
+  #entries = new Map();        // client -> Entry ({ handle, coupled, nested, queue }), populated once claimed
   #settled = [];               // callbacks deferred until this client's session truly, finally seals
 
   static tagSession(session) { /* stable, JSON-safe id for a session — see §4.9 */ }
@@ -146,7 +163,12 @@ class TransactionScope {
       this.#pending.set(client, (async () => {
         const parentHandle = (this.parent && !this.independent) ? await this.parent.#getHandle(client) : undefined;
         const handle = await client.transaction(parentHandle);      // driver decides what comes back
-        const entry = { handle, coupled: handle === parentHandle, queue: Promise.resolve() };
+        const entry = {
+          handle,
+          coupled: handle === parentHandle,                          // same handle back: shared fate (Mongo)
+          nested: parentHandle !== undefined && handle !== parentHandle, // distinct handle: real sub-txn (PG SAVEPOINT)
+          queue: Promise.resolve(),
+        };
         this.#entries.set(client, entry);
         return entry;
       })());
@@ -157,10 +179,10 @@ class TransactionScope {
   async getSession(client) { return (await this.#claim(client)).handle.session; }
 
   enqueue(client, fn) { /* serializes physical calls per client; coupled delegates to parent's queue */ }
-  addSettled(client, fn) { /* defers fn until this client's session truly seals; coupled forwards to parent — see §4.9 */ }
+  addSettled(client, fn) { /* defers fn until this client's session TRULY seals; coupled forwards to parent at registration; nested hands up at commit-time — see §4.9 */ }
 
-  async commit() { /* drains queues (allSettled — §4.10 #2), commits non-coupled handles, runs #settled */ }
-  async rollback() { /* drains queues, propagates to parent if any client is coupled, rolls back non-coupled handles, runs #settled */ }
+  async commit() { /* drains queues (allSettled — §4.10 #2), commits non-coupled handles (a NESTED commit = RELEASE — hands #settled up to the parent, not durability), runs remaining #settled */ }
+  async rollback() { /* drains queues, propagates to parent if any client is coupled, rolls back non-coupled handles (a NESTED rollback = ROLLBACK TO — partial and final; parent survives), runs #settled */ }
 }
 ```
 
@@ -311,10 +333,12 @@ with whatever else is going on:
   `client.transaction(undefined)` opens a genuinely new session, and this scope's `commit()`/
   `rollback()` are real. AG closes what it opened, entirely self-contained — no host involved.
 - **Something already ambient** (the whole-request root scope, or a manual transaction) →
-  `client.transaction(parentHandle)` hands back the *same* handle, `coupled` resolves to `true`
-  automatically, and this scope's `commit()` becomes a no-op while `rollback()` propagates up.
-  That's correct, not a compromise: if this batch is logically running inside a bigger transaction,
-  a failure in it *should* take the bigger one down too.
+  `client.transaction(parentHandle)` and the driver decides. Mongo hands back the *same* handle
+  (`coupled`): this scope's `commit()` becomes a no-op while `rollback()` propagates up — a
+  failure in the batch takes the bigger unit down too. Postgres hands back a savepoint handle
+  (`nested`): `rollback()` undoes exactly the batch (`ROLLBACK TO`) and the error still
+  propagates to whatever carries the unit — same net outcome when uncaught, but a caller who
+  CATCHES the batch failure keeps a live, un-poisoned parent transaction to continue in.
 
 **There is no case where "not knowing which one it got" produces the wrong outcome — both branches
 are independently correct.** That symmetry is what makes calling `withTransaction` unconditionally
@@ -330,10 +354,11 @@ resolver.withTransaction(async (txn) => { /* ... */ }, { isolated, coupled })
 - No ambient scope present → always starts a new, top-level scope regardless of `coupled` (there's
   nothing to relate it to).
 - Ambient scope present, `coupled: true` (default) → offers the ambient scope's handle to the
-  driver and accepts whatever relationship comes back. On Mongo/Postgres (today), that's always the
-  same physical session — rolling back this "child" rolls back the ambient parent too, full stop,
-  by construction, not by choice. This is the closest thing to "nesting" these drivers can honestly
-  offer.
+  driver and accepts whatever relationship comes back. On Mongo that's the same physical session
+  (coupled) — rolling back this "child" rolls back the ambient parent too, by construction; the
+  closest thing to nesting Mongo can honestly offer. On Postgres it's a SAVEPOINT (nested) —
+  rolling back this child undoes only the child, and the parent survives. Same API, driver-honest
+  semantics.
 - Ambient scope present, `coupled: false` → does **not** offer the parent's handle to the driver at
   all; a wholly separate session is opened regardless of driver capability. Genuinely independent:
   the ambient parent's rollback does not affect it, and vice versa. This is a deliberate, explicit

@@ -9,6 +9,18 @@ const knex = knexLib({ client: 'pg' });
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
 
 module.exports = class PostgresDriver {
+  // Hidden state hung off transaction handles so nested transaction() calls can reach their
+  // parent's physical connection (see transaction()). Symbols keyed on the class — never
+  // enumerable, never serialized, invisible to TransactionScope's identity checks.
+  static #CONN = Symbol('pg-connection'); // shared per connection: { query, seq }
+  // Per-handle sibling gate: SAVEPOINTs are a LINEAR STACK per connection (releasing one
+  // destroys every later one; rolling one back undoes every interleaved write after it), so two
+  // savepoint children of the same parent must not have OVERLAPPING lifetimes. Each handle
+  // carries a gate its DIRECT children queue on: a new savepoint waits for the previous sibling
+  // to settle. Nested chains (savepoint under savepoint) use their own handle's gate — a child
+  // never waits on its ancestor's gate, so strict nesting can't deadlock.
+  static #GATE = Symbol('pg-sibling-gate'); // { p: Promise } — mutable box
+
   #pool;
   #config;
 
@@ -96,13 +108,41 @@ module.exports = class PostgresDriver {
     );
   }
 
-  // No real SAVEPOINT support yet — when offered a parent handle (an ambient scope this call is
-  // nested under), hand it back unchanged rather than silently opening a second, unrelated
-  // transaction. TransactionScope reacts to that identity (handle === parentHandle) to know this
-  // is a coupled/shared-fate relationship. A future revision could implement real nested
-  // transactions via SAVEPOINT/RELEASE SAVEPOINT and return a distinct handle instead.
+  // Nested calls (offered a parent handle — an ambient scope this call runs under) open a real
+  // SAVEPOINT on the parent's connection and return a DISTINCT handle: commit = RELEASE (folds
+  // the work into the parent's fate — NOT durability), rollback = ROLLBACK TO (a real partial
+  // rollback that undoes only this scope's work AND un-poisons an aborted transaction (25P02),
+  // leaving the parent usable — this is what lets a participant hook catch a failed nested write
+  // and continue). TransactionScope classifies the distinct handle as NESTED and routes settled
+  // callbacks (postCommit etc.) up to the true owner. Savepoints nest natively (sp under sp).
   transaction(parentHandle) {
-    if (parentHandle) return Promise.resolve(parentHandle);
+    if (parentHandle) {
+      const conn = parentHandle[PostgresDriver.#CONN];
+      if (!conn) return Promise.resolve(parentHandle); // foreign handle — degrade to coupled/shared-fate
+      const gate = parentHandle[PostgresDriver.#GATE];
+      const prev = gate.p;
+      let release;
+      gate.p = new Promise((resolve) => { release = resolve; });
+      return prev.then(() => {
+        const name = `ag_sp_${++conn.seq}`;
+        return conn.query(`SAVEPOINT ${name}`).catch((e) => { release(); throw e; }).then(() => {
+          let closed = false;
+          const close = (fn) => {
+            if (closed) return Promise.resolve();
+            closed = true;
+            return fn().finally(release); // settle opens the gate for the next sibling
+          };
+          return Object.defineProperties({}, {
+            [PostgresDriver.#CONN]: { value: conn },
+            [PostgresDriver.#GATE]: { value: { p: Promise.resolve() } },
+            session: { value: { query: (...args) => conn.query(...args) }, enumerable: true },
+            commit: { value: () => close(() => conn.query(`RELEASE SAVEPOINT ${name}`)) },
+            // ROLLBACK TO re-establishes the savepoint (it stays defined); RELEASE pops it cleanly.
+            rollback: { value: () => close(() => conn.query(`ROLLBACK TO SAVEPOINT ${name}`).then(() => conn.query(`RELEASE SAVEPOINT ${name}`))) },
+          });
+        });
+      });
+    }
 
     // A Postgres transaction IS a dedicated connection running BEGIN..COMMIT/ROLLBACK — the
     // opaque session token AG threads back (query.options.session) is simply "which executor to
@@ -114,7 +154,10 @@ module.exports = class PostgresDriver {
       const level = this.#config.transaction?.isolationLevel ?? 'REPEATABLE READ';
       return client.query(`BEGIN ISOLATION LEVEL ${level}`).then(() => {
         let closed = false;
-        const session = { query: (...args) => client.query(...args) };
+        // Shared per-connection state savepoint children reach through their parent handle:
+        // one query funnel + one monotonic savepoint-name sequence per physical connection.
+        const conn = { query: (...args) => client.query(...args), seq: 0 };
+        const session = { query: (...args) => conn.query(...args) };
 
         // Because we allow queries in parallel we want to prevent calling this more than once.
         const close = (cmd) => {
@@ -124,6 +167,8 @@ module.exports = class PostgresDriver {
         };
 
         return Object.defineProperties({}, {
+          [PostgresDriver.#CONN]: { value: conn },
+          [PostgresDriver.#GATE]: { value: { p: Promise.resolve() } },
           session: { value: session, enumerable: true },
           commit: { value: () => close('COMMIT') },
           rollback: { value: () => close('ROLLBACK') },

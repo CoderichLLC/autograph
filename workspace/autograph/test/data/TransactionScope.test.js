@@ -61,6 +61,93 @@ describe('TransactionScope', () => {
     });
   });
 
+  describe('nested (savepoint) handles — partial rollback is real, commit defers fate to parent', () => {
+    // Savepoint-capable fake: offered a parent handle, returns a DISTINCT handle (the way
+    // PostgresDriver wraps SAVEPOINT/RELEASE/ROLLBACK TO). TransactionScope must classify this
+    // as NESTED — not coupled (no shared-fate propagation), not independent (commit ≠ durable).
+    function createSavepointClient() {
+      const handles = [];
+      const transaction = jest.fn((parentHandle) => {
+        const handle = { session: {}, commit: jest.fn(() => Promise.resolve()), rollback: jest.fn(() => Promise.resolve()) };
+        handles.push(handle);
+        return Promise.resolve(handle);
+      });
+      return { client: { transaction }, handles };
+    }
+
+    test('nested commit hands settled callbacks up — they fire only at the PARENT\'s real commit', async () => {
+      const { client } = createSavepointClient();
+      const parent = new TransactionScope();
+      await parent.getSession(client);
+      const child = new TransactionScope({ parent });
+      await child.getSession(client);
+
+      const outcomes = [];
+      child.addSettled(client, o => outcomes.push(o));
+      await child.commit(); // RELEASE — provisional, NOT durability
+      expect(outcomes).toEqual([]);
+
+      await parent.commit();
+      expect(outcomes).toEqual(['commit']);
+    });
+
+    test('a savepoint released into a transaction that later rolls back reports ROLLBACK', async () => {
+      const { client } = createSavepointClient();
+      const parent = new TransactionScope();
+      await parent.getSession(client);
+      const child = new TransactionScope({ parent });
+      await child.getSession(client);
+
+      const outcomes = [];
+      child.addSettled(client, o => outcomes.push(o));
+      await child.commit();
+      await parent.rollback(); // the child's "committed" work is undone with the parent
+      expect(outcomes).toEqual(['rollback']);
+    });
+
+    test('nested rollback is real and final — callbacks fire immediately, the parent SURVIVES', async () => {
+      const { client, handles } = createSavepointClient();
+      const parent = new TransactionScope();
+      await parent.getSession(client);
+      const child = new TransactionScope({ parent });
+      await child.getSession(client);
+
+      const childOutcomes = [];
+      const parentOutcomes = [];
+      child.addSettled(client, o => childOutcomes.push(o));
+      parent.addSettled(client, o => parentOutcomes.push(o));
+
+      await child.rollback(); // ROLLBACK TO SAVEPOINT — partial, definitive
+      expect(childOutcomes).toEqual(['rollback']); // fired NOW, not at parent settle
+      expect(parent.state).toBe('open'); // no coupled-style propagation
+
+      await parent.commit();
+      expect(parentOutcomes).toEqual(['commit']);
+      const [parentHandle, childHandle] = handles;
+      expect(childHandle.rollback).toHaveBeenCalledTimes(1);
+      expect(parentHandle.rollback).not.toHaveBeenCalled();
+      expect(parentHandle.commit).toHaveBeenCalledTimes(1);
+    });
+
+    test('savepoint-under-savepoint chains the handoff — the TOP owner\'s outcome wins', async () => {
+      const { client } = createSavepointClient();
+      const top = new TransactionScope();
+      await top.getSession(client);
+      const mid = new TransactionScope({ parent: top });
+      await mid.getSession(client);
+      const leaf = new TransactionScope({ parent: mid });
+      await leaf.getSession(client);
+
+      const outcomes = [];
+      leaf.addSettled(client, o => outcomes.push(o));
+      await leaf.commit(); // hands to mid
+      await mid.commit(); // hands to top
+      expect(outcomes).toEqual([]);
+      await top.rollback();
+      expect(outcomes).toEqual(['rollback']);
+    });
+  });
+
   describe('async claim race (regression)', () => {
     // Bug: the original #getHandle checked `has(client)` before awaiting client.transaction(),
     // so N concurrent callers (e.g. a *Many batch firing N .save() calls via Promise.all) would
