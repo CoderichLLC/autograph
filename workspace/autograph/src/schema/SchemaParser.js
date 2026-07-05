@@ -558,7 +558,10 @@ function parseSchema(config, typeDefs) {
             const to = $field.model.key;
             // Virtual side: join `linkTo[linkBy]` against this model's pk (linkBy names the FK column on the linked model).
             // Straight FK side: join `linkTo[fkField]` against this field's stored value (fkField names the linked column our value targets).
-            const on = $field.linkTo.fields[$field.isVirtual ? $field.linkBy : $field.fkField].key;
+            const joinFieldName = $field.isVirtual ? $field.linkBy : $field.fkField;
+            const joinField = $field.linkTo.fields[joinFieldName];
+            if (!joinField) throw new Error(`Schema validation failed: ${$model}.${$field} — ${$field.isVirtual ? `@link(by: "${joinFieldName}")` : `@field(fk: "${joinFieldName}")`} does not name a field on ${$field.linkTo}`);
+            const on = joinField.key;
             const from = $field.linkField.key;
             const as = `join_${to}`;
             $field.join = { to, on, from, as, toSource: $field.model.source };
@@ -674,9 +677,33 @@ function parseSchema(config, typeDefs) {
   $schema.indexes = $schema.indexes.map((index) => {
     const { key } = index.model;
     const { name, type } = index;
-    const on = index.on.map(f => index.model.fields[f].key);
+    const on = index.on.map((f) => {
+      const ixField = index.model.fields[f];
+      if (!ixField) throw new Error(`Schema validation failed: @index "${name}" on ${index.model} — "${f}" does not name a field on ${index.model}`);
+      return ixField.key;
+    });
     return { key, name, type, on };
   });
+
+  // DSL reference validation — every pipeline name the SDL references must resolve by the end of
+  // parse. A dangling reference (a typo'd @field(validate: bookNmae), or a Pipeline.define that
+  // runs after parse) would otherwise surface as a cryptic TypeError on the FIRST WRITE touching
+  // that field — in production, mid-request. All problems aggregate into ONE boot-time error so
+  // a broken schema never boots and every issue is fixed in one pass. (Consequence: custom
+  // pipelines MUST be defined BEFORE schema.parse() — define-then-parse is now the contract.)
+  const danglingRefs = [];
+  Object.values($schema.models).forEach(($model) => {
+    Object.values($model.fields).forEach(($field) => {
+      Object.entries($field.pipelines ?? {}).forEach(([stage, names]) => {
+        names.forEach((pipelineName) => {
+          if (typeof pipelineName === 'string' && typeof Pipeline[pipelineName] !== 'function') {
+            danglingRefs.push(`${$model}.${$field} — unknown pipeline "${pipelineName}" (${stage}); define it with Pipeline.define('${pipelineName}', fn) before schema.parse()`);
+          }
+        });
+      });
+    });
+  });
+  if (danglingRefs.length) throw new Error(`Schema validation failed:\n  - ${danglingRefs.join('\n  - ')}`);
 
   // Helper methods
   const resolvePathCache = {};

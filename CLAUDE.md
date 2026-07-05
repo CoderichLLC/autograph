@@ -81,6 +81,8 @@ GraphQL Schema (typeDefs with directives)
 
 Stage definitions come from `@field()` directives: `@field(construct: "createdAt", serialize: "toObjectId")`.
 
+**DSL references validate at parse time, loudly.** Every pipeline name in every `@field(...)` stage must resolve against `Pipeline` by the end of `schema.parse()` — dangling references aggregate into one boot-time error naming model.field/stage (they used to surface as cryptic TypeErrors on the first write touching the field). Same for `@link(by:)`/`@field(fk:)` targets and `@index(on:)` fields (descriptive parse errors, not `undefined.key` crashes). **Contract: define-then-parse** — custom `Pipeline.define()` calls must run before `schema.parse()`. See `SchemaValidation.test.js`.
+
 ### Schema Directives
 
 ```graphql
