@@ -31,8 +31,18 @@ const sorter = (a, b) => {
   return 0;
 };
 
-module.exports = () => describe('TestSuite', () => {
+// `supports` mirrors the consumer's dataSource declaration — the conformance suite is
+// capability-aware: sections asserting transactional semantics (snapshot isolation,
+// rollback-undoes, batch atomicity) only bind drivers that DECLARE 'transactions'; a source
+// without it runs the UNCARRIED-semantics variant instead (writes durable when awaited,
+// commit() no-op, rollback() cannot undo — the doctrine is asserted, not skipped).
+// 'joins' needs no gating: join-shaped queries pass unchanged through the QueryPlanner
+// fallback when undeclared — that is the point of it.
+module.exports = ({ supports = ['transactions', 'joins'] } = {}) => describe('TestSuite', () => {
   let resolver, context, ObjectId;
+  const hasTxns = supports.includes('transactions');
+  const describeTxns = hasTxns ? describe : describe.skip;
+  const testTxns = hasTxns ? test : test.skip;
 
   // Extend jest!
   expect.extend({
@@ -744,7 +754,7 @@ module.exports = () => describe('TestSuite', () => {
       expect(await resolver.match('Art').many()).toMatchObject([{ bids: [109.99] }, { bids: [109.99] }]);
     });
 
-    test('multi-create rolls back on partial validation failure', async () => {
+    testTxns('multi-create rolls back on partial validation failure', async () => {
       await expect(resolver.match('Person').save([
         { name: 'AtomicCreate1', emailAddress: 'atomic1@example.com' },
         { name: 'AtomicCreate2', emailAddress: 'not-an-email' }, // fails @field(validate: email)
@@ -752,7 +762,7 @@ module.exports = () => describe('TestSuite', () => {
       expect(await resolver.match('Person').where({ name: 'AtomicCreate1' }).one()).toBeNull();
     });
 
-    test('multi-create rolls back on partial uniqueness violation', async () => {
+    testTxns('multi-create rolls back on partial uniqueness violation', async () => {
       // Seed one record so the second of the pair below collides on the unique name index.
       const seed = await resolver.match('Person').save({ name: 'AtomicSeed', emailAddress: 'atomicseed@example.com' });
       expect(seed.id).toBeDefined();
@@ -767,7 +777,7 @@ module.exports = () => describe('TestSuite', () => {
       await resolver.match('Person').id(seed.id).delete();
     });
 
-    test('multi-update rolls back on partial validation failure', async () => {
+    testTxns('multi-update rolls back on partial validation failure', async () => {
       // Seed two records, then attempt updateMany where one would fail validation.
       const [a, b] = await resolver.match('Person').save([
         { name: 'AtomicUpdA', emailAddress: 'updA@example.com' },
@@ -784,6 +794,21 @@ module.exports = () => describe('TestSuite', () => {
       // Cleanup
       await resolver.match('Person').id([a.id, b.id]).delete();
     });
+
+    if (!hasTxns) {
+      test('UNCARRIED: a partial batch failure leaves PRIOR batch writes durable (rollback had nothing to undo)', async () => {
+        const seed = await resolver.match('Person').save({ name: 'AtomicSeed', emailAddress: 'atomicseed@example.com' });
+        await expect(resolver.match('Person').save([
+          { name: 'AtomicCreate3', emailAddress: 'atomic3@example.com' },
+          { name: 'AtomicSeed', emailAddress: 'atomic4@example.com' }, // duplicate name → index violation
+        ])).rejects.toThrow(/duplicate/gi);
+        // The *Many wrap still opened/settled its scope — but with no 'transactions' support the
+        // scope was inert: item 1's write dispatched sessionless and is durable.
+        const survivor = await resolver.match('Person').where({ name: 'AtomicCreate3' }).one();
+        expect(survivor).not.toBeNull();
+        await resolver.match('Person').id([survivor.id, seed.id]).delete();
+      });
+    }
   });
 
   describe('Where Vocabulary (conformance)', () => {
@@ -867,7 +892,7 @@ module.exports = () => describe('TestSuite', () => {
     });
   });
 
-  describe('Transactions (manual)', () => {
+  describeTxns('Transactions (manual)', () => {
     test('single txn (commit)', async () => {
       const txn = resolver.transaction();
       const person1$1 = await txn.match('Person').save({ name: 'person1', emailAddress: 'person1@gmail.com' });
@@ -932,7 +957,7 @@ module.exports = () => describe('TestSuite', () => {
     });
   });
 
-  describe('Transactions (manual-with-auto)', () => {
+  describeTxns('Transactions (manual-with-auto)', () => {
     test('multi-txn (rollback isolates inner writes)', async () => {
       // With the pair/isolated model, an auto-wrap *Many inside a user txn writes into the
       // user txn's pre-session. Reads from the root resolver (outside the txn) see snapshot-
@@ -967,6 +992,46 @@ module.exports = () => describe('TestSuite', () => {
       await txn2.rollback();
     });
   });
+
+  // The doctrine for a source that declares NO 'transactions' support: scopes are inert — not an
+  // error, a defined mode. These assert what the capability contract PROMISES in that mode; the
+  // describes above assert what it promises when the capability is declared. One suite, two
+  // honest halves — a driver binds exactly one.
+  if (!hasTxns) {
+    describe('Transactions (uncarried — source declares no transaction support)', () => {
+      afterEach(async () => {
+        const rows = await resolver.match('Person').where({ name: 'uncarried*' }).many();
+        await Promise.all(rows.map(r => resolver.match('Person').id(r.id).delete()));
+      });
+
+      test('scopes are inert: writes are immediately durable AND visible everywhere, commit() is a no-op', async () => {
+        const txn = resolver.transaction();
+        const person = await txn.match('Person').save({ name: 'uncarried1', emailAddress: 'uncarried1@gmail.com' });
+        // No isolation: the sessionless write is visible through the root resolver pre-"commit".
+        expect(await resolver.match('Person').id(person.id).one()).not.toBeNull();
+        await txn.commit(); // no-op — resolves cleanly
+        expect(await resolver.match('Person').id(person.id).one()).not.toBeNull();
+      });
+
+      test('rollback() CANNOT undo — declaring no support is consenting to that', async () => {
+        const txn = resolver.transaction();
+        const person = await txn.match('Person').save({ name: 'uncarried2', emailAddress: 'uncarried2@gmail.com' });
+        await txn.rollback();
+        expect(await resolver.match('Person').id(person.id).one()).not.toBeNull(); // the write survived
+      });
+
+      test('a settled scope is fully inert for this source — later writes run as if no scope existed', async () => {
+        const txn = resolver.transaction();
+        await txn.match('Person').save({ name: 'uncarried3', emailAddress: 'uncarried3@gmail.com' });
+        await txn.commit();
+        // The source never joined the scope, so there is no stale-session state to reject against:
+        // the write dispatches sessionless and succeeds (contrast: a transactional source rejects here).
+        const late = await txn.match('Person').save({ name: 'uncarried4', emailAddress: 'uncarried4@gmail.com' });
+        expect(late.id).toBeDefined();
+        expect(await resolver.match('Person').id(late.id).one()).not.toBeNull();
+      });
+    });
+  }
 
   describe('Referential Integrity', () => {
     test('remove', async () => {
@@ -1021,7 +1086,7 @@ module.exports = () => describe('TestSuite', () => {
       await resolver.match('PlainJane').id(pj.id).save({}); // Bug where deleted role would fail FK constraint when trying to update/save parent record
     });
 
-    test('delete rolls back cascades when a restrict throws mid-walk', async () => {
+    testTxns('delete rolls back cascades when a restrict throws mid-walk', async () => {
       // Setup: A is a Person referenced via Person.section.persons (cascade-pull) and
       // A also authored a Book with a Chapter (Book.author cascade → Book.remove() →
       // Chapter.book restrict throws). Person.section.persons cascade fires BEFORE

@@ -15,6 +15,7 @@ npm workspaces under `workspace/`:
 | `workspace/autograph/` | Core library (`@coderich/autograph`) |
 | `workspace/mongo-driver/` | MongoDB adapter (`@coderich/autograph-mongodb`) |
 | `workspace/postgres-driver/` | PostgreSQL adapter (`@coderich/autograph-pg`) |
+| `workspace/redis-driver/` | Vanilla-Redis adapter (`@coderich/autograph-redis`) — the contract-floor proof: `supports: []`, client-side vocabulary evaluation; see its `test/NOTES.md` |
 | `workspace/testsuite/` | Shared integration test suite (`@coderich/autograph-db-tests`) |
 
 ## Commands
@@ -226,7 +227,7 @@ writes straight through; `event.resolver.getContext()` reaches the real context 
 
 ## Testing
 
-Tests live in `workspace/autograph/test/` and driver packages. The shared `@coderich/autograph-db-tests` package (`workspace/testsuite/`) provides `TestSuite.js` — a comprehensive integration suite run by each driver package against an in-memory database.
+Tests live in `workspace/autograph/test/` and driver packages. The shared `@coderich/autograph-db-tests` package (`workspace/testsuite/`) provides `TestSuite.js` — a comprehensive integration suite run by each driver package against an in-memory database. It is **capability-aware**: `testSuite({ supports })` mirrors the driver package's dataSource declaration — transactional sections bind only drivers declaring `'transactions'`; without it the suite runs the uncarried-semantics variant (durable-when-awaited, `commit()` no-op, `rollback()` cannot undo) instead of skipping. `'joins'` needs no gating (the QueryPlanner fallback passes the same assertions).
 
 Test setup files (autograph workspace):
 - `jest.prepare.js` — Early bootstrap
@@ -358,7 +359,7 @@ function nextId() {
   see Transactions above.
 - `createMany`/`updateMany` as true driver-level batch operations (not N serial `createOne` calls)
   — still N serial calls today, just now atomically wrapped, not batched at the driver level.
-- ~~Enforce `dataSources.supports` capability flags~~ — done, as HONOR-not-enforce: `supports` is consumer-declared (they know driver AND deployment; absent = `[]`); no `'transactions'` → scopes are inert for the source (sessionless writes, uncarried semantics — `rollback()` cannot undo); no `'joins'` → QueryPlanner resolves join-shaped where/sort via its pre-query/`$in` + in-memory-sort pipeline (drivers never see `query.joins`; correctness-first, not perf-neutral; WHERE lifts cover FK sub-paths, embedded-prefix stored FKs, and bare virtual equality — the loud edges are join-shaped SORT deeper than a first-segment FK and WHERE on a virtual link behind an embedded prefix). `batches`/`referentialIntegrity` flags dropped (were declared/read nowhere). See `SupportsFallback.test.js`.
+- ~~Enforce `dataSources.supports` capability flags~~ — done, as HONOR-not-enforce: `supports` is consumer-declared (they know driver AND deployment; absent = `[]`); no `'transactions'` → scopes are inert for the source (sessionless writes, uncarried semantics — `rollback()` cannot undo); no `'joins'` → QueryPlanner resolves join-shaped where/sort via its pre-query/`$in` + in-memory-sort pipeline (drivers never see `query.joins`; correctness-first, not perf-neutral; WHERE lifts cover FK sub-paths, embedded-prefix stored FKs, and bare virtual equality; first-segment-FK SORTs resolve to ANY depth (multi-hop sub-paths recurse per FK link, multi-values reduced min-asc/max-desc) — the loud edges are join-shaped SORT not STARTING at a first-segment FK (embedded prefix, bare virtual) and WHERE on a virtual link behind an embedded prefix). `batches`/`referentialIntegrity` flags dropped (were declared/read nowhere). See `SupportsFallback.test.js` and `workspace/redis-driver` (a driver living permanently on these fallbacks).
 - Route all MongoDriver mutations through `$aggregateQuery` so `$project` applies consistently
 - Fix `query.flags.debug` propagation (currently missing from cache hits and recursive mutation paths)
 - Embedded document pipeline events (`construct: 'createdBy'` etc. currently don't fire for embeds)

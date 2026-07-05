@@ -170,7 +170,9 @@ module.exports = class QueryPlanner {
         path,
         dir,
         isCrossSource,
-        augmentKey: isCrossSource ? `__xsort_${fieldName}` : null,
+        // Keyed by the FULL path — two sort keys sharing a first segment ('authored.chapters.name'
+        // + 'authored.chapters.temp') must not clobber each other's augment values.
+        augmentKey: isCrossSource ? `__xsort_${path}` : null,
         fieldName: isCrossSource ? fieldName : null,
         sortPath: isCrossSource ? subParts.join('.') : null, // sub-path within foreign model
         localFKField,
@@ -308,14 +310,23 @@ module.exports = class QueryPlanner {
       // same doctrine as the pre-query above: no private cache islands.
       const foreignDocs = await this.#batchFetch(foreignModelName, foreignLookupField, fkValues);
 
-      // Build lookup map: foreignLookupField value → sort value
-      // For virtual reverse-links a person can have many books — take the minimum sort value
-      // so ordering is deterministic when one primary doc maps to multiple foreign docs.
+      // Resolve the sort value for each foreign doc. The sub-path may itself cross FK links
+      // ('authored.chapters.name' → sortPath 'chapters.name' where Book.chapters is another
+      // virtual link) — #hopSortValues recurses hop by hop, batch-fetching each level.
+      const values = sortPath
+        ? await this.#hopSortValues(foreignModelName, sortPath, sortEntry.dir, foreignDocs)
+        : foreignDocs.map(doc => doc[foreignLookupField]);
+
+      // Build lookup map: foreignLookupField value → sort value. A primary doc can map to many
+      // foreign docs (virtual reverse-links) — reduce direction-aware (min for asc, max for
+      // desc), matching the unwind→sort→first-occurrence semantics a joining driver produces.
       const sortMap = new Map();
-      foreignDocs.forEach((doc) => {
+      foreignDocs.forEach((doc, i) => {
         const key = String(doc[foreignLookupField]);
-        const val = sortPath ? get(doc, sortPath) : doc[foreignLookupField];
-        if (!sortMap.has(key) || (val != null && val < sortMap.get(key))) sortMap.set(key, val);
+        const val = values[i];
+        if (val == null) { if (!sortMap.has(key)) sortMap.set(key, null); return; }
+        const prev = sortMap.get(key);
+        if (prev == null || (sortEntry.dir === 'asc' ? val < prev : val > prev)) sortMap.set(key, val);
       });
 
       // Attach sort value as a hidden (non-enumerable) property on each result doc
@@ -369,6 +380,48 @@ module.exports = class QueryPlanner {
     if (op === 'findOne') return paginated[0] ?? null;
 
     return paginated;
+  }
+
+  /**
+   * Resolve a sort sub-path against a set of docs, recursing through FK links: when the path's
+   * head is itself an FK reference with more path remaining, batch-fetch the next model and
+   * reduce each doc's (possibly multi-valued) hop direction-aware — min for asc, max for desc.
+   * Returns an array of sort values aligned with `docs`.
+   */
+  async #hopSortValues(modelName, sortPath, dir, docs) {
+    const model = this.#schema.models[modelName];
+    const [head, ...rest] = sortPath.split('.');
+    const field = model.fields[head];
+
+    // Terminal: the remaining path resolves within these docs (plain/embedded fields).
+    if (!(field?.isFKReference && rest.length)) return docs.map(doc => get(doc, sortPath));
+
+    // FK hop: same local/lookup derivation as the top-level cross-source sort entries.
+    const localKey = field.isVirtual ? model.pkField : head;
+    const lookupField = field.isVirtual ? field.linkBy : field.fkField;
+    const fkValues = [...new Set(docs.map(doc => doc[localKey]).flat().filter(Boolean).map(String))];
+    const nextDocs = fkValues.length ? await this.#batchFetch(field.model.name, lookupField, fkValues) : [];
+    const nextValues = await this.#hopSortValues(field.model.name, rest.join('.'), dir, nextDocs);
+
+    const reduced = new Map();
+    nextDocs.forEach((doc, i) => {
+      const val = nextValues[i];
+      if (val == null) return;
+      Util.ensureArray(doc[lookupField]).forEach((k) => {
+        const key = String(k);
+        const prev = reduced.get(key);
+        if (prev == null || (dir === 'asc' ? val < prev : val > prev)) reduced.set(key, val);
+      });
+    });
+
+    return docs.map((doc) => {
+      const vals = Util.ensureArray(doc[localKey]).map(v => reduced.get(String(v))).filter(v => v != null);
+      if (!vals.length) return null;
+      return vals.reduce((a, b) => {
+        const better = dir === 'asc' ? b < a : b > a;
+        return better ? b : a;
+      });
+    });
   }
 
   // ---------------------------------------------------------------------------

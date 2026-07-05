@@ -11,6 +11,7 @@ module.exports = getEslintConfig({
       '@coderich/autograph-mongodb',
       'mongodb-memory-server',
       'pg-mem',
+      'redis-memory-server',
     ],
   },
 });
