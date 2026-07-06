@@ -12,6 +12,7 @@
   "scripts": {
     "test": "NODE_OPTIONS=\"--stack-trace-limit=1000\" jest --config=jest.config.js",
     "lint": "eslint ./",
+    "bench": "node bench/run.js",
     "dev": "coderich-dev",
     "local": "nodemon ./test/server.js -e graphql,js,yml",
     "clinic": "clinic flame -- node ./test/server",

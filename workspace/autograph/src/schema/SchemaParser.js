@@ -4,6 +4,7 @@ const { isLeafValue } = require('../service/AppService');
 const Vocabulary = require('../query/Vocabulary');
 const Transformer = require('../data/Transformer');
 const Pipeline = require('../data/Pipeline');
+const Emitter = require('../data/Emitter');
 const { $RAW } = require('../service/Symbols');
 
 const operations = ['Query', 'Mutation', 'Subscription'];
@@ -255,6 +256,14 @@ function parseSchema(config, typeDefs) {
           $model.ignorePaths = []; // reset — repopulated below; avoids dupes on re-run
           $model.resolvePath = (path, prop = 'name') => $schema.resolvePath(`${$model[prop]}.${path}`, prop);
 
+          // Tag a shape closure argsSafe so Transformer#applyKey reuses ONE args bag across this
+          // field's steps instead of spreading a fresh one per step. ONLY applied to closures that
+          // read the bag SYNCHRONOUSLY and spread it into a NEW object before returning/awaiting —
+          // every closure below does (scalar rules spread `{ ...a, ... }`; embedded-recursion rules
+          // read a.value/a.thunks/a.query/... synchronously inside a synchronous Util.map and build
+          // a fresh args object for the child transform). Correctness never depends on the tag.
+          const argsSafe = fn => Object.defineProperty(fn, 'argsSafe', { value: true });
+
           $model.isJoinPath = (path, prop = 'name') => {
             let foundJoin = false;
             return !path.split('.').every((el, i, arr) => {
@@ -296,7 +305,7 @@ function parseSchema(config, typeDefs) {
           $model.transformers.toDriver = new Transformer({
             shape: Object.values($model.fields).reduce((prev, curr) => {
               const rules = [curr.key]; // Rename key
-              if (curr.isEmbedded) rules.unshift(({ value }) => Util.map(value, v => curr.model.transformers.toDriver.transform(v)));
+              if (curr.isEmbedded) rules.unshift(argsSafe(({ value }) => Util.map(value, v => curr.model.transformers.toDriver.transform(v))));
               return Object.assign(prev, { [curr.name]: rules });
             }, {}),
           });
@@ -312,14 +321,14 @@ function parseSchema(config, typeDefs) {
                 a => Pipeline.$instruct({ ...a, ...args, path: a.path.concat(curr.name) }),
                 a => Pipeline.$construct({ ...a, ...args, path: a.path.concat(curr.name) }),
                 a => Pipeline.$serialize({ ...a, ...args, path: a.path.concat(curr.name) }),
-              ];
+              ].map(argsSafe);
 
               if (curr.isEmbedded) {
-                rules.push(a => Util.map(a.value, (value, i) => {
+                rules.push(argsSafe(a => Util.map(a.value, (value, i) => {
                   const path = a.path.concat(curr.name);
                   if (curr.isArray) path.push(i);
                   return curr.model.transformers.create.transform(value, { ...args, thunks: a.thunks, query: a.query, resolver: a.resolver, context: a.context, path });
-                }));
+                })));
               }
 
               return Object.assign(prev, { [curr.name]: rules });
@@ -342,14 +351,14 @@ function parseSchema(config, typeDefs) {
                 a => Pipeline.$instruct({ ...a, ...args, path: a.path.concat(curr.name) }),
                 a => Pipeline.$restruct({ ...a, ...args, path: a.path.concat(curr.name) }),
                 a => Pipeline.$serialize({ ...a, ...args, path: a.path.concat(curr.name) }),
-              ];
+              ].map(argsSafe);
 
               if (curr.isEmbedded) {
-                rules.push(a => Util.map(a.value, (value, i) => {
+                rules.push(argsSafe(a => Util.map(a.value, (value, i) => {
                   const path = a.path.concat(curr.name);
                   if (curr.isArray) path.push(i);
                   return curr.model.transformers.update.transform(value, { ...args, thunks: a.thunks, query: a.query, resolver: a.resolver, context: a.context, path });
-                }));
+                })));
               }
 
               return Object.assign(prev, { [curr.name]: rules });
@@ -377,14 +386,14 @@ function parseSchema(config, typeDefs) {
                 a => Pipeline.$cast({ ...a, ...args, path: a.path.concat(curr.name) }),
                 a => Pipeline.$instruct({ ...a, ...args, path: a.path.concat(curr.name) }),
                 a => Pipeline.$serialize({ ...a, ...args, path: a.path.concat(curr.name) }),
-              ].map(operatorAware);
+              ].map(operatorAware).map(argsSafe);
 
               if (curr.isEmbedded) {
-                rules.push(operatorAware(a => Util.map(a.value, (value, i) => {
+                rules.push(argsSafe(operatorAware(a => Util.map(a.value, (value, i) => {
                   const path = a.path.concat(curr.name);
                   if (curr.isArray) path.push(i);
                   return curr.model.transformers.where.transform(value, { ...args, query: a.query, context: a.context, path });
-                })));
+                }))));
               }
 
               return Object.assign(prev, { [curr.name]: rules });
@@ -408,14 +417,14 @@ function parseSchema(config, typeDefs) {
               // required) on their subtree fights this pattern; skip the embedded validate
               // transform entirely. Custom validators on the parent field still run.
               if (curr.isEmbedded && curr.isPersistable !== false) {
-                rules.push(a => Util.map(a.value, (value, i) => {
+                rules.push(argsSafe(a => Util.map(a.value, (value, i) => {
                   const path = a.path.concat(curr.name);
                   if (curr.isArray) path.push(i);
                   return curr.model.transformers.validate.transform(value, { ...args, thunks: a.thunks, query: a.query, resolver: a.resolver, context: a.context, path });
-                }));
+                })));
               }
 
-              rules.push(a => Pipeline.$validate({ ...a, ...args, path: a.path.concat(curr.name) }));
+              rules.push(argsSafe(a => Pipeline.$validate({ ...a, ...args, path: a.path.concat(curr.name) })));
 
               return Object.assign(prev, { [curr.name]: rules });
             }, {}),
@@ -432,7 +441,22 @@ function parseSchema(config, typeDefs) {
           // the default field resolver re-wraps embedded sub-docs via toResultSet — and those
           // children were already transformed during the parent's read. The non-enumerable
           // $transformed marker lets a second call short-circuit without altering semantics.
-          const docFields = Object.values($model.fields);
+          // Partitioned ONCE per parse (re-partitioned on interface rebuild — this whole
+          // function re-runs): the per-row loop below stops re-deriving flags per field per call.
+          const docFields = Object.values($model.fields).map(f => ({
+            field: f,
+            key: f.key,
+            name: f.name,
+            isArray: Boolean(f.isArray),
+            hasEmbedded: Boolean(f.isEmbedded),
+            hasDeserialize: f.pipelines.deserialize.length > 0,
+            defaultValue: f.defaultValue,
+          }));
+          // Models with zero embedded/deserialize-eligible fields never need the lazy-getter
+          // machinery or selection logic at all — precompute the count so the per-row loop can
+          // take a pure identity-plus-rename fast path.
+          const eligibleCount = docFields.filter(f => f.hasEmbedded || f.hasDeserialize).length;
+
           $model.docTransform = (doc, args = {}, selection) => {
             if (doc == null || typeof doc !== 'object') return doc;
             if (doc.$transformed) return doc;
@@ -441,6 +465,22 @@ function parseSchema(config, typeDefs) {
             // + shared lazy getters without the caller threading a Ctor down. When no resolver
             // is available (legacy callers, tests), Ctor is undefined → falls back to {}.
             const Ctor = args.resolver?.getDocClass?.($model);
+            const out = Ctor ? new Ctor() : {};
+
+            if (eligibleCount === 0) {
+              // FAST PATH: no field on this model is embedded or has a deserialize pipeline,
+              // so there is nothing to make lazy and no selection to consult — just rename
+              // keys, apply default values, and shallow-copy arrays.
+              for (const df of docFields) {
+                let value = df.key in doc ? doc[df.key] : df.defaultValue;
+                if (value === undefined) continue; // eslint-disable-line
+                if (df.isArray) value = value == null ? value : [...Util.ensureArray(value)];
+                out[df.name] = value;
+              }
+              Object.defineProperty(out, '$transformed', { value: true });
+              return out;
+            }
+
             const lazyGetters = Ctor?.lazyGetters;
             const lazySetters = Ctor?.lazySetters;
             // selection (built once at the top-level toResultSet call, passed explicitly
@@ -450,32 +490,29 @@ function parseSchema(config, typeDefs) {
             // a shared getter; if a hook/spread reads it later, the getter still fires).
             // When selection is undefined (embedded recursion from a lazy getter, non-
             // GraphQL caller), every eligible field is lazy.
-            const out = Ctor ? new Ctor() : {};
-            for (const docField of docFields) {
-              let value = docField.key in doc ? doc[docField.key] : docField.defaultValue;
+            for (const df of docFields) {
+              let value = df.key in doc ? doc[df.key] : df.defaultValue;
               if (value === undefined) continue; // eslint-disable-line
               // Arrays are shallow-COPIED, never shared by reference: `doc` is the raw cached
               // row (the DataLoader stores raw driver results), so handing out its array would
               // let a caller's push/splice mutate the cache for every later hit. Embedded and
               // deserialize paths below re-map into new arrays anyway; this covers the plain
               // (scalar/FK) assignment path.
-              if (docField.isArray) value = value == null ? value : [...Util.ensureArray(value)];
-              const hasEmbedded = docField.isEmbedded;
-              const hasDeserialize = docField.pipelines.deserialize.length > 0;
-              const isEligible = (hasEmbedded || hasDeserialize) && value != null;
-              const isSelected = selection ? selection.fields.has(docField.name) : false;
+              if (df.isArray) value = value == null ? value : [...Util.ensureArray(value)];
+              const isEligible = (df.hasEmbedded || df.hasDeserialize) && value != null;
+              const isSelected = selection ? selection.fields.has(df.name) : false;
               const goLazy = lazyGetters && isEligible && !isSelected;
 
               if (goLazy) {
                 // LAZY: shared getter on the DocClass; raw value goes in this[$RAW][name]
                 // for the getter to consume on first access.
                 if (!out[$RAW]) out[$RAW] = {};
-                out[$RAW][docField.name] = value;
-                Object.defineProperty(out, docField.name, {
+                out[$RAW][df.name] = value;
+                Object.defineProperty(out, df.name, {
                   enumerable: true,
                   configurable: true,
-                  get: lazyGetters[docField.name],
-                  set: lazySetters[docField.name],
+                  get: lazyGetters[df.name],
+                  set: lazySetters[df.name],
                 });
                 continue; // eslint-disable-line
               }
@@ -483,14 +520,14 @@ function parseSchema(config, typeDefs) {
               // EAGER. Pass the sub-selection straight through as the third arg — no spread
               // needed, args itself is unchanged. If selection is undefined or doesn't have
               // this field's embedded sub-tree, sub-doc gets undefined → all-lazy.
-              if (hasEmbedded) {
-                const subSelection = selection?.embedded?.[docField.name];
-                value = Util.map(value, v => docField.model.docTransform(v, args, subSelection));
+              if (df.hasEmbedded) {
+                const subSelection = selection?.embedded?.[df.name];
+                value = Util.map(value, v => df.field.model.docTransform(v, args, subSelection));
               }
-              if (hasDeserialize) {
-                value = Pipeline.resolve({ ...args, model: $model, field: docField, value }, 'deserialize');
+              if (df.hasDeserialize) {
+                value = Pipeline.resolve({ ...args, model: $model, field: df.field, value }, 'deserialize');
               }
-              out[docField.name] = value;
+              out[df.name] = value;
             }
             Object.defineProperty(out, '$transformed', { value: true });
             return out;
@@ -502,6 +539,34 @@ function parseSchema(config, typeDefs) {
             if (f.isScalar) $model.ignorePaths.push(path.join('.'));
             return null;
           }, { path: [] });
+
+          // ── Pre-image elision (see docs/superpowers/specs/2026-07-05-performance-baseline-design.md) ──
+          // updateDocFree: nothing in any update-stage pipeline reads query.doc, and no embedded
+          // fields (embedded excludes both toDriver's null-parent merge and $pk's array-element
+          // doc-use — v1 categorical). Entries must be docSafe-tagged functions-by-name or
+          // tagged inline functions; anything unprovable blocks (conservative).
+          const UPDATE_STAGES = ['validate', 'restruct', 'instruct', 'normalize', 'serialize'];
+          const entrySafe = entry => (typeof entry === 'string' ? Boolean(Pipeline[entry]?.docSafe) : Boolean(entry?.docSafe));
+          $model.updateDocFree = !Object.values($model.fields).some((f) => {
+            if (f.isEmbedded) return true;
+            return UPDATE_STAGES.some(stage => (f.pipelines?.[stage] ?? []).some(entry => !entrySafe(entry)));
+          });
+          // Computed and tested but not yet consulted: delete elision currently piggybacks the
+          // updateDocFree-selected preImage slot below (the conservative superset, since
+          // update-stage where-transform pipelines run on deletes too). Wiring true delete-only
+          // elision off this flag is a recorded follow-up.
+          $model.deleteDocFree = !$model.referentialIntegrity?.length;
+
+          // The preImage SLOT: terminate() always awaits it — zero branching at the call site.
+          // Parse selects the implementation; the one runtime-only input (listener registration)
+          // is checked INSIDE the doc-free variant. `undefined` ⇔ elided: a real fetch either
+          // returns a doc or throws NotFound, so undefined is unambiguous.
+          const fetchPreImage = (query, resolver) => resolver.match($model.name).id(query.toObject().id).one({ required: true });
+          $model.preImage = $model.updateDocFree
+            ? (query, resolver) => (Emitter.MUTATION_EVENTS.some(e => Emitter.hasListenersFor(e, $model.name))
+              ? fetchPreImage(query, resolver)
+              : Promise.resolve(undefined))
+            : fetchPreImage;
         };
 
         thunks.push($model.buildDerived);

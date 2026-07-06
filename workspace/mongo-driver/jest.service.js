@@ -1,6 +1,6 @@
 global.ObjectId = require('mongodb').ObjectId;
 const { MongoMemoryReplSet } = require('mongodb-memory-server');
-const { setup } = require('@coderich/autograph-db-tests');
+const { setup, instrumentClient } = require('@coderich/autograph-db-tests');
 const MongoClient = require('./src/MongoDriver');
 
 exports.setup = async () => {
@@ -23,6 +23,9 @@ exports.setup = async () => {
   // natively provides the findOne/find/findOneAndUpdate surface the TestSuite documents.
   global.rawDriver = name => global.mongoClient.collection(name);
 
+  const { client: instrumentedClient, calls } = instrumentClient(global.mongoClient);
+  global.driverCalls = calls;
+
   // Autograph
   Object.assign(global, setup({
     generator: ({ value }) => {
@@ -37,7 +40,7 @@ exports.setup = async () => {
     },
     dataSource: {
       supports: ['transactions', 'joins'],
-      client: global.mongoClient,
+      client: instrumentedClient,
     },
   }));
 

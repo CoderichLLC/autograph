@@ -87,7 +87,7 @@ module.exports = class PostgresDriver {
         break;
       }
       case 'deleteOne':
-        plan.sql = knex(query.model).where(PostgresDriver.buildWhereCallback(where)).delete();
+        plan.sql = knex(query.model).where(PostgresDriver.buildWhereCallback(where)).delete().returning('*');
         break;
       case 'deleteMany':
         plan.sql = knex(query.model).where(PostgresDriver.buildWhereCallback(where)).delete();
@@ -226,7 +226,12 @@ module.exports = class PostgresDriver {
     return this.#run(plan.sql, plan.session).then(rows => rows[0] ?? null);
   }
 
-  deleteOne(plan) { return this.#run(plan.sql, plan.session); }
+  deleteOne(plan) {
+    // Contract: deleteOne resolves to the PRE-IMAGE row (null when no match). #run already
+    // revives rows (see updateOne's non-partial branch) — no re-revival needed here.
+    return this.#run(plan.sql, plan.session).then(rows => rows[0] ?? null);
+  }
+
   deleteMany(plan) { return this.#run(plan.sql, plan.session); }
 
   collection(name) {

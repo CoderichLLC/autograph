@@ -3,6 +3,7 @@ const schemaDef = require('./schema');
 const TestSuite = require('./TestSuite');
 
 exports.testSuite = TestSuite;
+exports.instrumentClient = require('./instrumentClient');
 
 // Re-exported so driver packages' OWN test files (beyond the shared suite) can register hooks
 // against the resolver this package built, without declaring @coderich/autograph themselves.

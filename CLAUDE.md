@@ -83,6 +83,8 @@ Stage definitions come from `@field()` directives: `@field(construct: "createdAt
 
 **DSL references validate at parse time, loudly.** Every pipeline name in every `@field(...)` stage must resolve against `Pipeline` by the end of `schema.parse()` — dangling references aggregate into one boot-time error naming model.field/stage (they used to surface as cryptic TypeErrors on the first write touching the field). Same for `@link(by:)`/`@field(fk:)` targets and `@index(on:)` fields (descriptive parse errors, not `undefined.key` crashes). **Contract: define-then-parse** — custom `Pipeline.define()` calls must run before `schema.parse()`. See `SchemaValidation.test.js`.
 
+`Pipeline.define(name, fn, options)` options now carry two internal (undocumented) audit flags: `docSafe` declares a step never reads `query.doc`/`query.merged` (feeds the `updateDocFree` pre-image-elision check above), and `argsSafe` declares a step reads its args bag synchronously and never retains it, letting the framework reuse one args object across a field's step chain instead of allocating a fresh one per step. Every built-in preset carries both; custom `Pipeline.define()` calls default both to `false` and conservatively take the slow paths (per-step allocation, no elision) — the framework can't prove a user function's discipline, and a public opt-in is deliberately deferred.
+
 ### Schema Directives
 
 ```graphql
@@ -107,6 +109,17 @@ CALLING resolver and the calling query's `info`. Consequences: every cache hit r
 instances (safe to mutate, spread, and `JSON.stringify` — array fields are shallow-copied out of
 the raw row), each call site gets its own selection shaping, and a doc's `$` magic is bound to
 the resolver that read it (a doc read through a txn clone writes through the txn clone).
+
+**Pre-image elision.** `updateOne`/`deleteOne` normally cost 2 driver calls — a pre-fetch of
+`query.doc` plus the write itself. On a **doc-free** model (no update-stage pipeline reads
+`query.doc`/`query.merged`, no embedded fields, and — for deletes — no referential-integrity
+edges) with **zero mutation-lifecycle listeners registered for it**, autograph skips the
+pre-fetch entirely and drives the write off the returning mutation alone (see the driver
+contract's `updateOne`/`deleteOne` return-row requirement above), dropping the budget to 1 call.
+Registering any hook (`Emitter.on`/`observe` on a mutation event) or adding a doc-reading
+pipeline/embedded field transparently restores the pre-fetch — no configuration needed either
+way. The 404 contract is preserved across elision: `flags.required` is enforced against the
+driver's returned row instead of the skipped pre-fetch.
 
 ### Where Vocabulary
 
@@ -231,6 +244,8 @@ writes straight through; `event.resolver.getContext()` reaches the real context 
 
 Tests live in `workspace/autograph/test/` and driver packages. The shared `@coderich/autograph-db-tests` package (`workspace/testsuite/`) provides `TestSuite.js` — a comprehensive integration suite run by each driver package against an in-memory database. It is **capability-aware**: `testSuite({ supports })` mirrors the driver package's dataSource declaration — transactional sections bind only drivers declaring `'transactions'`; without it the suite runs the uncarried-semantics variant (durable-when-awaited, `commit()` no-op, `rollback()` cannot undo) instead of skipping. `'joins'` needs no gating (the QueryPlanner fallback passes the same assertions).
 
+The TestSuite's "Driver-call budgets" section requires the driver package's `jest.service.js` to wrap its client with `instrumentClient` (exported by `@coderich/autograph-db-tests`) and expose the counters as `global.driverCalls`. Only `dataSource.client` gets the wrapper — raw accessors (`global.rawDriver`, DDL/index creation) keep the raw, uninstrumented client.
+
 Test setup files (autograph workspace):
 - `jest.prepare.js` — Early bootstrap
 - `jest.setup.js` — Extended Jest matchers (`.thunk()`, `.multiplex()`)
@@ -252,6 +267,12 @@ class MyDriver {
 
   // Execute a previously-prepared plan and return results.
   execute(plan) { ... }
+
+  // CONTRACT — mutation results: updateOne resolves to the POST-IMAGE row and deleteOne
+  // resolves to the PRE-IMAGE row (raw DB shape, exactly as a find would return it; null when
+  // no match) — natively if your substrate supports it (RETURNING, findOneAndUpdate), by
+  // internal refetch if it doesn't. This is what lets autograph skip its pre-image read
+  // entirely on models where nothing consumes it (see the preImage slot / Driver-call budgets).
 
   // There is NO production raw accessor: native expressiveness lives INSIDE the QueryBuilder —
   // the Where Vocabulary (below) plus `flags({ native })` cover it, inheriting transactions,

@@ -174,6 +174,12 @@ const normalizeFilter = (filter) => {
  * zero memo-aware branching. The hot loop stays a tight dispatch.
  */
 class Emitter extends EventEmitter {
+  // Every event whose payload exposes query.doc/query.merged for a mutation. The pre-image
+  // elision guard (SchemaParser's $model.preImage) sweeps this list — a NEW mutation-lifecycle
+  // event MUST be added here or listeners for it would see query.doc === undefined on elided
+  // writes. Resolver#createSystemEvent's hot-path bypass covers the same family (type-split).
+  static MUTATION_EVENTS = Object.freeze(['preMutation', 'validate', 'postMutation', 'preResponse', 'postResponse', 'postCommit', 'postRollback']);
+
   #cache = new Map();
 
   #invalidate(event) {
@@ -458,4 +464,7 @@ class Emitter extends EventEmitter {
   }
 }
 
-module.exports = new Emitter().setMaxListeners(100);
+// The module exports the SINGLETON instance, not the class. Statics live on the class, so surface
+// MUTATION_EVENTS on the instance too — consumers (SchemaParser) import this instance and read
+// `Emitter.MUTATION_EVENTS` off it.
+module.exports = Object.defineProperty(new Emitter().setMaxListeners(100), 'MUTATION_EVENTS', { value: Emitter.MUTATION_EVENTS, enumerable: true });

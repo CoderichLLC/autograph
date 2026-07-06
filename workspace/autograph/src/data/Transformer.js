@@ -77,11 +77,19 @@ module.exports = class Transformer {
       let value = startValue;
       let previousValue = startValue;
       const callArgs = this.#callArgs;
+      let bag; // shared across this FIELD's argsSafe steps; retentive/unknown steps get a fresh spread
       for (let i = 0; i < pipe.length; i++) {
         const t = pipe[i];
         previousValue = value;
         if (typeof t === 'function') {
-          const r = t({ startValue, value, ...callArgs });
+          let r;
+          if (t.argsSafe) {
+            bag ??= { startValue, value, ...callArgs };
+            bag.value = value;
+            r = t(bag);
+          } else {
+            r = t({ startValue, value, ...callArgs });
+          }
           if (r !== undefined) value = r;
         } else {
           prop = t; // rename key

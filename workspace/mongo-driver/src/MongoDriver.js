@@ -100,7 +100,9 @@ module.exports = class MongoDriver {
   }
 
   deleteOne(plan) {
-    return this.collection(plan.model).deleteOne(plan.where, plan.options);
+    // Contract: deleteOne resolves to the PRE-IMAGE row (null when no match) — mongodb v6
+    // returns the deleted document directly (includeResultMetadata defaults false).
+    return this.collection(plan.model).findOneAndDelete(plan.where, plan.options);
   }
 
   deleteMany(plan) {

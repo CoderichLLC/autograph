@@ -199,4 +199,15 @@ module.exports = `
     name: String!
     varmints: [Varmint!]
   }
+
+  # Driver-call-budget model — deliberately hook-free and elision-shaped: scalar + FK fields
+  # only, no embedded types, no custom pipelines, no onDelete rules. No other TestSuite section
+  # may register Emitter listeners against it or reuse it. Any UNDISPOSED generic (model-less)
+  # mutation-event listener left registered by any other section also suspends elision here and
+  # will fail the 1-call budgets — dispose every such listener before its section ends.
+  type Budget @model {
+    name: String
+    counter: Int
+    bff: Budget
+  }
 `;

@@ -403,8 +403,10 @@ module.exports = class Resolver {
           // Keyed so N writes to one model register one settle-time clear, not N.
           if (useScope) useScope.addSettled(client, () => this.clear(model), `clear:${model}`);
 
-          // Return results
-          if (crud === 'delete') return doc;
+          // Return results.
+          // Pre-fetched doc when the walk ran; the driver's returned PRE-IMAGE (contract) when
+          // the read was elided — deserialized like any read result.
+          if (crud === 'delete') return doc !== undefined ? doc : this.toResultSet(model, results, query.toObject().info);
           // Pass mutation's selection set through so the returned doc applies the same eager/lazy
           // split as reads. Mutations have info too — caller uses .info(info) before save/delete.
           return this.toResultSet(model, results, query.toObject().info);
@@ -621,6 +623,13 @@ module.exports = class Resolver {
     // object allocation, an Emitter cache lookup, a Promise.resolve, and a .then microtask.
     // For a wide read like findNetworkPlace with thousands of inner sub-resolvers
     // (Category/Image/Workspace) that have no relevant hooks, this is a real win.
+    //
+    // MUST stay in sync with Emitter.MUTATION_EVENTS: the mutation-side event set checked below
+    // (pre/postMutation, preResponse, postResponse, postCommit/postRollback) is the same family
+    // the pre-image elision guard sweeps (see $model.preImage in SchemaParser.js, which checks
+    // Emitter.MUTATION_EVENTS). Adding a mutation-lifecycle event to this chain without also
+    // adding it to Emitter.MUTATION_EVENTS would let listeners for it see query.doc === undefined
+    // on elided writes.
     const { model: qModel } = query;
     if (
       !needsValidate

@@ -1429,4 +1429,82 @@ module.exports = ({ supports = ['transactions', 'joins'] } = {}) => describe('Te
       await resolver.match('Person').id(saved.id).delete();
     });
   });
+
+  describe('Driver-call budgets', () => {
+    // Counts AG-visible execute() calls via global.driverCalls (see instrumentClient).
+    // client.transaction() is NOT execute() and is deliberately uncounted.
+    beforeEach(() => { global.driverCalls.reset(); });
+
+    test('createOne is 1 driver call', async () => {
+      const doc = await resolver.match('Budget').save({ name: 'b-create' });
+      expect(doc.id).toBeDefined();
+      expect(global.driverCalls.total).toBe(1);
+      expect(global.driverCalls.byOp.createOne).toBe(1);
+    });
+
+    test('repeated findOne by id is 1 driver call (DataLoader raw-row cache)', async () => {
+      const doc = await resolver.match('Budget').save({ name: 'b-cache' });
+      global.driverCalls.reset(); // the write cleared the model's cache; start clean
+      const a = await resolver.match('Budget').id(doc.id).one();
+      const b = await resolver.match('Budget').id(doc.id).one();
+      expect(`${a.id}`).toEqual(`${b.id}`);
+      expect(global.driverCalls.total).toBe(1);
+    });
+
+    test('N concurrent findOne by id collapse to 1 driver call (batch $in merge)', async () => {
+      const docs = await Promise.all(['m1', 'm2', 'm3'].map(name => resolver.match('Budget').save({ name })));
+      global.driverCalls.reset();
+      const found = await Promise.all(docs.map(d => resolver.match('Budget').id(d.id).one()));
+      expect(found).toHaveLength(3);
+      found.forEach((f, i) => expect(`${f.id}`).toEqual(`${docs[i].id}`));
+      expect(global.driverCalls.total).toBe(1);
+    });
+
+    test('updateOne budget', async () => {
+      const doc = await resolver.match('Budget').save({ name: 'b-up', counter: 1 });
+      global.driverCalls.reset();
+      const updated = await resolver.match('Budget').id(doc.id).save({ counter: 2 });
+      expect(updated.counter).toBe(2);
+      // Pre-image elided (Budget is doc-free and hook-free): the driver's returning
+      // mutation IS the response, so this also conformance-tests Task 4's contract.
+      expect(global.driverCalls.total).toBe(1);
+    });
+
+    test('deleteOne budget (no RI edges)', async () => {
+      const doc = await resolver.match('Budget').save({ name: 'b-del' });
+      global.driverCalls.reset();
+      const deleted = await resolver.match('Budget').id(doc.id).delete();
+      expect(`${deleted.id}`).toEqual(`${doc.id}`);
+      // Pre-image elided (Budget is doc-free and hook-free): the driver's returning
+      // mutation IS the response, so this also conformance-tests Task 4's contract.
+      expect(global.driverCalls.total).toBe(1);
+    });
+
+    test('createMany of N is N createOne calls (the budget the batch-op goal must beat)', async () => {
+      await resolver.match('Budget').save([{ name: 'cm1' }, { name: 'cm2' }, { name: 'cm3' }]);
+      expect(global.driverCalls.byOp.createOne).toBe(3);
+    });
+
+    test('a listener on the model suspends elision; disposing restores it', async () => {
+      const doc = await resolver.match('Budget').save({ name: 'b-guard', counter: 1 });
+      const off = Emitter.on({ event: 'postMutation', model: 'Budget' }, () => {});
+      global.driverCalls.reset();
+      await resolver.match('Budget').id(doc.id).save({ counter: 2 });
+      expect(global.driverCalls.total).toBe(2); // listener is entitled to query.doc
+      off();
+      global.driverCalls.reset();
+      await resolver.match('Budget').id(doc.id).save({ counter: 3 });
+      expect(global.driverCalls.total).toBe(1);
+    });
+
+    test('elided delete returns the full pre-image', async () => {
+      const doc = await resolver.match('Budget').save({ name: 'b-pre', counter: 7 });
+      global.driverCalls.reset();
+      const deleted = await resolver.match('Budget').id(doc.id).delete();
+      expect(global.driverCalls.total).toBe(1);
+      expect(deleted.name).toBe('b-pre');
+      expect(deleted.counter).toBe(7);
+      expect(deleted.createdAt).toBeTruthy(); // deserialize ran on the driver's pre-image
+    });
+  });
 });

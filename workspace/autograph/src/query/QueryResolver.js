@@ -66,8 +66,12 @@ module.exports = class QueryResolver extends QueryBuilder {
         });
       }
       case 'updateOne': {
-        return this.#get(query).then((doc) => {
-          return this.#resolver.resolve(query.clone({ doc }));
+        return this.#model.preImage(query, this.#resolver).then((doc) => {
+          // undefined ⇔ elided: the 404 contract rides flags.required against the driver's
+          // returned post-image instead of the pre-fetch (same error class and message).
+          return this.#resolver.resolve(doc === undefined
+            ? query.clone({ flags: { ...flags, required: true } })
+            : query.clone({ doc }));
         });
       }
       case 'updateMany': {
@@ -232,6 +236,12 @@ module.exports = class QueryResolver extends QueryBuilder {
 
     // Only pay for a transaction when there's an actual cascade to protect — a model with no
     // @field(onDelete:) rules deletes exactly one document, already atomic on its own.
-    return this.#model.referentialIntegrity.length ? this.#resolver.withTransaction(run) : run(this.#resolver);
+    if (this.#model.referentialIntegrity.length) return this.#resolver.withTransaction(run);
+    // No cascades: a single-document delete — elision-eligible through the same slot.
+    return this.#model.preImage(query, this.#resolver).then((doc) => {
+      return this.#resolver.resolve(doc === undefined
+        ? query.clone({ flags: { ...query.toObject().flags, required: true } })
+        : query.clone({ doc }));
+    });
   }
 };

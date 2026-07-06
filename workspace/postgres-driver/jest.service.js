@@ -1,5 +1,5 @@
 const { newDb } = require('pg-mem');
-const { setup, createObjectIdShim } = require('@coderich/autograph-db-tests');
+const { setup, createObjectIdShim, instrumentClient } = require('@coderich/autograph-db-tests');
 const { wrapPool } = require('./test/PgMemShim');
 const PostgresDriver = require('./src/PostgresDriver');
 
@@ -47,6 +47,9 @@ exports.setup = async () => {
 
   // Alias mongoClient so the DataLoader spy test can find the client.
   global.mongoClient = global.postgresClient;
+
+  const { client: instrumentedClient, calls } = instrumentClient(global.postgresClient);
+  global.driverCalls = calls;
 
   // Monotonically increasing sequential ID counter.
   // Sequential IDs ensure that entities created earlier always sort before later ones,
@@ -97,7 +100,7 @@ exports.setup = async () => {
     },
     dataSource: {
       supports: ['transactions', 'joins'],
-      client: global.postgresClient,
+      client: instrumentedClient,
     },
   });
   Object.assign(global, result);

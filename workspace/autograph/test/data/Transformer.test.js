@@ -177,4 +177,53 @@ describe('Transformer', () => {
     ]));
     console.timeEnd('transformRegular');
   });
+
+  describe('compiled-chain semantic pins', () => {
+    // These pin CURRENT behavior before the params-reuse rewrite — they must pass unchanged
+    // before AND after Task 7's internals change.
+    test('a step returning undefined keeps the previous value (uvl)', () => {
+      const t = new Transformer({ shape: { a: [({ value }) => `${value}!`, () => undefined] } });
+      expect(t.transform({ a: 'x' }).a).toBe('x!');
+    });
+
+    test('rename applies at its position in the chain', () => {
+      const t = new Transformer({ shape: { a: [({ value }) => value.toUpperCase(), 'b'] } });
+      const out = t.transform({ a: 'x' });
+      expect(out.b).toBe('X');
+      expect(out.a).toBeUndefined();
+    });
+
+    test('a Promise step stores previousValue and pushes to $thunks', () => {
+      const thunks = [];
+      const t = new Transformer({ shape: { a: [() => Promise.resolve('later')] } });
+      const out = t.transform({ a: 'now' }, { thunks });
+      expect(out.a).toBe('now'); // previousValue stored, not the Promise
+      expect(thunks).toHaveLength(1);
+    });
+
+    test('post-construction writes re-fire the pipeline (Proxy.set path)', () => {
+      const t = new Transformer({ shape: { a: [({ value }) => value.toUpperCase()] } });
+      const out = t.transform({ a: 'x' });
+      out.a = 'y';
+      expect(out.a).toBe('Y');
+    });
+
+    test('every step sees the ORIGINAL startValue even mid-chain', () => {
+      const seen = [];
+      const t = new Transformer({
+        shape: { a: [({ value }) => `${value}1`, ({ startValue, value }) => { seen.push([startValue, value]); return `${value}2`; }] },
+      });
+      expect(t.transform({ a: 'x' }).a).toBe('x12');
+      expect(seen).toEqual([['x', 'x1']]);
+    });
+
+    test('two fields in one transform never leak values into each other (bag isolation)', () => {
+      const grabs = [];
+      const grab = ({ value }) => { grabs.push(value); return value; };
+      const t = new Transformer({ shape: { a: [grab], b: [grab] } });
+      const out = t.transform({ a: 'A', b: 'B' });
+      expect(out).toMatchObject({ a: 'A', b: 'B' });
+      expect(grabs).toEqual(['A', 'B']);
+    });
+  });
 });

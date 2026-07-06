@@ -1,6 +1,6 @@
 const { RedisMemoryServer } = require('redis-memory-server');
 const Redis = require('ioredis');
-const { setup, createObjectIdShim } = require('@coderich/autograph-db-tests');
+const { setup, createObjectIdShim, instrumentClient } = require('@coderich/autograph-db-tests');
 const RedisDriver = require('./src/RedisDriver');
 
 exports.setup = async () => {
@@ -22,6 +22,9 @@ exports.setup = async () => {
 
   // Alias mongoClient so the DataLoader spy test can find the client.
   global.mongoClient = global.redisClient;
+
+  const { client: instrumentedClient, calls } = instrumentClient(global.redisClient);
+  global.driverCalls = calls;
 
   // Monotonically increasing sequential ID counter — entities created earlier must always
   // sort before later ones (the ordering semantics the shared TestSuite was written for).
@@ -70,7 +73,7 @@ exports.setup = async () => {
     },
     dataSource: {
       supports: [], // the whole point: no transactions, no joins — the framework carries both
-      client: global.redisClient,
+      client: instrumentedClient,
     },
   });
   Object.assign(global, result);
