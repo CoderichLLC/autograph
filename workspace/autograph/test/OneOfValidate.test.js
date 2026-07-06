@@ -37,6 +37,28 @@ const typeDefs = /* GraphQL */`
   # aggregated TextThing serializer on the way to storage (the toDriver dispatch fix).
   type ObjTitle implements Comp @model(typeValue: "objTitle") { config: TextThing! }
   type ListTitle implements Comp @model(typeValue: "listTitle") { config: ListThing! }
+
+  # EMBEDDED @oneOf: unlike Comp above (a ROOT/persisted @oneOf model whose stored document IS the
+  # variant), Target is used as a FIELD inside a parent (Holder.target). The whole embedded value is a
+  # property of the parent, so a parent update must be able to REDEFINE it to a different variant,
+  # replacing the entire subdocument (no sibling variant fields left behind). The discriminator is NOT
+  # immutable here — that guard is only for root @oneOf, where morphing 'type' mutates a record's identity.
+  type Geo @model(embed: true) { lat: Float! lng: Float! }
+
+  enum TargetType { geoTarget poiTarget }
+
+  interface Target @model(embed: true, oneOf: true) {
+    type: TargetType! @field(crud: r)
+    weight: Int!
+  }
+  type GeoTarget implements Target @model(embed: true, typeValue: "geoTarget") { geo: Geo! }
+  type PoiTarget implements Target @model(embed: true, typeValue: "poiTarget") { poi: String! }
+
+  type Holder @model(key: "holder") {
+    id: ID! @field(key: "_id")
+    name: String!
+    target: Target
+  }
 `;
 
 let resolver;
@@ -113,5 +135,78 @@ describe('@oneOf discriminator immutability', () => {
     const read = await resolver.match('Comp').id(created.id).one();
     expect(read.type).toBe('withTitle');
     expect(read.title).toBe('Orig');
+  });
+});
+
+/**
+ * An EMBEDDED @oneOf field (Holder.target) is a discriminated union living inside a parent doc. It
+ * updates like any ORDINARY embedded document (path of least surprise):
+ *   - a SAME-variant update partial-merges (untouched fields are preserved);
+ *   - a variant SWITCH is a full redefine — Query.toDriver detects the changed discriminator and
+ *     $sets the whole subdocument, so no sibling variant's fields survive.
+ * Contrast the root-@oneOf immutability block above — there the document itself IS the variant, so a
+ * switch is rejected outright.
+ */
+describe('embedded @oneOf update (merges like an ordinary embedded doc; switch replaces)', () => {
+  test('creates a parent with an embedded oneOf target', async () => {
+    const created = await resolver.match('Holder').save({ name: 'h1', target: { geoTarget: { weight: 1, geo: { lat: 1, lng: 2 } } } });
+    expect(created.target.type).toBe('geoTarget');
+    expect(created.target.weight).toBe(1);
+    expect(created.target.geo).toEqual({ lat: 1, lng: 2 });
+  });
+
+  test('SAME-variant update partial-merges — untouched fields are preserved', async () => {
+    const created = await resolver.match('Holder').save({ name: 'h2', target: { geoTarget: { weight: 2, geo: { lat: 3, lng: 4 } } } });
+
+    // Touch only `weight`; `geo` (same variant, not supplied) must survive the merge.
+    const updated = await resolver.match('Holder').id(created.id).save({ target: { geoTarget: { weight: 22 } } });
+    expect(updated.target.type).toBe('geoTarget');
+    expect(updated.target.weight).toBe(22);
+    expect(updated.target.geo).toEqual({ lat: 3, lng: 4 });
+
+    // Re-read from the driver to prove the stored subdocument merged (geo not clobbered).
+    const read = await resolver.match('Holder').id(created.id).one();
+    expect(read.target.weight).toBe(22);
+    expect(read.target.geo).toEqual({ lat: 3, lng: 4 });
+  });
+
+  test('nested same-variant merge — untouched keys inside the embedded object survive', async () => {
+    const created = await resolver.match('Holder').save({ name: 'h2b', target: { geoTarget: { weight: 1, geo: { lat: 3, lng: 4 } } } });
+    const updated = await resolver.match('Holder').id(created.id).save({ target: { geoTarget: { geo: { lat: 30 } } } });
+    expect(updated.target.geo).toEqual({ lat: 30, lng: 4 }); // lng preserved
+    expect(updated.target.weight).toBe(1); // weight preserved
+  });
+
+  test('variant SWITCH replaces the entire field — sibling variant fields are GONE', async () => {
+    const created = await resolver.match('Holder').save({ name: 'h3', target: { geoTarget: { weight: 2, geo: { lat: 3, lng: 4 } } } });
+
+    // Switch geoTarget -> poiTarget: a full redefine, not a morph of the same variant.
+    const updated = await resolver.match('Holder').id(created.id).save({ target: { poiTarget: { weight: 9, poi: 'xyz' } } });
+    expect(updated.target.type).toBe('poiTarget');
+    expect(updated.target.poi).toBe('xyz');
+    expect(updated.target.geo).toBeUndefined(); // sibling variant's field is GONE, not left behind
+
+    const read = await resolver.match('Holder').id(created.id).one();
+    expect(read.target.type).toBe('poiTarget');
+    expect(read.target.poi).toBe('xyz');
+    expect(read.target.geo).toBeUndefined();
+    expect(read.target.weight).toBe(9);
+  });
+
+  test('switches back to the original variant type', async () => {
+    const created = await resolver.match('Holder').save({ name: 'h4', target: { poiTarget: { weight: 5, poi: 'first' } } });
+    const updated = await resolver.match('Holder').id(created.id).save({ target: { geoTarget: { weight: 6, geo: { lat: 7, lng: 8 } } } });
+    expect(updated.target.type).toBe('geoTarget');
+    expect(updated.target.geo).toEqual({ lat: 7, lng: 8 });
+    expect(updated.target.poi).toBeUndefined();
+  });
+
+  test('leaving the embedded target untouched on an unrelated parent update preserves it', async () => {
+    const created = await resolver.match('Holder').save({ name: 'h5', target: { geoTarget: { weight: 3, geo: { lat: 9, lng: 10 } } } });
+    const updated = await resolver.match('Holder').id(created.id).save({ name: 'renamed' });
+    expect(updated.name).toBe('renamed');
+    expect(updated.target.type).toBe('geoTarget');
+    expect(updated.target.geo).toEqual({ lat: 9, lng: 10 });
+    expect(updated.target.weight).toBe(3);
   });
 });
