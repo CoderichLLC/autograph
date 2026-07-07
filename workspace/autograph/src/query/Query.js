@@ -228,6 +228,31 @@ module.exports = class Query {
     let $input = isSaveNative ? input : this.#model.transformers.toDriver.transform(input);
     if (crud === 'update' && !isSaveNative) {
       const ignorePaths = [...this.#model.ignorePaths];
+
+      // Embedded @oneOf variant SWITCH → replace the whole subdocument. A partial dot-merge would
+      // leave the previous variant's fields behind (a half-morphed doc), so when the incoming
+      // discriminator differs from the stored one, $set the entire field. A SAME-variant update
+      // falls through to the normal partial-merge path below — an embedded @oneOf then updates like
+      // any other embedded document (path of least surprise). Walk the (app-shaped, already-
+      // dispatched) input against the stored doc; emit the field's DB-key path, which is what the
+      // flatten below matches on the DB-shaped $input.
+      (function collectVariantSwitches($model, inputVal, docVal, keyPath) {
+        if (!Util.isPlainObject(inputVal)) return;
+        Object.entries(inputVal).forEach(([name, iv]) => {
+          const field = $model.fields[name];
+          if (!field?.isEmbedded || field.isArray || !Util.isPlainObject(iv)) return;
+          const subKeyPath = keyPath ? `${keyPath}.${field.key}` : field.key;
+          const dv = Util.isPlainObject(docVal) ? docVal[name] : undefined;
+          const tf = field.model.oneOf ? field.model.typeField : undefined;
+          const dType = tf && Util.isPlainObject(dv) ? dv[tf] : undefined;
+          // Only a genuine switch (both discriminators present, differing) forces a whole-field
+          // replace; a first-time set (no stored variant) is already handled as a whole-object write
+          // by collectNullParents. Same-variant / non-oneOf embeds recurse into the normal merge.
+          if (tf && iv[tf] !== undefined && dType !== undefined && iv[tf] !== dType) ignorePaths.push(subKeyPath);
+          else collectVariantSwitches(field.model, iv, dv, subKeyPath);
+        });
+      }(this.#model, input, doc, ''));
+
       (function collectNullParents($obj, path = '') {
         if (!Util.isPlainObject($obj)) return;
         Object.entries($obj).forEach(([key, val]) => {

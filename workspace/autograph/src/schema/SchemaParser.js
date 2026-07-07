@@ -686,11 +686,19 @@ function parseSchema(config, typeDefs) {
       //      the discriminator and partial-merge into a half-morphed doc. immutable compares the
       //      stamped value against the stored doc and rejects the variant switch (a delete+create job).
       //      It is a no-op on create (no prior value), so it does not block legitimate creation.
+      //
+      //      BUT immutable applies ONLY to a ROOT (persisted) @oneOf model, whose stored document IS
+      //      the variant — there, morphing the discriminator on update mutates an existing record's
+      //      identity. An EMBEDDED @oneOf lives inside a parent field: a same-variant update merges
+      //      like any embedded doc, and a variant SWITCH is handled by Query.toDriver, which detects
+      //      the changed discriminator and $sets the whole subdocument (so no sibling variant fields
+      //      survive — there is no half-morphed doc to guard against). Redefining an embedded target
+      //      to a different variant is a legitimate parent update, so it must stay switchable there.
       [iface, ...Object.values($schema.models).filter(m => !m.isInterface && m.interfaces?.includes(iface.name))].forEach((m) => {
         const typeField = m.fields[iface.typeField];
         if (!typeField) return;
         typeField.crud = 'r';
-        if (!typeField.pipelines.validate.includes('immutable')) typeField.pipelines.validate.push('immutable');
+        if (!iface.isEmbedded && !typeField.pipelines.validate.includes('immutable')) typeField.pipelines.validate.push('immutable');
         m.buildDerived($schema); // field pipeline changed — rebuild transformers so validate picks up 'immutable'
       });
 

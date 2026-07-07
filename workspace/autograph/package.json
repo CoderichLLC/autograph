@@ -1,9 +1,10 @@
 {
   "name": "@coderich/autograph",
   "main": "index.js",
-  "version": "0.15.7",
+  "version": "0.15.11",
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": false
   },
   "files": [
     "src",
