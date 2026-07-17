@@ -96,6 +96,20 @@ const computeCacheKey = q => JSON.stringify({
   session: TransactionScope.tagSession(q.options?.session),
 });
 
+// A GraphQL selection set for `model`: scalars by name; a relation is expanded ONE level to its
+// scalar fields (a relation needs a sub-selection to be valid GQL; one level keeps it cycle-safe).
+const buildSelection = (model, select) => {
+  const names = select?.length ? select : Object.keys(model.fields);
+  const parts = names.map((name) => {
+    const field = model.fields[name];
+    if (!field) return null;
+    if (field.isScalar) return field.name;
+    if (field.model) return `${field.name} { ${Object.values(field.model.fields).filter(f => f.isScalar).map(f => f.name).join(' ')} }`;
+    return null;
+  }).filter(Boolean);
+  return `{ ${parts.join(' ')} }`;
+};
+
 module.exports = class Query {
   #config;
   #resolver;
@@ -150,6 +164,76 @@ module.exports = class Query {
       enumerable: true,
       configurable: true,
     });
+  }
+
+  /**
+   * Serialize this Query's IR into a GraphQL request `{ query, variables }`, matching the API that
+   * Autograph generates (get/find/create/update/delete + Connection). The inverse of the server's
+   * GQL → IR parsing — it lets a Query built anywhere be forwarded over the wire (resolver.graphql).
+   * Arguments go through GraphQL variables (typed against the generated Input types), so there is no
+   * literal escaping and `where`/`input`/`sort` pass through unmodified.
+   */
+  toGQL() {
+    const q = this.#query;
+    const M = this.#model.name;
+    const args = {}; // name -> [gqlType, value]
+    let field;
+    let wrap;
+
+    switch (q.op) {
+      case 'findOne':
+        if (q.id != null) {
+          field = `get${M}`; wrap = 'node'; args.id = ['ID!', q.id];
+        } else {
+          field = `find${M}`; wrap = 'firstNode'; args.where = [`${M}InputWhere`, q.where]; args.first = ['Int', 1];
+        }
+        break;
+      case 'findMany':
+        field = `find${M}`; wrap = 'connection';
+        Object.assign(args, { where: [`${M}InputWhere`, q.where], sortBy: [`${M}InputSort`, q.sort], limit: ['Int', q.limit], skip: ['Int', q.skip], first: ['Int', q.first], after: ['String', q.after], last: ['Int', q.last], before: ['String', q.before] });
+        break;
+      case 'count':
+        field = `find${M}`; wrap = 'count'; args.where = [`${M}InputWhere`, q.where];
+        break;
+      case 'createOne': case 'createMany':
+        field = `create${M}`; wrap = 'node'; args.input = [`${M}InputCreate!`, q.input];
+        break;
+      case 'updateOne': case 'updateMany':
+        field = `update${M}`; wrap = 'node'; args.id = ['ID!', q.id]; args.input = [`${M}InputUpdate`, q.input];
+        break;
+      case 'deleteOne': case 'deleteMany':
+        field = `delete${M}`; wrap = 'node'; args.id = ['ID!', q.id];
+        break;
+      default: throw new Error(`toGQL: unsupported op "${q.op}"`);
+    }
+
+    const decls = [];
+    const fieldArgs = [];
+    const variables = {};
+    Object.entries(args).forEach(([name, [type, value]]) => {
+      if (value === undefined) return;
+      decls.push(`$${name}: ${type}`);
+      fieldArgs.push(`${name}: $${name}`);
+      variables[name] = value;
+    });
+
+    const selection = wrap === 'count' ? '' : buildSelection(this.#model, q.select);
+    const body = {
+      node: selection,
+      firstNode: `{ edges { node ${selection} } }`,
+      connection: `{ count edges { node ${selection} } }`,
+      count: '{ count }',
+    }[wrap];
+
+    const opType = q.isMutation ? 'mutation' : 'query';
+    const opName = field.charAt(0).toUpperCase() + field.slice(1);
+    const declStr = decls.length ? `(${decls.join(', ')})` : '';
+    const argStr = fieldArgs.length ? `(${fieldArgs.join(', ')})` : '';
+
+    return {
+      query: `${opType} ${opName}${declStr} { ${field}${argStr} ${body} }`,
+      variables,
+    };
   }
 
   // Unique identity of this query, used by both DataLoader's cacheKeyFn (read path) and
