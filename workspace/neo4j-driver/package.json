@@ -1,0 +1,20 @@
+{
+  "name": "@coderich/autograph-neo4j",
+  "main": "src/Neo4jDriver.js",
+  "version": "0.1.0",
+  "publishConfig": { "access": "public" },
+  "files": ["src", "!__mocks__"],
+  "scripts": {
+    "lint": "eslint ./",
+    "test": "jest --config=jest.config.js",
+    "clinic-test": "clinic flame -- node ../../node_modules/jest/bin/jest.js --config=jest.config.js --runInBand"
+  },
+  "dependencies": {
+    "@coderich/util": "2.2.3",
+    "neo4j-driver": "5.28.1"
+  },
+  "devDependencies": {
+    "@coderich/autograph-db-tests": "*",
+    "@testcontainers/neo4j": "10.24.2"
+  }
+}
