@@ -59,6 +59,22 @@ const typeDefs = /* GraphQL */`
     name: String!
     target: Target
   }
+
+  # Spitfire regression: an embedded @oneOf (Target) nested inside a PLAIN embed (Wrap) that itself
+  # lives inside a ROOT @oneOf variant (Card). Reproduces the reported "…type is immutable" failure
+  # (autograph 0.15.7) AND exercises the variant-switch replace through a root-oneOf-wrapped input.
+  type Wrap @model(embed: true) {
+    target: Target!
+  }
+  enum CardType { standard }
+  interface Card @model(key: "card", oneOf: true) {
+    id: ID! @field(key: "_id")
+    type: CardType!
+  }
+  type StandardCard implements Card @model(typeValue: "standard") {
+    label: String
+    wrap: Wrap!
+  }
 `;
 
 let resolver;
@@ -208,5 +224,47 @@ describe('embedded @oneOf update (merges like an ordinary embedded doc; switch r
     expect(updated.target.type).toBe('geoTarget');
     expect(updated.target.geo).toEqual({ lat: 9, lng: 10 });
     expect(updated.target.weight).toBe(3);
+  });
+});
+
+/**
+ * Spitfire regression (reported: "ActionTargetCategories.type is immutable; cannot be changed once
+ * set inApp -> categories" on autograph 0.15.7). The embedded @oneOf discriminator was auto-marked
+ * immutable EVEN for embedded interfaces, so switching a nested embedded variant on update threw.
+ *
+ * This reproduces the exact shape: embedded @oneOf (Target) inside a plain embed (Wrap) inside a
+ * ROOT @oneOf variant (StandardCard). It must (a) NOT throw immutable, and (b) fully replace the
+ * embedded subdocument on a variant switch (no sibling fields left behind) even when the whole
+ * update arrives wrapped under the root @oneOf key.
+ */
+describe('embedded @oneOf nested inside a root-@oneOf variant (spitfire regression)', () => {
+  test('creates the root variant with a deeply-nested embedded oneOf target', async () => {
+    const created = await resolver.match('Card').save({ standard: { label: 'c1', wrap: { target: { poiTarget: { weight: 1, poi: 'a' } } } } });
+    expect(created.type).toBe('standard');
+    expect(created.wrap.target.type).toBe('poiTarget');
+    expect(created.wrap.target.poi).toBe('a');
+  });
+
+  test('SAME-variant nested update partial-merges (untouched nested keys survive)', async () => {
+    const created = await resolver.match('Card').save({ standard: { label: 'c2', wrap: { target: { geoTarget: { weight: 2, geo: { lat: 1, lng: 2 } } } } } });
+    const updated = await resolver.match('Card').id(created.id).save({ standard: { wrap: { target: { geoTarget: { weight: 22 } } } } });
+    expect(updated.wrap.target.type).toBe('geoTarget');
+    expect(updated.wrap.target.weight).toBe(22);
+    expect(updated.wrap.target.geo).toEqual({ lat: 1, lng: 2 });
+  });
+
+  test('variant SWITCH on the nested embedded oneOf does NOT throw immutable and replaces the subdoc', async () => {
+    const created = await resolver.match('Card').save({ standard: { label: 'c3', wrap: { target: { poiTarget: { weight: 3, poi: 'orig' } } } } });
+
+    // poiTarget -> geoTarget: before the 0.15.8 fix this rejected with /immutable/.
+    const updated = await resolver.match('Card').id(created.id).save({ standard: { wrap: { target: { geoTarget: { weight: 4, geo: { lat: 5, lng: 6 } } } } } });
+    expect(updated.wrap.target.type).toBe('geoTarget');
+    expect(updated.wrap.target.geo).toEqual({ lat: 5, lng: 6 });
+    expect(updated.wrap.target.poi).toBeUndefined(); // sibling variant field gone, not left behind
+
+    const read = await resolver.match('Card').id(created.id).one();
+    expect(read.wrap.target.type).toBe('geoTarget');
+    expect(read.wrap.target.geo).toEqual({ lat: 5, lng: 6 });
+    expect(read.wrap.target.poi).toBeUndefined();
   });
 });
