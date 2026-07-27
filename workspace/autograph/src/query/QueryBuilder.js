@@ -70,10 +70,23 @@ module.exports = class QueryBuilder {
 
   args(args = {}) {
     Object.entries(args).forEach(([key, value]) => {
+      // `first`/`last` are BOTH connection arguments and TERMINAL commands — `first(n)` ends in
+      // `return this.many()`. Invoking one from here dispatched the query on the spot, so every
+      // `findX(first: n)` executed TWICE: once mid-argument-application, discarded, and again when
+      // the caller's own terminal ran. Measured, not inferred — `.match(M).args({ first: 2 })` alone
+      // produced one `Resolver#resolve`. The wasted read is the small half; the real cost is that
+      // `preQuery`/`postQuery` fired an extra time for a query nobody asked for. Apply the paging
+      // state and let the caller's terminal do the dispatching.
+      if (key === 'first') this.#applyFirst(value);
+      else if (key === 'last') this.#applyLast(value);
+      // No OTHER terminal may be invoked as an argument either. A schema extension is free to name
+      // an argument `save` or `count`, and running it because the name collides with a builder
+      // method is the same bug with a worse blast radius. Preserve it as an arg instead.
+      else if (this.isTerminal(key)) this.#query.args[key] = value;
       // Known builder methods drive the builder. Unknown keys (e.g., schema extensions like
       // `findNetworkPlace(search: String)`) are preserved on `args` so hooks can see them via
       // `event.query.args.<key>`. Without this, custom GraphQL args are silently dropped.
-      if (typeof this[key] === 'function') this[key](value);
+      else if (typeof this[key] === 'function') this[key](value);
       else this.#query.args[key] = value;
     });
     return this;
@@ -197,17 +210,27 @@ module.exports = class QueryBuilder {
   /**
    * Proxy terminial commands
    */
-  first(first) {
+  // The paging STATE, separated from the terminal that dispatches it — `args()` needs the first
+  // half without the second. See the note there.
+  #applyFirst(first) {
     this.#query.isCursorPaging = true;
     this.#query.first = first + 2; // Adding 2 for pagination meta info (hasNext hasPrev)
     this.#query.args.first = first;
+  }
+
+  #applyLast(last) {
+    this.#query.isCursorPaging = true;
+    this.#query.last = last + 2; // Adding 2 for pagination meta info (hasNext hasPrev)
+    this.#query.args.last = last;
+  }
+
+  first(first) {
+    this.#applyFirst(first);
     return this.many();
   }
 
   last(last) {
-    this.#query.isCursorPaging = true;
-    this.#query.last = last + 2; // Adding 2 for pagination meta info (hasNext hasPrev)
-    this.#query.args.last = last;
+    this.#applyLast(last);
     return this.many();
   }
 

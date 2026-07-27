@@ -306,13 +306,23 @@ module.exports = class Loader {
       });
     }
 
-    // First try to take off the "bookends" ($gte | $lte)
-    if (rs.length && rs[0].$cursor === after) {
+    // First try to take off the "bookends" ($gte | $lte).
+    //
+    // GUARDED ON THE CURSOR BEING ASKED FOR. Without `sort` no `$cursor` is ever attached above, so
+    // `rs[0].$cursor === after` compares `undefined === undefined` — true — and every unsorted page
+    // silently lost its first AND its last record to bookends nobody was paging through.
+    //
+    // Measured before the guard: `.first(n)` returned n records starting at the SECOND, and
+    // `.where(…).first(n)` returned NOTHING at all whenever the match set was no bigger than the two
+    // bookends being taken off it. The second is the dangerous one — it is a successful, empty
+    // response. `Query.toGQL()` serializes a where-scoped `.one()` as `find(where, first: 1)`, so a
+    // remote resolver read null for a document that exists, and `one({ required: true })` 404'd on it.
+    if (after != null && rs.length && rs[0].$cursor === after) {
       rs.shift();
       hasPreviousPage = true;
     }
 
-    if (rs.length && rs[rs.length - 1].$cursor === before) {
+    if (before != null && rs.length && rs[rs.length - 1].$cursor === before) {
       rs.pop();
       hasNextPage = true;
     }
