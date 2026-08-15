@@ -32,7 +32,8 @@ describe('Query.toGQL', () => {
     isValidGQL(query);
     expect(query).toMatch(/^query GetBook\(\$id: ID!\) \{ getBook\(id: \$id\) \{/);
     expect(query).toContain('id title pages'); // Book scalars
-    expect(query).toContain('author { id name }'); // relation expanded ONE level (Author scalars)
+    expect(query).toContain('author { id }'); // relation reduced to its pk — the client flattens it to a bare FK
+    expect(query).not.toContain('author { id name }'); // NOT the related model's scalars
     expect(variables).toEqual({ id: 'abc123' });
   });
 
@@ -66,6 +67,12 @@ describe('Query.toGQL', () => {
     expect(query).not.toContain('author');
   });
 
+  test('a relation named in select is still pk-only', () => {
+    const { query } = build('Book').select('title', 'author').many().toGQL();
+    isValidGQL(query);
+    expect(query).toContain('node { title author { id } }');
+  });
+
   test('create → mutation createModel(input)', () => {
     const { query, variables } = build('Book').save({ title: 'Dune', pages: 412 }).toGQL();
     isValidGQL(query);
@@ -94,6 +101,76 @@ describe('Query.toGQL', () => {
     expect(query).not.toContain('where');
     expect(query).toMatch(/find[Bb]ook \{ count edges/); // no ()
     expect(variables).toEqual({});
+  });
+});
+
+// The selection contract, in full. The wire selection matches the shape the LOCAL resolver returns —
+// the stored document: scalars and enums by name, embedded types in full, and a relation reduced to
+// its pk (which the remote client flattens back to a bare FK). Virtual (@link) fields are not stored,
+// so the default selection omits them; naming one in `select` opts it in, still pk-only.
+describe('Query.toGQL selection contract', () => {
+  let schema;
+  const build = model => new QueryBuilder({ schema, query: { model }, context: {} });
+  const isValidGQL = gql => expect(() => parse(gql)).not.toThrow();
+  const selectionOf = model => build(model).id('x').one().toGQL().query;
+
+  const richTypeDefs = `
+    enum Genre { FICTION NONFICTION }
+    type Inner { code: String }
+    type Loc { lat: String lng: String inner: Inner }
+    type Shelf @model(pk: "key") {
+      key: ID! @field(key: "_id")
+      label: String
+    }
+    type Library @model {
+      id: ID! @field(key: "_id")
+      name: String
+      genre: Genre
+      loc: Loc
+      shelf: Shelf
+      books: [Book] @field(connection: true)
+      featured: [Book] @link(by: "author")
+    }
+  `;
+
+  beforeAll(() => {
+    schema = new Schema({}).framework().merge({ typeDefs }).merge({ typeDefs: richTypeDefs }).decorate().api().parse();
+  });
+
+  test('a relation selects the pk of ITS model — pkField is not always "id"', () => {
+    const query = selectionOf('Library');
+    isValidGQL(query);
+    expect(query).toContain('shelf { key }'); // Shelf declares @model(pk: "key")
+  });
+
+  test('a connection-marked relation rides the Connection shape, pk-only', () => {
+    const query = selectionOf('Library');
+    isValidGQL(query);
+    expect(query).toContain('books { edges { node { id } } }');
+  });
+
+  test('enums are selected like scalars', () => {
+    const query = selectionOf('Library');
+    isValidGQL(query);
+    expect(query).toMatch(/node \{[^}]*genre|genre/);
+    expect(query).toContain('genre');
+  });
+
+  test('an embedded type is expanded in full, recursively', () => {
+    const query = selectionOf('Library');
+    isValidGQL(query);
+    expect(query).toContain('loc { lat lng inner { code } }');
+  });
+
+  test('a virtual (@link) field is omitted from the default selection', () => {
+    const query = selectionOf('Library');
+    expect(query).not.toContain('featured');
+  });
+
+  test('a virtual field named in select is honored, pk-only', () => {
+    const { query } = build('Library').select('name', 'featured').many().toGQL();
+    isValidGQL(query);
+    expect(query).toContain('node { name featured { id } }');
   });
 });
 

@@ -96,16 +96,26 @@ const computeCacheKey = q => JSON.stringify({
   session: TransactionScope.tagSession(q.options?.session),
 });
 
-// A GraphQL selection set for `model`: scalars by name; a relation is expanded ONE level to its
-// scalar fields (a relation needs a sub-selection to be valid GQL; one level keeps it cycle-safe).
-const buildSelection = (model, select) => {
-  const names = select?.length ? select : Object.keys(model.fields);
+// A GraphQL selection set for `model`, matching the shape the LOCAL resolver returns — the stored
+// document. Scalars and enums by name; an embedded type expanded in full (recursively, cycle-guarded);
+// a RELATION reduced to its pk (`{ pkField }` — not always `id`), which a remote client flattens back
+// to the bare FK the local resolver would have returned. A connection-marked relation rides the
+// generated Connection shape (`{ edges { node { pk } } }`) because `@field(connection: true)` rewrote
+// its API type. Virtual (@link) fields are not stored, so the default selection omits them — naming
+// one in `select` opts it in, still pk-only.
+const buildSelection = (model, select, ancestors = new Set()) => {
+  const names = select?.length ? select : Object.keys(model.fields).filter(name => !model.fields[name].isVirtual);
   const parts = names.map((name) => {
     const field = model.fields[name];
     if (!field) return null;
-    if (field.isScalar) return field.name;
-    if (field.model) return `${field.name} { ${Object.values(field.model.fields).filter(f => f.isScalar).map(f => f.name).join(' ')} }`;
-    return null;
+    if (field.isScalar || field.isEnum) return field.name;
+    if (!field.model) return null;
+    if (field.isEmbedded) {
+      if (ancestors.has(field.model)) return null; // an embedded cycle has no finite selection
+      return `${field.name} ${buildSelection(field.model, undefined, new Set(ancestors).add(model))}`;
+    }
+    const pk = `{ ${field.model.pkField} }`;
+    return field.isConnection ? `${field.name} { edges { node ${pk} } }` : `${field.name} ${pk}`;
   }).filter(Boolean);
   return `{ ${parts.join(' ')} }`;
 };
@@ -217,7 +227,12 @@ module.exports = class Query {
       variables[name] = value;
     });
 
-    const selection = wrap === 'count' ? '' : buildSelection(this.#model, q.select);
+    // QueryBuilder's constructor defaults `q.select` to EVERY field name, so it cannot distinguish
+    // "the author chose these" from "nobody chose". `.select(…)` records the author's choice in
+    // `q.args.select` too — that is the explicitness signal. Defaulted → the stored-document shape
+    // (virtuals omitted); explicit → exactly what was named (a virtual is honored, still pk-only).
+    const explicitSelect = q.args?.select?.length ? q.select : undefined;
+    const selection = wrap === 'count' ? '' : buildSelection(this.#model, explicitSelect);
     const body = {
       node: selection,
       firstNode: `{ edges { node ${selection} } }`,

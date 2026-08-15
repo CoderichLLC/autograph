@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## v0.16.3
+  - `Query.toGQL()` selection contract: the wire selection now matches the shape the LOCAL resolver returns (the stored document)
+    - a relation selects `{ pkField }` only (not the related model's scalars; pkField honors `@model(pk:)`) — a remote client flattens it back to a bare FK
+    - a connection-marked relation (`@field(connection: true)`) rides the generated Connection shape `{ edges { node { pk } } }` — previously serialized as a plain object selection, which the generated API rejects
+    - enums are selected like scalars (previously dropped from every selection)
+    - embedded types expand in full, recursively (previously one level of scalars), cycle-guarded
+    - virtual (`@link`) fields are omitted from the DEFAULT selection (they are not stored); naming one in `.select()` opts it in, still pk-only
+    - explicitness is read from `query.args.select` (the `.select()` method records it there) since QueryBuilder defaults `query.select` to every field name
+
 ## v0.16.x (BREAKING)
   - Performance baseline (Part 1): driver-call budgets are now a TestSuite conformance section (`instrumentClient`, exported from `@coderich/autograph-db-tests`, wraps a driver's `execute`/`prepare` to assert per-scenario call counts); `workspace/autograph/bench/` harness added — a standalone (non-Jest) CPU/latency benchmark (`npm run bench`) isolating framework CPU (zero-latency `InstantDriver`) from round-trip cost (`InstantDriver.withLatency`); see `bench/RESULTS.md` for baseline numbers that later elision/compilation work is measured against
   - Performance (Part 2): pre-image elision drops `updateOne`/`deleteOne` from 2 driver calls to 1 on doc-free models
