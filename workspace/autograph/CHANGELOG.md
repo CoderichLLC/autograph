@@ -1,5 +1,8 @@
 # CHANGELOG
 
+## v0.16.4
+  - Generated `InputCreate`: a required field carrying an `instruct` pipeline is now OPTIONAL in the input type (same treatment `@field(default:)` already had) — the pipeline is the server's promise to fill it, and typing it `!` made GraphQL variable coercion refuse the mutation before any pipeline could run, so a remote client could never create the document. Storage stays guarded: the `required` validate rule still refuses a create the pipeline could not fill.
+
 ## v0.16.3
   - `Query.toGQL()` selection contract: the wire selection now matches the shape the LOCAL resolver returns (the stored document)
     - a relation selects `{ pkField }` only (not the related model's scalars; pkField honors `@model(pk:)`) — a remote client flattens it back to a bare FK

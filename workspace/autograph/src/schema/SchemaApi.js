@@ -4,12 +4,17 @@ const { fromGUID } = require('../service/AppService');
 
 function getGQLType(field, suffix) {
   let { type } = field;
-  const { isEmbedded, isRequired, isScalar, isEnum, isArray, isArrayRequired, isPrimaryKey, defaultValue } = field;
+  const { isEmbedded, isRequired, isScalar, isEnum, isArray, isArrayRequired, isPrimaryKey, defaultValue, pipelines } = field;
   const modelType = `${type}${suffix}`;
   if (suffix && !isScalar && !isEnum) type = isEmbedded ? modelType : 'ID';
   type = isArray ? `[${type}${isArrayRequired ? '!' : ''}]` : type;
   if (!suffix && isRequired) type += '!';
-  if (suffix === 'InputCreate' && !isPrimaryKey && isRequired && defaultValue == null) type += '!';
+  // InputCreate requires a field only when the CALLER is the one who must supply it: a default or
+  // an `instruct` pipeline is the server's promise to fill it (instruct runs even when the field is
+  // absent from the payload), so typing those `!` would make GraphQL variable coercion refuse the
+  // mutation before the pipeline ever runs. Storage stays guarded either way — the `required`
+  // validate rule still refuses a create the pipeline could not fill.
+  if (suffix === 'InputCreate' && !isPrimaryKey && isRequired && defaultValue == null && !pipelines?.instruct?.length) type += '!';
   return type;
 }
 
