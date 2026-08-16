@@ -38,7 +38,22 @@ const OPERATORS = {
   $nin: { coerce: 'list' },
   $exists: { coerce: 'none' },
   $not: { coerce: 'nested' }, // field-level negation: its operand is ITSELF an operator object (or regex)
+  // The LENGTH of the field's value — element count for arrays, CODE POINTS for String (the one
+  // definition mongo $strLenCP, PG char_length and JS [...s].length agree on). Missing/null (and
+  // a wrong-runtime-type value) count as size 0, so `{ tags: { $size: 0 } }` alone means "no
+  // tags" — no $exists compound needed. Operand is a LENGTH, never a field value ('size'
+  // coercion: pipelines and glob conversion must not touch it): a non-negative integer, or a
+  // comparison object over non-negative integers. validate() additionally enforces: array/String
+  // fields only, sole key of its operator object, never inside $not, and never through a dotted
+  // path or inside an embedded-ARRAY where (drivers would measure the wrong thing — loud, not
+  // wrong; the nested RELATION spelling `{ tags: { name: { $size: n } } }` is supported because
+  // the planner/join re-roots it as a top-level query on the related model).
+  $size: { coerce: 'size' },
 };
+
+// The comparison subset a $size operand may compose from. Not $in/$nin: a set of lengths has no
+// measured use, and every driver would pay for it.
+const SIZE_COMPARATORS = { $eq: true, $ne: true, $gt: true, $gte: true, $lt: true, $lte: true };
 
 // COMPOUND operators compose whole where clauses (value = array of where clauses) and may
 // appear at any object level, ALONGSIDE field keys (implicit AND — standard Mongo semantics).
@@ -71,6 +86,21 @@ const mapValues = (obj, fn) => Object.entries(obj).reduce((prev, [op, value]) =>
   return Object.assign(prev, { [op]: value });
 }, {});
 
+// Flatten a where clause by FIELD PATHS only — operator objects are vocabulary VALUES, never
+// path segments. This is the operator-aware replacement for a generic Util.flatten anywhere a
+// where clause is flattened: generic flattening turns `{ price: { $ne: -999 } }` into the key
+// 'price.$ne', which MongoDB reads as a literal field path that silently matches nothing, and
+// which the QueryPlanner misread as a JOIN sub-path (pre-querying the foreign model with a
+// dangling operator that the transform then dropped — every relation operator degenerated to
+// match-all). Operator objects stay INTACT as leaf values.
+const flattenWhere = (obj, path = [], acc = {}) => {
+  Object.entries(obj ?? {}).forEach(([key, value]) => {
+    if (Util.isPlainObject(value) && !isOperatorObject(value) && Object.keys(value).length) flattenWhere(value, path.concat(key), acc);
+    else acc[path.concat(key).join('.')] = value;
+  });
+  return acc;
+};
+
 // Walk a (possibly dotted) where key against the parsed model — DOMAIN field names, exactly what
 // a caller writes. Numeric segments (array indices) stay on the current model; reaching a field
 // with no model (a scalar — including custom object scalars like the dogfood's Place, and
@@ -79,12 +109,16 @@ const mapValues = (obj, fn) => Object.entries(obj).reduce((prev, [op, value]) =>
 // value should recurse into (undefined at a scalar leaf). Throws on an unknown segment, naming
 // the model it failed against and the declared alternatives.
 const resolveField = (model, key, path) => {
-  return key.split('.').reduce((target, segment) => {
+  let field; // the TERMINAL field the key resolves to (last known field past a scalar leaf)
+  let viaArray = false; // did the path traverse an ARRAY before its terminal segment ($size bars these)
+  key.split('.').reduce((target, segment) => {
     if (!target || /^\d+$/.test(segment)) return target; // past a scalar, or an array index
-    const field = target.fields?.[segment];
+    if (field?.isArray) viaArray = true;
+    field = target.fields?.[segment];
     if (!field) throw new Error(`Unknown where field "${segment}" for ${target} at "${path.concat(key).join('.')}" — declared fields: ${Object.keys(target.fields ?? {}).join(', ')}. (\`flags({ native })\` is the escape hatch for raw storage keys.)`);
     return field.model;
   }, model);
+  return { field, nested: field?.model, viaArray };
 };
 
 // `_` — the WIRE's vocabulary slot. The generated `<Model>InputWhere` keeps its typed fields
@@ -121,8 +155,9 @@ const liftMixed = (model, where) => {
 // unknown keys, so the predicate vanished and the query matched EVERYTHING. Throws with the
 // allowlist / the declared fields in the message — the loud front door for anything the GraphQL
 // Mixed where argument lets through, and the same guard for local callers, who never had one.
-const validate = (where, path = [], model = undefined) => {
+const validate = (where, path = [], model = undefined, position = 'clause', ctx = {}) => {
   if (!Util.isPlainObject(where)) return where;
+  const { field, sizeBarred = false } = ctx;
 
   // Compound operators: value must be a non-empty array of where clauses; recurse each branch.
   // They coexist with field keys (implicit AND), so validate them and strip before the
@@ -130,31 +165,57 @@ const validate = (where, path = [], model = undefined) => {
   const compounds = Object.keys(where).filter(k => COMPOUNDS[k]);
   compounds.forEach((op) => {
     if (!Array.isArray(where[op]) || where[op].length === 0) throw new Error(`Where operator "${op}" at "${path.join('.') || '.'}" requires a non-empty array of where clauses`);
-    where[op].forEach((branch, i) => validate(branch, path.concat(`${op}[${i}]`), model)); // branches predicate the SAME model
+    where[op].forEach((branch, i) => validate(branch, path.concat(`${op}[${i}]`), model, 'clause', { sizeBarred })); // branches predicate the SAME model, in clause position
   });
 
   const keys = Object.keys(where).filter(k => !COMPOUNDS[k]);
   const opKeys = keys.filter(isOperatorKey);
 
   if (opKeys.length) {
+    // POSITION matters: value operators apply to a FIELD, so they are only legal in a field's
+    // VALUE position. An operator dangling in CLAUSE position (the where root, a compound
+    // branch, or the root of a nested relation where) has no field to predicate — historically
+    // the transform dropped it silently and the query matched EVERYTHING.
+    if (position === 'clause') throw new Error(`Invalid where clause at "${path.join('.') || '.'}": operator${opKeys.length > 1 ? 's' : ''} ${opKeys.join(', ')} cannot stand alone — a value operator applies to a field, as in { field: { ${opKeys[0]}: … } }`);
     if (opKeys.length !== keys.length) throw new Error(`Invalid where clause at "${path.join('.') || '.'}": operator keys (${opKeys.join(', ')}) cannot mix with field keys in the same object`);
     // $not operands are themselves operator objects — recurse their operator keys.
-    opKeys.forEach((op) => { if (op === '$not' && Util.isPlainObject(where[op])) validate(where[op], path.concat(op)); });
+    opKeys.forEach((op) => {
+      if (op === '$not' && Util.isPlainObject(where[op])) {
+        if (where[op].$size !== undefined) throw new Error(`Where operator "$size" at "${path.concat(op).join('.')}" cannot be negated with $not — flip the comparison instead`);
+        validate(where[op], path.concat(op), undefined, 'value');
+      }
+    });
     opKeys.forEach((op) => {
       // Dotted-flat form ('field.$op' → '$op' arrives as the trailing segment pre-unflatten)
       const bare = op.slice(op.lastIndexOf('$'));
       if (!OPERATORS[bare]) throw new Error(`Unknown where operator "${op}" at "${path.join('.') || '.'}" — supported operators: ${Object.keys(OPERATORS).join(', ')}`);
       if (OPERATORS[bare].coerce === 'list' && !Array.isArray(where[op])) throw new Error(`Where operator "${op}" at "${path.join('.') || '.'}" requires an array value`);
     });
+    if (where.$size !== undefined) {
+      const at = path.join('.') || '.';
+      // Sole key: missing counts as size 0, so composing $size with $exists (or anything else)
+      // is redundant at best and contradictory at worst — and sole-key keeps every driver's
+      // translation a single self-contained predicate.
+      if (keys.length !== 1 || compounds.length) throw new Error(`Invalid where clause at "${at}": $size must be the sole operator of its object (missing counts as size 0 — composition is redundant)`);
+      if (sizeBarred) throw new Error(`Where operator "$size" at "${at}" is not supported through dotted paths or inside embedded-array wheres — drivers would measure the wrong value. Predicate the field directly, or via a nested relation where.`);
+      if (field && !(field.isArray || field.type === 'String')) throw new Error(`Where operator "$size" at "${at}" applies to array and String fields — "${field}" is ${field.type}`);
+      const operand = where.$size;
+      const ok = (Number.isInteger(operand) && operand >= 0)
+        || (Util.isPlainObject(operand) && Object.keys(operand).length > 0
+          && Object.entries(operand).every(([op, n]) => SIZE_COMPARATORS[op] && Number.isInteger(n) && n >= 0));
+      if (!ok) throw new Error(`Where operator "$size" at "${at}" takes a non-negative integer or a comparison object over non-negative integers ({ ${Object.keys(SIZE_COMPARATORS).join('/')}: <int> })`);
+    }
     return where;
   }
 
   keys.forEach((key) => {
     // Dotted keys may embed an operator as their final segment ('price.$ne') — validate it,
-    // then resolve the FIELD prefix it applies to.
+    // then resolve the FIELD prefix it applies to. ($size never rides the dotted-flat spelling —
+    // its operand checks need the resolved field, which only the nested form threads through.)
     const segments = key.split('.');
     const last = segments[segments.length - 1];
     if (isOperatorKey(last)) {
+      if (last === '$size' && segments.length > 1) throw new Error(`Where operator "$size" at "${path.concat(key).join('.')}" does not support the dotted spelling — write { ${segments.slice(0, -1).join('.')}: { $size: … } }`);
       if (!OPERATORS[last]) throw new Error(`Unknown where operator "${last}" at "${path.concat(key).join('.')}" — supported operators: ${Object.keys(OPERATORS).join(', ')}`);
       if (model && segments.length > 1) resolveField(model, segments.slice(0, -1).join('.'), path);
       return;
@@ -164,11 +225,21 @@ const validate = (where, path = [], model = undefined) => {
     // relation/embedded field is a NESTED WHERE and recurses against the related model. Operator
     // objects and scalar-leaf objects recurse model-less — operator checks only (a Mixed/custom-
     // scalar object is opaque data, not shape).
-    const nested = model ? resolveField(model, key, path) : undefined;
-    if (nested && Util.isPlainObject(where[key]) && !isOperatorObject(where[key])) validate(where[key], path.concat(key), nested);
-    else validate(where[key], path.concat(key));
+    const resolved = model ? resolveField(model, key, path) : undefined;
+    if (resolved?.nested && Util.isPlainObject(where[key]) && !isOperatorObject(where[key])) {
+      // Nested where — clause position. Crossing a RELATION re-roots the query (planner
+      // pre-query / driver join), so $size is legal again inside; crossing an embedded ARRAY
+      // stays on the same driver query where $size would measure the wrong value — barred.
+      const crossed = resolved.field.isEmbedded ? (sizeBarred || resolved.field.isArray) : false;
+      validate(where[key], path.concat(key), resolved.nested, 'clause', { sizeBarred: crossed });
+    } else {
+      // Value position: hand the terminal field along for $size's type check; a dotted or
+      // array-traversing path bars $size outright (single-segment keys pass their field).
+      const barred = sizeBarred || segments.length > 1 || Boolean(resolved?.viaArray);
+      validate(where[key], path.concat(key), undefined, 'value', { field: segments.length === 1 ? resolved?.field : undefined, sizeBarred: barred });
+    }
   });
   return where;
 };
 
-module.exports = { OPERATORS, COMPOUNDS, isOperatorKey, isOperatorObject, mapValues, liftMixed, validate };
+module.exports = { OPERATORS, COMPOUNDS, isOperatorKey, isOperatorObject, mapValues, flattenWhere, liftMixed, validate };

@@ -101,6 +101,10 @@ module.exports = class QueryBuilder {
 
   where(clause) {
     this.#propCheck('where', false); // Allow redefine of "where" because we merge it
+    // null/undefined = "no constraint", same as omitting the call. GraphQL's nullable `where:`
+    // argument delivers exactly this shape; it must not reach mergeDeep (TypeError) or clobber
+    // an already-merged clause.
+    if (clause == null) return this;
     // Legacy OR form: an ARRAY of where clauses. Normalize to its canonical vocabulary spelling
     // ($or) here at the builder boundary — a raw array is hostile to everything downstream:
     // mergeDeep DISCARDS previously-merged object clauses when handed an array (type-mismatch

@@ -219,4 +219,57 @@ describe('Where vocabulary — tier-1 operators through the NORMAL (transformed)
         .resolves.toEqual([]);
     });
   });
+
+  describe('$size — the LENGTH of a field value (array elements; string code points)', () => {
+    test('string length, in code points, through the normal path', async () => {
+      // vocab-charlie is the only 13-code-point name in the scoped seed.
+      expect(names(await scoped({ name: { $size: 13 } }))).toEqual(['vocab-charlie']);
+      expect(names(await scoped({ name: { $size: { $gt: 11 } } }))).toEqual(['vocab-charlie']);
+      expect(names(await scoped({ name: { $size: { $gte: 11, $lte: 12 } } }))).toEqual(['vocab-alpha', 'vocab-bravo', 'vocab-delta']);
+    });
+
+    test('array length on an embedded-array field, missing counts as 0', async () => {
+      // Seeded people have NO sections — size 0 must include them (missing ≡ 0).
+      expect((await scoped({ sections: { $size: 0 } })).length).toBe(4);
+      expect(await scoped({ sections: { $size: { $gt: 0 } } })).toEqual([]);
+    });
+
+    test('refused on fields that are neither array nor String', async () => {
+      await expect(scoped({ age: { $size: 0 } })).rejects.toThrow(/\$size.*array and String/);
+    });
+
+    test('the operand is a non-negative integer or a comparison object — nothing else', async () => {
+      await expect(scoped({ name: { $size: 'x' } })).rejects.toThrow(/\$size/);
+      await expect(scoped({ name: { $size: -1 } })).rejects.toThrow(/\$size/);
+      await expect(scoped({ name: { $size: 1.5 } })).rejects.toThrow(/\$size/);
+      await expect(scoped({ name: { $size: {} } })).rejects.toThrow(/\$size/);
+      await expect(scoped({ name: { $size: { $regexx: 1 } } })).rejects.toThrow(/\$size/);
+      await expect(scoped({ name: { $size: { $gt: 'x' } } })).rejects.toThrow(/\$size/);
+      await expect(scoped({ name: { $size: { $in: [1, 2] } } })).rejects.toThrow(/\$size/);
+    });
+
+    test('$size must be the sole operator of its object (composition is redundant with missing ≡ 0)', async () => {
+      await expect(scoped({ name: { $size: 3, $exists: true } })).rejects.toThrow(/sole/);
+    });
+
+    test('$size cannot be negated with $not — flip the comparison instead', async () => {
+      await expect(scoped({ name: { $not: { $size: 3 } } })).rejects.toThrow(/\$size.*\$not|flip the comparison/);
+    });
+
+    test('refused through dotted paths and inside embedded-array wheres (loud, not wrong)', async () => {
+      // A dotted path or an embedded-array where would make the drivers count the wrong thing
+      // (mongo $expr sees an array of leaf values; the JS filters never see the predicate) —
+      // refuse until a driver story exists. The nested RELATION spelling stays supported: the
+      // planner/join re-roots it as a fresh top-level query on the related model.
+      await expect(resolver.match('Book').where({ 'author.name': { $size: 3 } }).many()).rejects.toThrow(/\$size/);
+      await expect(resolver.match('Person').where({ 'name.$size': 3 }).many()).rejects.toThrow(/\$size/);
+      await expect(scoped({ sections: { name: { $size: 3 } } })).rejects.toThrow(/\$size/);
+    });
+
+    test('a $size predicate inside a nested RELATION where is supported', async () => {
+      // Re-rooted by the planner/join against Person: name length 13 → vocab-charlie's books.
+      // vocab-charlie has no books, so this asserts the loud-free round trip, not membership.
+      await expect(resolver.match('Book').where({ author: { name: { $size: 13 } } }).many()).resolves.toEqual([]);
+    });
+  });
 });

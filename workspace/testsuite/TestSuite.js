@@ -823,9 +823,9 @@ module.exports = ({ supports = ['transactions', 'joins'] } = {}) => describe('Te
     beforeAll(async () => {
       vocabAuthor = await resolver.match('Person').save({ name: 'vocabperson', emailAddress: 'vocabperson@gmail.com' });
       await Promise.all([
-        resolver.match('Book').save({ name: 'VocabBook1', price: 10, author: vocabAuthor.id }),
-        resolver.match('Book').save({ name: 'VocabBook2', price: 20, author: vocabAuthor.id }),
-        resolver.match('Book').save({ name: 'VocabBook3', price: 30, author: vocabAuthor.id }),
+        resolver.match('Book').save({ name: 'VocabBook1', price: 10, author: vocabAuthor.id }), // bids MISSING
+        resolver.match('Book').save({ name: 'VocabBook2', price: 20, bids: [], author: vocabAuthor.id }), // bids EMPTY
+        resolver.match('Book').save({ name: 'VocabBook3', price: 30, bids: [7.5, 8.5], author: vocabAuthor.id }),
       ]);
     });
 
@@ -889,6 +889,40 @@ module.exports = ({ supports = ['transactions', 'joins'] } = {}) => describe('Te
 
     test('unknown operators are rejected loudly (the allowlist)', async () => {
       await expect(books({ price: { $where: 'true' } })).rejects.toThrow(/Unknown where operator/);
+    });
+
+    describe('$size — the LENGTH of a value (array elements; string CODE POINTS); missing ≡ 0', () => {
+      let emojiBook;
+
+      beforeAll(async () => {
+        // 'VocabBook💩' is 10 CODE POINTS but 11 UTF-16 units — the discriminator that pins the
+        // portable definition: a driver measuring .length (code units) gets 11 and fails below.
+        emojiBook = await resolver.match('Book').save({ name: 'VocabBook💩', price: 41.55, author: vocabAuthor.id });
+      });
+
+      afterAll(async () => {
+        await resolver.match('Book').id(emojiBook.id).delete();
+      });
+
+      test('array length: exact, and missing/empty both count as 0', async () => {
+        expect(prices(await books({ bids: { $size: 0 } }))).toEqual([10, 20, 41.55]); // missing + empty + emoji (missing)
+        expect(prices(await books({ bids: { $size: 2 } }))).toEqual([30]);
+      });
+
+      test('array length: comparison operands and range composition', async () => {
+        expect(prices(await books({ bids: { $size: { $gt: 0 } } }))).toEqual([30]);
+        expect(prices(await books({ bids: { $size: { $gte: 1, $lte: 2 } } }))).toEqual([30]);
+        expect(prices(await books({ bids: { $size: { $ne: 0 } } }))).toEqual([30]);
+      });
+
+      test('string length is CODE POINTS — the emoji book is 10, not 11', async () => {
+        expect(prices(await books({ price: 41.55, name: { $size: 10 } }))).toEqual([41.55]);
+        expect(prices(await books({ price: 41.55, name: { $size: 11 } }))).toEqual([]);
+      });
+
+      test('refused on fields that are neither array nor String', async () => {
+        await expect(books({ price: { $size: 0 } })).rejects.toThrow(/\$size.*array and String/);
+      });
     });
   });
 

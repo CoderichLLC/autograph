@@ -34,6 +34,23 @@ function buildDDL(models) {
 
 exports.setup = async () => {
   const pgMem = newDb();
+
+  // pg-mem ships very few native functions; the driver's $size translation uses these two REAL
+  // Postgres builtins, so the harness supplies faithful implementations. char_length counts
+  // CHARACTERS (code points) — [...str].length, never str.length (UTF-16 units).
+  pgMem.public.registerFunction({
+    name: 'jsonb_array_length',
+    args: ['jsonb'],
+    returns: 'integer',
+    implementation: v => (Array.isArray(v) ? v.length : null),
+  });
+  pgMem.public.registerFunction({
+    name: 'char_length',
+    args: ['text'],
+    returns: 'integer',
+    implementation: v => (v == null ? null : [...String(v)].length),
+  });
+
   const { Pool } = pgMem.adapters.createPg();
   // The production driver is written against REAL Postgres semantics (native isolation and
   // rollback); pg-mem has neither, so the test pool is wrapped in an emulation shim.

@@ -134,6 +134,7 @@ by passthrough (the reference implementation); every other driver translates to 
 | `$in` `$nin` | list | array of field-shaped operands, applied element-wise |
 | `$exists` | none | boolean; "a NON-NULL value is present" (portable — Mongo translates to a null-comparison) |
 | `$not` | nested | field-level negation; operand is itself an operator object; matches missing/null values (Mongo semantics) |
+| `$size` | size | LENGTH of the field's value — array element count, or String CODE POINTS (mongo `$strLenCP` / PG `char_length` / JS `[...s].length` agree). Missing/null/wrong-type ≡ 0, so `{ tags: { $size: 0 } }` alone means "none". Operand is a length — a non-negative integer or a comparison object (`{ $gt: 0 }`) — never touched by field pipelines. Array/String fields only; must be the sole key of its object; refused inside `$not`, through dotted paths, and inside embedded-ARRAY wheres (loud, not wrong) — the nested RELATION spelling (`{ tags: { name: { $size: n } } }`) is supported (the planner/join re-roots it). Richer than raw Mongo's exact-only `$size` — MongoDriver translates to a runtime-typed `$expr`. |
 | `$or` `$and` | compound | arrays of whole where clauses; nest recursively; coexist with field keys (implicit AND) |
 
 Rules and guarantees:

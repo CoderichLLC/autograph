@@ -382,11 +382,28 @@ function parseSchema(config, typeDefs) {
                 return Vocabulary.mapValues(a.value, value => rule({ ...a, value }));
               };
 
+              // A plain (non-operator) object on a RELATION field is one of two things. Carrying
+              // the field's LOOKUP key (`{ author: { id: x } }`, a fetched document) it is a
+              // VALUE: `$fk` reduces it to the bare FK, and the chain runs exactly as before.
+              // Anything else (`{ tags: { name: 'x' } }`) is a NESTED WHERE — query STRUCTURE —
+              // and the pipelines must not touch it: `$fk` would pass the whole object to the
+              // generator and `serialize: toString` turned it into "[object Object]", which
+              // degenerated downstream to match-all. Nested content is coerced by the FOREIGN
+              // model's own where-transform when the join resolves (planner pre-query or driver
+              // join). Embedded fields keep their explicit recursion below.
+              const nestedWhereAware = rule => (a) => {
+                if (curr.model && !curr.isEmbedded && Util.isPlainObject(a.value) && !Vocabulary.isOperatorObject(a.value)) {
+                  const lookupField = curr.isPrimaryKey ? curr.name : curr.fkField;
+                  if (a.value[lookupField] === undefined) return a.value;
+                }
+                return rule(a);
+              };
+
               const rules = [
                 a => Pipeline.$cast({ ...a, ...args, path: a.path.concat(curr.name) }),
                 a => Pipeline.$instruct({ ...a, ...args, path: a.path.concat(curr.name) }),
                 a => Pipeline.$serialize({ ...a, ...args, path: a.path.concat(curr.name) }),
-              ].map(operatorAware).map(argsSafe);
+              ].map(operatorAware).map(nestedWhereAware).map(argsSafe);
 
               if (curr.isEmbedded) {
                 rules.push(argsSafe(operatorAware(a => Util.map(a.value, (value, i) => {

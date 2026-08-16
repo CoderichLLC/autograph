@@ -191,12 +191,32 @@ module.exports = class MongoDriver {
   // Contract-semantics translation (see autograph/src/query/Vocabulary.js): the vocabulary
   // defines `$exists: true` as "a non-null value is present" — portable across drivers. Mongo's
   // native $exists counts null-valued fields as existing, so it translates to the equivalent
-  // null-comparison. Everything else in the vocabulary is Mongo wire syntax already (this driver
-  // is the reference implementation — passthrough).
+  // null-comparison. `$size` is the vocabulary's LENGTH predicate (array elements; string CODE
+  // POINTS; missing/null/wrong-type ≡ 0) — richer than Mongo's native $size (exact, array-only,
+  // missing never matches), so it translates to a runtime-typed $expr: $isArray → $size,
+  // string → $strLenCP, anything else → 0. $exprs accumulate under $and so several $size
+  // predicates (and an author-written $and) coexist. Everything else in the vocabulary is Mongo
+  // wire syntax already (this driver is the reference implementation — passthrough).
   static translateVocabulary(where = {}) {
     return Object.entries(where).reduce((prev, [key, value]) => {
-      if ((key === '$or' || key === '$and') && Array.isArray(value)) value = value.map(branch => MongoDriver.translateVocabulary(branch));
-      else if (value != null && typeof value === 'object' && '$exists' in value) {
+      if ((key === '$or' || key === '$and') && Array.isArray(value)) {
+        const branches = value.map(branch => MongoDriver.translateVocabulary(branch));
+        return Object.assign(prev, { [key]: (key === '$and' && Array.isArray(prev.$and)) ? prev.$and.concat(branches) : branches });
+      }
+      if (value != null && typeof value === 'object' && '$size' in value) {
+        const len = {
+          $cond: [
+            { $isArray: [`$${key}`] },
+            { $size: [`$${key}`] },
+            { $cond: [{ $eq: [{ $type: `$${key}` }, 'string'] }, { $strLenCP: `$${key}` }, 0] },
+          ],
+        };
+        const cmp = (value.$size != null && typeof value.$size === 'object') ? value.$size : { $eq: value.$size };
+        const exprs = Object.entries(cmp).map(([op, n]) => ({ [op]: [len, n] }));
+        const $expr = exprs.length === 1 ? exprs[0] : { $and: exprs };
+        return Object.assign(prev, { $and: (prev.$and || []).concat({ $expr }) });
+      }
+      if (value != null && typeof value === 'object' && '$exists' in value) {
         const { $exists, ...rest } = value;
         value = { ...rest, ...($exists ? { $ne: null } : { $eq: null }) };
       }

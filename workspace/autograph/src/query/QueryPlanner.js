@@ -1,5 +1,6 @@
 const get = require('lodash.get');
 const Util = require('@coderich/util');
+const Vocabulary = require('./Vocabulary');
 
 const CHUNK_SIZE = 500;
 
@@ -81,7 +82,11 @@ module.exports = class QueryPlanner {
     const rawQuery = tquery.toObject();
     const { where = {}, sort = {}, op, limit, skip, first, last, before, after, isCursorPaging } = rawQuery;
 
-    const flatWhere = Util.flatten(where, { safe: true });
+    // OPERATOR-AWARE flatten (never Util.flatten here): an operator object is a vocabulary
+    // VALUE, not a path — generic flattening turned `{ tags: { $exists: false } }` into the
+    // path 'tags.$exists', which the FK walk below misread as a JOIN sub-path and pre-queried
+    // the foreign model with a dangling operator (dropped by its transform → match-all).
+    const flatWhere = Vocabulary.flattenWhere(where);
     const flatSort = Util.flatten(sort, { safe: true });
 
     // Joins execute in the ROOT source's driver ($lookup / SQL JOIN on the root table), so the
@@ -124,6 +129,12 @@ module.exports = class QueryPlanner {
         // A virtual link behind an embedded prefix has no local column to inject at — the only
         // genuinely unliftable WHERE shape. Loud beats silently dropping the constraint.
         throw new Error(`Unsupported where: join path "${path}" cannot be planner-resolved (virtual link behind an embedded prefix) and the data source does not support driver joins`);
+      } else if (!subPath && Vocabulary.isOperatorObject(value)) {
+        // An operator object on a bare VIRTUAL link has no local column to predicate, and $in
+        // injection cannot express its complement ($exists: false = "rows with NO links" needs
+        // an anti-join). A stored FK never reaches here (bare stored FKs are local columns,
+        // handled above). Loud beats over-matching.
+        throw new Error(`Unsupported where: operator on virtual link "${path}" (${Object.keys(value).join(', ')}) cannot be planner-resolved — predicate a field of the linked model instead (e.g. { ${path}: { <field>: … } })`);
       } else {
         const groupKey = segments.slice(0, fkIndex + 1).join('.');
         if (!whereGroupsByField[groupKey]) {

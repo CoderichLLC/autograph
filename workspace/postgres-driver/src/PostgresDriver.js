@@ -411,6 +411,11 @@ module.exports = class PostgresDriver {
           // Regular scalar: SQL IN (empty → 1=0 in buildWhereCallback).
           dbWhere[col] = { $in: scalars };
         }
+      } else if (value !== null && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).some(k => k.startsWith('$'))) {
+        // A vocabulary operator object (non-$in, handled above): SQL-expressible in
+        // buildWhereCallback — INCLUDING on JSONB array columns, where $size/$exists predicate
+        // the COLUMN itself, never its elements (element predicates are containment, above).
+        dbWhere[col] = value;
       } else if (isJsonbArray && !isDotted && value !== null && value !== undefined) {
         // Top-level JSONB array, scalar value: JS-side containment.
         jsFilters.push({ type: 'contains', col, values: [value] });
@@ -828,6 +833,18 @@ module.exports = class PostgresDriver {
                 // only notion; MongoDriver translates to the equivalent null-comparison.
                 this.whereRaw(operand ? `${colExpr} IS NOT NULL` : `${colExpr} IS NULL`);
                 break;
+              case '$size': {
+                // Vocabulary LENGTH predicate: array elements (jsonb) or string CODE POINTS
+                // (char_length counts characters, matching mongo's $strLenCP and JS [...s]);
+                // COALESCE implements the contract's missing/null ≡ 0.
+                const lenExpr = isJsonbArray
+                  ? `COALESCE(jsonb_array_length(${colExpr}), 0)`
+                  : `COALESCE(char_length(${colExpr}), 0)`;
+                const cmp = (operand !== null && typeof operand === 'object') ? operand : { $eq: operand };
+                const SQL_CMP = { $eq: '=', $ne: '!=', $gt: '>', $gte: '>=', $lt: '<', $lte: '<=' };
+                Object.entries(cmp).forEach(([o, n]) => this.whereRaw(`${lenExpr} ${SQL_CMP[o]} ?`, [n]));
+                break;
+              }
               case '$not': {
                 // Field-level negation with Mongo's semantics: matches docs where the field is
                 // null/missing OR the inner predicate fails (SQL NOT alone excludes NULL rows).

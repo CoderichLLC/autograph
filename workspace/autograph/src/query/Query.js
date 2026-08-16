@@ -10,18 +10,9 @@ const convertGlobs = (value) => {
   return Util.map(value, el => (isGlob(el) ? globToRegex(el) : el));
 };
 
-// Flatten a where clause by FIELD PATHS only — operator objects are vocabulary VALUES, never
-// path segments. This is the operator-aware replacement for Util.flatten in #finalize: flattening
-// `{ price: { $ne: -999 } }` to the key 'price.$ne' hands MongoDB a literal field path that
-// silently matches nothing (verified empirically), and hands every other driver a reconstruction
-// chore. Operator objects arrive at drivers INTACT.
-const flattenWhere = (obj, path = [], acc = {}) => {
-  Object.entries(obj ?? {}).forEach(([key, value]) => {
-    if (Util.isPlainObject(value) && !Vocabulary.isOperatorObject(value) && Object.keys(value).length) flattenWhere(value, path.concat(key), acc);
-    else acc[path.concat(key).join('.')] = value;
-  });
-  return acc;
-};
+// Operator-aware where flatten — canonical home is Vocabulary (the QueryPlanner shares it; see
+// the note there for why a generic Util.flatten on a where clause is always wrong).
+const { flattenWhere } = Vocabulary;
 
 // Deep "merged" view: input first, falls through to doc — recursively for plain objects.
 // READ-ONLY. Writes/deletes throw with a hint pointing at `query.input` as the correct
