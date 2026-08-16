@@ -574,6 +574,11 @@ function parseSchema(config, typeDefs) {
         const $field = field;
         const $model = model;
 
+        // "_" is the generated where-input's VOCABULARY SLOT (see Vocabulary.liftMixed) — an
+        // author field by that name would collide with it on its own model's where. Reserved
+        // loudly at parse rather than shadowed silently at query time.
+        if (field.name === '_') throw new Error(`Field "${model.name}._" is not allowed: "_" is reserved as the generated where-input's vocabulary slot. Rename the field.`);
+
         field.isPrimaryKey = Boolean(field.name === model.pkField);
         field.isPersistable = Util.uvl(field.isPersistable, model.isPersistable, true);
 

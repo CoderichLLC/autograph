@@ -37,9 +37,68 @@ describe('generated inputs vs server-supplied fields', () => {
     expect(create).toMatch(/name: String!/); // a plain required field is still the caller's to provide
   });
 
-  test('the output type and the where input are untouched', () => {
+  // `@model(meta:)` adds the meta ARGUMENT and nothing else. An earlier revision also relaxed the
+  // create input to nullable, and it was rejected: meta is an untyped escape hatch whose presence
+  // promises nothing about who fills the input — unlike `default`/`instruct`, which are per-field,
+  // generator-verifiable server-supplies-it declarations. A wholly server-driven create (clone)
+  // belongs to a custom operation, not a bent create.
+  test('declaring @model(meta:) adds the meta argument; the create input stays required', () => {
+    const metaDefs = `
+      scalar AutoGraphDateTime
+      scalar Mixed
+
+      type Gadget @model(meta: Mixed) {
+        name: String!
+      }
+    `;
+    const { typeDefs: api } = generateApi(new Schema({}).merge(metaDefs).parse());
+    expect(api).toMatch(/createGadget\(input: GadgetInputCreate! meta: Mixed\)/);
+    expect(api).toMatch(/updateGadget\(id: ID! input: GadgetInputUpdate meta: Mixed\)/);
+    expect(api).toMatch(/deleteGadget\(id: ID! meta: Mixed\)/);
+  });
+
+  // The WHERE surface: the typed `<Model>InputWhere` STAYS — external clients hard-code its name
+  // in variable declarations (`query ($where: PersonInputWhere)`), and its fields are what
+  // introspection documents — plus ONE optional `_: AutoGraphMixed` member: the vocabulary SLOT.
+  // GraphQL's type system cannot carry the where IR (`$` is not a legal field name; a relation
+  // operand is bare-id | array | operator-object | nested-where, which inputs can't union), so
+  // the slot is where the FULL grammar rides — validated at the query boundary like everything
+  // else, and lifted server-side into an implicit AND with its typed siblings. Strictly additive:
+  // nothing existing changes shape, meaning, or name.
+  test('the where argument stays typed, and every InputWhere carries the `_` vocabulary slot', () => {
     const { typeDefs: api } = generateApi(new Schema({}).merge(typeDefs).parse());
-    expect(inputBlock(api, 'WidgetInputWhere')).toMatch(/user: /);
+    expect(api).toMatch(/findWidget\([^)]*where: WidgetInputWhere/);
+    expect(inputBlock(api, 'WidgetInputWhere')).toMatch(/_: AutoGraphMixed/);
+    expect(inputBlock(api, 'WidgetInputWhere')).toMatch(/user: /); // typed fields untouched
+  });
+
+  test('the subscription filter keeps its typed where, slot included', () => {
+    const subDefs = `
+      scalar AutoGraphDateTime
+
+      type Thing @model(crud: "cruds") {
+        name: String
+      }
+    `;
+    const { typeDefs: api } = generateApi(new Schema({}).merge(subDefs).parse());
+    expect(api).toMatch(/where: ThingSubscriptionInputWhere! = \{\}/);
+    expect(inputBlock(api, 'ThingSubscriptionInputWhere')).toMatch(/_: AutoGraphMixed/);
+    expect(api).toMatch(/input ThingInputSort/); // sort stays typed — navigational grammar, no slot needed
+    expect(inputBlock(api, 'ThingInputSort')).not.toMatch(/_: /);
+  });
+
+  // `_` is WIRE vocabulary, not an author field name — a model that declares it would collide
+  // with the slot on its own where-input, so the reservation is enforced loudly at parse.
+  test('a model field named `_` is refused at parse — the slot name is reserved', () => {
+    expect(() => new Schema({}).merge(`
+      type Bad @model {
+        _: String
+      }
+    `).parse()).toThrow(/"_".*reserved/s);
+  });
+
+  test('the output type is untouched', () => {
+    const { typeDefs: api } = generateApi(new Schema({}).merge(typeDefs).parse());
     expect(api).not.toMatch(/type Widget \{[\s\S]*?user: ID(?!!)/); // reads still promise non-null
   });
 });

@@ -190,20 +190,27 @@ module.exports = class Query {
     let field;
     let wrap;
 
+    // A where ALWAYS rides the `_` vocabulary slot of the typed `${M}InputWhere` — one
+    // serialization path carrying the IR verbatim (operators, compounds, bare-FK operands — none
+    // of which the typed fields can express), which the server lifts back out and validates at
+    // the query boundary. The typed fields are the human/external-client surface; toGQL never
+    // needs them. NOTE this also keeps the DECLARATION (`$where: ${M}InputWhere`) on the name
+    // external clients hard-code — the wire stays backward-compatible for everyone but us, and
+    // we upgrade client+server together.
     switch (q.op) {
       case 'findOne':
         if (q.id != null) {
           field = `get${M}`; wrap = 'node'; args.id = ['ID!', q.id];
         } else {
-          field = `find${M}`; wrap = 'firstNode'; args.where = [`${M}InputWhere`, q.where]; args.first = ['Int', 1];
+          field = `find${M}`; wrap = 'firstNode'; args.where = [`${M}InputWhere`, q.where === undefined ? undefined : { _: q.where }]; args.first = ['Int', 1];
         }
         break;
       case 'findMany':
         field = `find${M}`; wrap = 'connection';
-        Object.assign(args, { where: [`${M}InputWhere`, q.where], sortBy: [`${M}InputSort`, q.sort], limit: ['Int', q.limit], skip: ['Int', q.skip], first: ['Int', q.first], after: ['String', q.after], last: ['Int', q.last], before: ['String', q.before] });
+        Object.assign(args, { where: [`${M}InputWhere`, q.where === undefined ? undefined : { _: q.where }], sortBy: [`${M}InputSort`, q.sort], limit: ['Int', q.limit], skip: ['Int', q.skip], first: ['Int', q.first], after: ['String', q.after], last: ['Int', q.last], before: ['String', q.before] });
         break;
       case 'count':
-        field = `find${M}`; wrap = 'count'; args.where = [`${M}InputWhere`, q.where];
+        field = `find${M}`; wrap = 'count'; args.where = [`${M}InputWhere`, q.where === undefined ? undefined : { _: q.where }];
         break;
       case 'createOne': case 'createMany':
         field = `create${M}`; wrap = 'node'; args.input = [`${M}InputCreate!`, q.input];
@@ -215,6 +222,16 @@ module.exports = class Query {
         field = `delete${M}`; wrap = 'node'; args.id = ['ID!', q.id];
         break;
       default: throw new Error(`toGQL: unsupported op "${q.op}"`);
+    }
+
+    // `.meta()` is out-of-band instruction to the mutation (the server's generated resolver routes
+    // the argument back into `query.meta`, where hooks read it). It exists on the wire only when
+    // the model opted in with `@model(meta: <Type>)` — offered without the declaration, there is
+    // no argument to bind it to, so refuse by name rather than silently dropping domain semantics.
+    // Read from `q.args.meta`: the builder defaults `q.meta` to `{}`, so only `.meta()` sets args.
+    if (q.args?.meta !== undefined && q.isMutation) {
+      if (!this.#model.meta) throw new Error(`toGQL: .meta() was given but model "${M}" declares no meta type — the generated ${field} mutation has no meta argument to carry it. Declare it in the SDL: @model(meta: <ScalarOrInputType>).`);
+      args.meta = [this.#model.meta, q.args.meta];
     }
 
     const decls = [];
@@ -268,11 +285,13 @@ module.exports = class Query {
     const args = { query: this.#query, resolver: this.#resolver, context: this.#context };
 
     if (['create', 'update'].includes(this.#query.crud) && !this.#query.isSaveNative) input = this.#model.transformers[this.#query.crud]?.transform(Util.unflatten(this.#query.input, { safe: true }), args);
-    // Validate the where against the vocabulary allowlist BEFORE any transformation — this is
-    // the loud front door for whatever the GraphQL Mixed where-inputs let through. Native wheres
+    // Validate the where against the vocabulary allowlist AND the parsed model BEFORE any
+    // transformation — this is the loud front door for whatever the GraphQL Mixed where argument
+    // lets through, and the same guard for local callers (the key-walk silently DROPS unknown
+    // keys, so an unvalidated typo deleted its predicate and matched everything). Native wheres
     // are exempt by design: flags({ native }) is the developer's code-level declaration of TRUE
-    // driver dialect (e.g. Mongo $expr) — the allowlist guards the untrusted path only.
-    if (!this.#query.isWhereNative && ['read', 'update', 'delete'].includes(this.#query.crud)) Vocabulary.validate(this.#query.where ?? {});
+    // driver dialect (raw storage keys, e.g. Mongo $expr) — the guard covers the untrusted path only.
+    if (!this.#query.isWhereNative && ['read', 'update', 'delete'].includes(this.#query.crud)) Vocabulary.validate(this.#query.where ?? {}, [], this.#model);
     if (!this.#query.isWhereNative && ['read', 'update', 'delete'].includes(this.#query.crud)) where = this.#transformWhere(Util.unflatten(this.#query.where ?? {}, { safe: true }), args);
     if (!this.#query.isSortNative && ['read'].includes(this.#query.crud)) sort = this.#model.transformers.sort.transform(Util.unflatten(this.#query.sort, { safe: true }), args);
 

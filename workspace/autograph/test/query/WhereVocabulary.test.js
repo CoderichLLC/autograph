@@ -175,4 +175,48 @@ describe('Where vocabulary — tier-1 operators through the NORMAL (transformed)
       .many();
     expect(names(rows)).toEqual(['vocab-alpha', 'vocab-charlie']); // glob + operator, per branch
   });
+
+  // UNKNOWN FIELD NAMES reject as loudly as unknown operators — the other half of boundary
+  // validation. Without it, a typo'd key was WORSE than a wrong result: the domain→data key-walk
+  // silently DROPS unknown keys, so `.where({ emialAddress: 'x' })` deleted the predicate and
+  // matched EVERYTHING — a tenancy-grade hazard, and it existed for LOCAL callers too (the old
+  // typed GraphQL where-inputs protected only remote callers; with `where: AutoGraphMixed` the
+  // model walk here is the one guard, every caller, every depth). `flags({ native })` remains
+  // the sanctioned escape for raw storage keys, per the same doctrine as operators.
+  describe('unknown field names reject loudly at the boundary', () => {
+    test('a typo`d field rejects instead of silently matching everything', async () => {
+      await expect(resolver.match('Person').where({ emialAddress: 'x@y.z' }).many())
+        .rejects.toThrow(/Unknown where field "emialAddress".*Person/s);
+    });
+
+    test('an unknown segment in a DOTTED path rejects, naming the model it failed against', async () => {
+      await expect(resolver.match('Person').where({ 'sections.bogus': 'x' }).many())
+        .rejects.toThrow(/Unknown where field "bogus".*Section/s);
+    });
+
+    test('a nested where against a RELATION validates against the related model', async () => {
+      await expect(resolver.match('Book').where({ author: { bogus: 'x' } }).many())
+        .rejects.toThrow(/Unknown where field "bogus".*Person/s);
+    });
+
+    test('compound branches validate their field names too', async () => {
+      await expect(scoped({ $or: [{ emailAddress: 'a@b.c' }, { bogus: 'x' }] }))
+        .rejects.toThrow(/Unknown where field "bogus".*Person/s);
+    });
+
+    test('a Mixed-typed field is OPAQUE — object values inside it are not field-checked', async () => {
+      await expect(resolver.match('Person').where({ emailAddress: 'no-such-vocab@x.com', multiLang: { anything: { goes: 1 } } }).many())
+        .resolves.toEqual([]);
+    });
+
+    test('deep VALID paths and nested relation wheres still pass', async () => {
+      await expect(resolver.match('Person').where({ 'sections.name': 'no-such-section' }).many()).resolves.toEqual([]);
+      await expect(resolver.match('Book').where({ author: { name: 'no-such-person' } }).many()).resolves.toEqual([]);
+    });
+
+    test('flags({ native }) remains the sanctioned escape for raw storage keys', async () => {
+      await expect(resolver.match('Person').flags({ native: ['where'] }).where({ email_address: 'no-such@x.com' }).many())
+        .resolves.toEqual([]);
+    });
+  });
 });

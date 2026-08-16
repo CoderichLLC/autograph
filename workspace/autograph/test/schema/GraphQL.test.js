@@ -171,6 +171,45 @@ describe('GraphQL', () => {
     });
   });
 
+  // The `_` VOCABULARY SLOT on the typed where-input: the full where IR rides it (operators,
+  // compounds — inexpressible as typed input fields since `$` is not a legal GraphQL name), the
+  // server LIFTS it into an implicit AND with its typed siblings, and the query boundary
+  // validates its content like any other where. NOTE the slot's content must travel as a
+  // VARIABLE — `$`-keys are illegal in document literals too, so an inline `{ _: { age: { $exists:
+  // false } } }` cannot even parse; variables are JSON and carry it fine.
+  test('find (where `_` slot): operators cross the typed input', async () => {
+    const { errors, data } = await graphql({
+      schema: xschema,
+      contextValue: context,
+      source: 'query ($where: PersonInputWhere) { findPerson(where: $where) { count edges { node { name } } } }',
+      variableValues: { where: { _: { age: { $exists: false } } } }, // neither person was created with an age
+    });
+    expect(errors).not.toBeDefined();
+    expect(data.findPerson.count).toBe(2);
+  });
+
+  test('find (where `_` slot): the slot ANDs with its typed siblings', async () => {
+    const { errors, data } = await graphql({
+      schema: xschema,
+      contextValue: context,
+      source: 'query ($where: PersonInputWhere) { findPerson(where: $where) { count edges { node { name } } } }',
+      variableValues: { where: { name: 'anne', _: { age: { $exists: false } } } },
+    });
+    expect(errors).not.toBeDefined();
+    expect(data.findPerson.count).toBe(1);
+    expect(data.findPerson.edges[0].node.name).toBe('anne');
+  });
+
+  test('find (where `_` slot): slot content is boundary-validated like any other where', async () => {
+    const { errors } = await graphql({
+      schema: xschema,
+      contextValue: context,
+      source: 'query ($where: PersonInputWhere) { findPerson(where: $where) { count } }',
+      variableValues: { where: { _: { bogus: 1 } } },
+    });
+    expect(errors?.[0]?.message).toMatch(/Unknown where field "bogus"/);
+  });
+
   test('find (sort, cursorPaginating)', async () => {
     expect(await graphql({
       schema: xschema,

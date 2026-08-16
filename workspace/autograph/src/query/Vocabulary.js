@@ -71,11 +71,57 @@ const mapValues = (obj, fn) => Object.entries(obj).reduce((prev, [op, value]) =>
   return Object.assign(prev, { [op]: value });
 }, {});
 
+// Walk a (possibly dotted) where key against the parsed model — DOMAIN field names, exactly what
+// a caller writes. Numeric segments (array indices) stay on the current model; reaching a field
+// with no model (a scalar — including custom object scalars like the dogfood's Place, and
+// AutoGraphMixed) makes every deeper segment OPAQUE: the scalar's contents are the model's VALUE,
+// not its shape, so there is nothing to check them against. Returns the model a nested-object
+// value should recurse into (undefined at a scalar leaf). Throws on an unknown segment, naming
+// the model it failed against and the declared alternatives.
+const resolveField = (model, key, path) => {
+  return key.split('.').reduce((target, segment) => {
+    if (!target || /^\d+$/.test(segment)) return target; // past a scalar, or an array index
+    const field = target.fields?.[segment];
+    if (!field) throw new Error(`Unknown where field "${segment}" for ${target} at "${path.concat(key).join('.')}" — declared fields: ${Object.keys(target.fields ?? {}).join(', ')}. (\`flags({ native })\` is the escape hatch for raw storage keys.)`);
+    return field.model;
+  }, model);
+};
+
+// `_` — the WIRE's vocabulary slot. The generated `<Model>InputWhere` keeps its typed fields
+// (external clients hard-code the type name; introspection documents the fields) plus one
+// optional `_: AutoGraphMixed` member carrying the full where IR the type system cannot express.
+// This lift, applied by the generated resolvers, folds the slot back into the where it rides in —
+// an implicit AND with its typed siblings, at ANY depth (every nested InputWhere has its own
+// slot) — BEFORE the query boundary validates the whole, so the slot's content is schema-checked
+// like everything else. MODEL-GUIDED recursion: it descends only into relation/embedded fields
+// and compound branches, so a literal `_` key inside a Mixed scalar's DATA is never mistaken for
+// the slot. The slot's own content is IR, taken verbatim (an `_` inside it is not a slot — it
+// rejects at the boundary as an unknown field, loudly). `_` is wire-only: a LOCAL
+// `.where({ _: … })` rejects the same way, and the parser refuses a model field named `_`.
+const liftMixed = (model, where) => {
+  if (!Util.isPlainObject(where)) return where;
+
+  const { _, ...rest } = where;
+  const lifted = Object.fromEntries(Object.entries(rest).map(([key, value]) => {
+    if (COMPOUNDS[key] && Array.isArray(value)) return [key, value.map(branch => liftMixed(model, branch))];
+    const field = model?.fields?.[key];
+    if (field?.model && Util.isPlainObject(value) && !isOperatorObject(value)) return [key, liftMixed(field.model, value)];
+    return [key, value];
+  }));
+
+  if (_ === undefined) return lifted;
+  return Object.keys(lifted).length ? { $and: [lifted, _] } : _;
+};
+
 // Validate a (nested) where clause against the vocabulary. Every `$`-key must be a known
 // operator; operator keys must not mix with field keys in one object; list-operators require
-// arrays. Throws with the full allowlist in the message — the loud front door for anything the
-// GraphQL Mixed inputs let through.
-const validate = (where, path = []) => {
+// arrays. Given a parsed MODEL, every field key must also resolve against it — at every depth,
+// through dotted paths, into relation/embedded nested wheres, inside compound branches. Without
+// this the typo'd key was WORSE than a wrong result: the domain→data key-walk silently DROPS
+// unknown keys, so the predicate vanished and the query matched EVERYTHING. Throws with the
+// allowlist / the declared fields in the message — the loud front door for anything the GraphQL
+// Mixed where argument lets through, and the same guard for local callers, who never had one.
+const validate = (where, path = [], model = undefined) => {
   if (!Util.isPlainObject(where)) return where;
 
   // Compound operators: value must be a non-empty array of where clauses; recurse each branch.
@@ -84,7 +130,7 @@ const validate = (where, path = []) => {
   const compounds = Object.keys(where).filter(k => COMPOUNDS[k]);
   compounds.forEach((op) => {
     if (!Array.isArray(where[op]) || where[op].length === 0) throw new Error(`Where operator "${op}" at "${path.join('.') || '.'}" requires a non-empty array of where clauses`);
-    where[op].forEach((branch, i) => validate(branch, path.concat(`${op}[${i}]`)));
+    where[op].forEach((branch, i) => validate(branch, path.concat(`${op}[${i}]`), model)); // branches predicate the SAME model
   });
 
   const keys = Object.keys(where).filter(k => !COMPOUNDS[k]);
@@ -104,15 +150,25 @@ const validate = (where, path = []) => {
   }
 
   keys.forEach((key) => {
-    // Dotted keys may embed an operator as their final segment ('price.$ne') — validate it.
-    const last = key.split('.').pop();
+    // Dotted keys may embed an operator as their final segment ('price.$ne') — validate it,
+    // then resolve the FIELD prefix it applies to.
+    const segments = key.split('.');
+    const last = segments[segments.length - 1];
     if (isOperatorKey(last)) {
       if (!OPERATORS[last]) throw new Error(`Unknown where operator "${last}" at "${path.concat(key).join('.')}" — supported operators: ${Object.keys(OPERATORS).join(', ')}`);
+      if (model && segments.length > 1) resolveField(model, segments.slice(0, -1).join('.'), path);
       return;
     }
-    validate(where[key], path.concat(key));
+
+    // Resolve the field path against the model (when one was given); a plain-object value on a
+    // relation/embedded field is a NESTED WHERE and recurses against the related model. Operator
+    // objects and scalar-leaf objects recurse model-less — operator checks only (a Mixed/custom-
+    // scalar object is opaque data, not shape).
+    const nested = model ? resolveField(model, key, path) : undefined;
+    if (nested && Util.isPlainObject(where[key]) && !isOperatorObject(where[key])) validate(where[key], path.concat(key), nested);
+    else validate(where[key], path.concat(key));
   });
   return where;
 };
 
-module.exports = { OPERATORS, COMPOUNDS, isOperatorKey, isOperatorObject, mapValues, validate };
+module.exports = { OPERATORS, COMPOUNDS, isOperatorKey, isOperatorObject, mapValues, liftMixed, validate };

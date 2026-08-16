@@ -389,13 +389,22 @@ describe('persisted @oneOf interface — generated API surface', () => {
     expect(executable.getType('CogInputUpdate').getFields()).toHaveProperty('ratio');
   });
 
-  test('where/sort stay FAT regardless of @oneOf (aggregated union of all implementer fields)', () => {
+  test('where/sort stay FAT regardless of @oneOf — and the where carries the `_` slot', () => {
     const where = executable.getType('GadgetInputWhere').getFields();
     expect(where).toHaveProperty('type'); // discriminator stays queryable -> backs find(where: { type })
     expect(where).toHaveProperty('label'); // interface own
     expect(where).toHaveProperty('teeth'); // Sprocket variant — aggregated onto the fat where
     expect(where).toHaveProperty('ratio'); // Cog variant — aggregated onto the fat where
+    expect(where).toHaveProperty('_'); // the vocabulary slot rides the fat where too
     expect(executable.getType('GadgetInputSort').getFields()).toHaveProperty('teeth'); // sort is fat too
+    expect(executable.getType('GadgetInputSort').getFields()).not.toHaveProperty('_'); // no slot — navigational grammar
+
+    // The fat guarantee is ALSO enforced at the query boundary (where the slot's content lands):
+    // Vocabulary.validate walks the interface's aggregated fields.
+    const Vocabulary = require('../../src/query/Vocabulary');
+    const { Gadget } = new Schema({}).merge(td).parse().models;
+    expect(() => Vocabulary.validate({ teeth: 9, ratio: 1.5 }, [], Gadget)).not.toThrow(); // variants aggregated
+    expect(() => Vocabulary.validate({ bogus: 1 }, [], Gadget)).toThrow(/Unknown where field "bogus"/);
   });
 
   test('implementers emit no standalone where/sort/connection types', () => {

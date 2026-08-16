@@ -1,6 +1,13 @@
 /* eslint-disable indent */
 
 const { fromGUID } = require('../service/AppService');
+const { liftMixed } = require('../query/Vocabulary');
+
+// Fold a GraphQL `where` argument's `_` vocabulary slot into the where before it enters the
+// builder (see Vocabulary.liftMixed). Applied at every generated resolver that accepts a where —
+// the slot is a WIRE concept, so the lift lives here, never in the builder (a local
+// `.where({ _: … })` rejects as an unknown field at the query boundary).
+const liftWhereArgs = (model, args) => (args?.where === undefined ? args : { ...args, where: liftMixed(model, args.where) });
 
 function getGQLType(field, suffix) {
   let { type } = field;
@@ -28,6 +35,11 @@ function getSubscriptionType(field) {
 }
 
 function getConnectionArguments(model) {
+  // The typed `<Model>InputWhere` STAYS — external clients hard-code its NAME in variable
+  // declarations and its fields are what introspection documents — and it carries the `_`
+  // vocabulary slot (see the where-input generation below) for everything GraphQL's type system
+  // cannot express. Sort needs no slot: its grammar is purely navigational — fields down to an
+  // enum leaf.
   return `
     where: ${model}InputWhere
     sortBy: ${model}InputSort
@@ -95,8 +107,19 @@ function generateApi(schema) {
         // Note: connection fields (`@field(connection: true)`) are rewritten in place on the
         // user's existing type by Schema#rewriteConnections, called from .api() before this
         // generator runs — so we don't emit a competing `extend type X { ... }` here.
+        // The where-input: typed fields for the COMMON grammar (field navigation; Mixed leaves so
+        // operator objects ride scalar positions), plus `_: AutoGraphMixed` — the VOCABULARY SLOT.
+        // The full where IR ($and/$or, operators at relation/embedded positions, bare-FK operands)
+        // is structurally inexpressible as typed input fields (`$` is not a legal GraphQL name; a
+        // relation operand is bare-id | array | operator-object | nested-where, which inputs can't
+        // union), so the slot carries it: the generated resolvers LIFT it into an implicit AND
+        // with its typed siblings (Vocabulary.liftMixed, recursive — every nested InputWhere has
+        // its own slot), and the query boundary validates its content against the model like any
+        // other where. Strictly additive: existing clients' variable declarations and typed usage
+        // are untouched. `_` is reserved at parse so an author field can never collide with it.
         return `
           input ${model}InputWhere {
+            _: AutoGraphMixed
             ${fields.map(field => `${field}: ${field.model ? `${field.model}InputWhere` : 'AutoGraphMixed'}`)}
           }
           input ${model}InputSort {
@@ -164,6 +187,12 @@ function generateApi(schema) {
           ${mutationModels.map((model) => {
             const api = [];
             const meta = model.meta ? `meta: ${model.meta}` : '';
+            // NOTE deliberately NOT relaxed by `meta`: an earlier revision made the create input
+            // nullable when `@model(meta:)` was declared (so a hook-filled create could omit it),
+            // and it was rejected — meta is an untyped escape hatch whose presence promises
+            // nothing about who fills the input. Per-field `default`/`instruct` relax the INNER
+            // fields because those ARE verifiable server-supplies-it declarations (getGQLType);
+            // a wholly server-driven create belongs to a custom operation, not a bent create.
             if (model.crud?.includes('c')) api.push(`create${model}(input: ${model}InputCreate! ${meta}): ${model}!`);
             if (model.crud?.includes('u')) api.push(`update${model}(id: ID! input: ${model}InputUpdate ${meta}): ${model}!`);
             if (model.crud?.includes('d')) api.push(`delete${model}(id: ID! ${meta}): ${model}!`);
@@ -192,6 +221,7 @@ function generateApi(schema) {
             }
 
             input ${model}SubscriptionInputWhere {
+              _: AutoGraphMixed
               ${fields.map(field => `${field}: ${field.model ? `${field.model}InputWhere` : 'AutoGraphMixed'}`)}
             }
 
@@ -243,7 +273,7 @@ function generateApi(schema) {
       Query: queryModels.reduce((prev, model) => {
         return Object.assign(prev, {
           [`get${model}`]: (doc, args, context, info) => context[schema.namespace].resolver.match(model).args(args).info(info).one({ required: true }),
-          [`find${model}`]: (doc, args, context, info) => context[schema.namespace].resolver.match(model).args(args).resolve(info),
+          [`find${model}`]: (doc, args, context, info) => context[schema.namespace].resolver.match(model).args(liftWhereArgs(model, args)).resolve(info),
         });
       }, {
         node: (doc, args, context, info) => {
@@ -282,7 +312,7 @@ function generateApi(schema) {
               [field]: (doc, args, context, info) => {
                 if (!doc.$) doc = context[schema.namespace].resolver.toResultSet(model, doc); // Ensure resultSet
                 const where = isVirtual ? { [linkBy]: doc[linkField] } : { [fkField]: doc[field] };
-                return context[schema.namespace].resolver.match(fieldModel).where(where).args(args).resolve(info);
+                return context[schema.namespace].resolver.match(fieldModel).where(where).args(liftWhereArgs(fieldModel, args)).resolve(info);
               },
             });
             // Interface models also need a __resolveType so GraphQL can pick the concrete type for
