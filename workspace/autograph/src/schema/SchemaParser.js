@@ -334,10 +334,27 @@ function parseSchema(config, typeDefs) {
               ];
 
               if (curr.isEmbedded) {
+                // An embedded ARRAY is replaced wholesale on update (elements have no identity to
+                // merge by), so its elements are effectively CREATED: seed each element with the
+                // embedded model's @field(default:) values (absent keys only) before the update
+                // transform — restoring the create/update default parity lost in the 0.13 rewrite
+                // (0.12's `subCrud` rule; ENG-885). Still the UPDATE transform, so update-stage
+                // pipelines (restruct: immutable, etc.) run per element against the pre-image.
+                // A SINGULAR embedded object partial-merges (dot-flattened) — defaults would stomp
+                // stored values there, so it is never seeded.
+                let elementDefaults;
+                const seedDefaults = (value) => {
+                  if (!Util.isPlainObject(value)) return value;
+                  elementDefaults ??= Object.values(curr.model.fields).reduce((acc, f) => {
+                    if (f.defaultValue !== undefined) acc[f.name] = f.defaultValue;
+                    return acc;
+                  }, {});
+                  return { ...elementDefaults, ...value };
+                };
                 rules.push(a => Util.map(a.value, (value, i) => {
                   const path = a.path.concat(curr.name);
                   if (curr.isArray) path.push(i);
-                  return curr.model.transformers.update.transform(value, { ...args, thunks: a.thunks, query: a.query, resolver: a.resolver, context: a.context, path });
+                  return curr.model.transformers.update.transform(curr.isArray ? seedDefaults(value) : value, { ...args, thunks: a.thunks, query: a.query, resolver: a.resolver, context: a.context, path });
                 }));
               }
 
