@@ -56,6 +56,24 @@ function generateApi(schema) {
   const mutationModels = entityModels.filter(model => ['c', 'u', 'd'].some(el => model.crud?.includes(el)) && !isOneOfImplementer(model));
   const subscriptionModels = entityModels.filter(model => model.crud?.includes('s') && !isOneOfImplementer(model));
 
+  // A `${model}Connection` is reachable exactly two ways: the root `find${model}` field (emitted
+  // for queryModels), or a field marked `@field(connection: true)`, which Schema#rewriteConnections
+  // retypes in place to `${model}Connection`. Emitting the pair for every readApiModel instead
+  // leaves a dead Connection + Edge on every embedded/nested type — types nothing can reach, which
+  // cost nothing at runtime but bloat the generated SDL that humans and agents read.
+  //
+  // where/sort are NOT in the same boat and must stay on readApiModels: nested inputs are genuinely
+  // reachable because parent input types reference them (XInputSort.child -> ChildInputSort).
+  const connectionTargets = new Set(queryModels.map(model => `${model}`));
+  Object.values(schema.models).forEach((model) => {
+    Object.values(model.fields).forEach((field) => {
+      if (field.isConnection && field.model) connectionTargets.add(`${field.model}`);
+    });
+  });
+  // Intersect with readApiModels: a Connection's arguments reference `${model}InputWhere`/`InputSort`,
+  // which only readApiModels emit, and oneOf implementers are deliberately excluded from both.
+  const connectionModels = readApiModels.filter(model => connectionTargets.has(`${model}`));
+
   return {
     typeDefs: `
       scalar AutoGraphMixed
@@ -97,17 +115,20 @@ function generateApi(schema) {
           input ${model}InputSort {
             ${fields.map(field => `${field}: ${field.model ? `${field.model}InputSort` : 'SortOrderEnum'}`)}
           }
-          type ${model}Connection {
-            count: Int!
-            pageInfo: PageInfo
-            edges: [${model}Edge]
-          }
-          type ${model}Edge {
-            node: ${model}
-            cursor: String
-          }
         `;
       })}
+
+      ${connectionModels.map(model => `
+        type ${model}Connection {
+          count: Int!
+          pageInfo: PageInfo
+          edges: [${model}Edge]
+        }
+        type ${model}Edge {
+          node: ${model}
+          cursor: String
+        }
+      `)}
 
       ${createModels.map((model) => {
         // Polymorphic interface input: @oneOf keyed by each implementer's typeValue -> its own input.
@@ -226,7 +247,11 @@ function generateApi(schema) {
       Node: {
         __resolveType: (doc, args, context, info) => doc.__typename,
       },
-      ...queryModels.reduce((prev, model) => {
+      // Keyed off connectionModels, not queryModels: a `@field(connection: true)` field can target a
+      // model with no root find field (e.g. `@model(crud: "cud")`), and that Connection needs these
+      // resolvers just as much — without them count/edges/pageInfo fall through to the default
+      // resolver and hand the caller the raw thunks.
+      ...connectionModels.reduce((prev, model) => {
         return Object.assign(prev, {
           [`${model}Connection`]: {
             count: ({ count }) => count(),
