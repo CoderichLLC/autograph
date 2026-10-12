@@ -416,3 +416,80 @@ describe('persisted @oneOf interface — generated API surface', () => {
     });
   });
 });
+
+// A PERSISTED @oneOf interface whose implementers are referenced DIRECTLY — as an FK target, as a
+// @link list element, or as the owner of a @link(by:) field. Before this, such a schema could not
+// build at all: (1) @link(by:) is resolved against the interface's own fields before implementer
+// fields are aggregated onto it, so a field declared only on an implementer was "not found";
+// (2) every model-typed field makes the parent input reference `<Model>InputWhere`/`InputSort`,
+// which a @oneOf implementer deliberately does not emit; (3) an implementer's default collection
+// key is its own type name, so a join or resolver.match() against it targeted the wrong collection.
+//
+// Mirrors the point-of-care tree: a Place has department rows; a department row has provider rows
+// nested under it via `parent`. Authors should be able to type each edge by the concrete kind.
+describe('persisted @oneOf interface — implementer-typed references', () => {
+  const td = `
+    type Place @model(key: "place") {
+      id: ID! @field(key: "_id")
+      name: String
+      depts: [Dept!] @link(by: place)
+      units: [Unit!] @link(by: place)
+    }
+    interface Unit @model(key: "unit", oneOf: true, typeField: "kind") {
+      id: ID! @field(key: "_id")
+      kind: UnitKind!
+      label: String
+    }
+    enum UnitKind { dept doc }
+    type Dept implements Unit @model(typeValue: "dept") {
+      place: Place
+      children: [Doc!] @link(by: parent)
+    }
+    type Doc implements Unit @model(typeValue: "doc") {
+      parent: Dept!
+      npi: String
+    }
+  `;
+
+  test('schema builds when @link(by:) names a field declared only on an implementer', () => {
+    expect(() => makeExecutableSchema(new Schema({}).merge(td).api().toObject())).not.toThrow();
+  });
+
+  test('a @link(by:) that targets an implementer-only field joins on that field', () => {
+    const { Place, Dept } = new Schema({}).merge(td).parse().models;
+    expect(Place.fields.depts.join).toMatchObject({ on: 'place', from: '_id' }); // Place.depts -> Dept.place
+    expect(Dept.fields.children.join).toMatchObject({ on: 'parent', from: '_id' }); // Dept.children -> Doc.parent
+  });
+
+  // The list is typed as the INTERFACE but `by:` names a field that only one implementer declares.
+  // Links are resolved before implementer fields are aggregated onto the interface, so this used to
+  // read `undefined.key` and crash the parse.
+  test('a @link(by:) on an interface-typed list may name an implementer-only field', () => {
+    const { Place } = new Schema({}).merge(td).parse().models;
+    expect(Place.fields.units.join).toMatchObject({ to: 'unit', on: 'place', from: '_id' });
+  });
+
+  test('an implementer inherits its interface collection key, so joins target the interface collection', () => {
+    const { Dept, Doc } = new Schema({}).merge(td).parse().models;
+    expect(Dept.key).toBe('unit');
+    expect(Doc.key).toBe('unit');
+    expect(Doc.fields.parent.join.to).toBe('unit'); // Doc.parent -> the unit collection, not "Dept"
+    expect(Dept.fields.children.join.to).toBe('unit');
+  });
+
+  test('implementer-typed fields reference the owning interface where/sort inputs', () => {
+    const executable = makeExecutableSchema(new Schema({}).merge(td).api().toObject());
+    expect(String(executable.getType('PlaceInputWhere').getFields().depts.type)).toBe('UnitInputWhere');
+    expect(String(executable.getType('PlaceInputSort').getFields().depts.type)).toBe('UnitInputSort');
+    expect(String(executable.getType('UnitInputWhere').getFields().parent.type)).toBe('UnitInputWhere'); // aggregated from Doc
+    expect(String(executable.getType('UnitInputWhere').getFields().children.type)).toBe('UnitInputWhere'); // aggregated from Dept
+  });
+
+  test('implementers still emit no standalone where/sort inputs', () => {
+    const executable = makeExecutableSchema(new Schema({}).merge(td).api().toObject());
+    ['Dept', 'Doc'].forEach((impl) => {
+      expect(executable.getType(`${impl}InputWhere`)).toBeUndefined();
+      expect(executable.getType(`${impl}InputSort`)).toBeUndefined();
+    });
+  });
+});

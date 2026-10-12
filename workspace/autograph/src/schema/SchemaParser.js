@@ -51,6 +51,10 @@ function findModelPathsToField($schema, model, field) {
   return arr;
 }
 
+// A field declared by one of an interface's implementers, by name. Used where a join must be built
+// before implementer fields have been aggregated onto the interface model.
+const findImplementerField = ($s, iface, name) => Object.values($s.models).find(m => !m.isInterface && m.interfaces?.includes(iface.name) && m.fields[name])?.fields[name];
+
 /**
  * Parse typeDefs into a schema POJO. Returns { schema, typeDefs } where typeDefs is the
  * crud-pruned AST used for makeExecutableSchema (fields without 'r' in crud are removed).
@@ -663,7 +667,9 @@ function parseSchema(config, typeDefs) {
             // Virtual side: join `linkTo[linkBy]` against this model's pk (linkBy names the FK column on the linked model).
             // Straight FK side: join `linkTo[fkField]` against this field's stored value (fkField names the linked column our value targets).
             const joinFieldName = $field.isVirtual ? $field.linkBy : $field.fkField;
-            const joinField = $field.linkTo.fields[joinFieldName];
+            // An interface-typed link may name a field that only an implementer declares; implementer
+            // fields are aggregated onto the interface AFTER these thunks run, so look there directly.
+            const joinField = $field.linkTo.fields[joinFieldName] ?? findImplementerField($s, $field.linkTo, joinFieldName);
             if (!joinField) throw new Error(`Schema validation failed: ${$model}.${$field} — ${$field.isVirtual ? `@link(by: "${joinFieldName}")` : `@field(fk: "${joinFieldName}")`} does not name a field on ${$field.linkTo}`);
             const on = joinField.key;
             const from = $field.linkField.key;
@@ -680,6 +686,18 @@ function parseSchema(config, typeDefs) {
         target = model;
       }
     },
+  });
+
+  // Implementers of a PERSISTED interface share its collection. An implementer that declares no
+  // @model(key:) / @model(source:) of its own inherits them, so a field typed as the implementer
+  // (an FK or @link edge to one concrete kind) joins and resolves against the interface's
+  // collection rather than one named after the concrete type. Runs before the thunks, which read
+  // model.key to build joins.
+  Object.values($schema.models).filter(m => !m.isInterface && m.interfaces?.length).forEach((impl) => {
+    const owner = impl.interfaces.map(name => $schema.models[name]).find(m => m?.isMarkedModel && !m.isEmbedded);
+    if (!owner) return;
+    if (impl.directives?.model?.key == null) impl.key = owner.key;
+    if (impl.directives?.model?.source == null) impl.source = owner.source;
   });
 
   // Resolve data thunks
