@@ -49,6 +49,13 @@ function generateApi(schema) {
   // dispatch, so a standalone concrete create couldn't satisfy it anyway.)
   const isOneOfImplementer = model => (model.interfaces || []).some(name => schema.models[name]?.oneOf);
 
+  // A field typed as a @oneOf IMPLEMENTER (an FK or @link edge to one concrete kind) still navigates
+  // the interface's collection, and the implementer emits no where/sort of its own — so a nested
+  // where/sort input references the OWNING INTERFACE's. Its inputs are fat (every implementer field
+  // is aggregated onto them), so nothing is lost; without this the parent input would reference a
+  // `<Implementer>InputWhere` that is never emitted and the schema would not build.
+  const inputModelOf = model => (isOneOfImplementer(model) ? schema.models[(model.interfaces || []).find(name => schema.models[name]?.oneOf)] : model);
+
   // These are for defining schema queries/mutations
   const entityModels = Object.values(schema.models).filter(model => model.isEntity);
   const readApiModels = readModels.filter(model => !isOneOfImplementer(model));
@@ -110,10 +117,10 @@ function generateApi(schema) {
         // generator runs — so we don't emit a competing `extend type X { ... }` here.
         return `
           input ${model}InputWhere {
-            ${fields.map(field => `${field}: ${field.model ? `${field.model}InputWhere` : 'AutoGraphMixed'}`)}
+            ${fields.map(field => `${field}: ${field.model ? `${inputModelOf(field.model)}InputWhere` : 'AutoGraphMixed'}`)}
           }
           input ${model}InputSort {
-            ${fields.map(field => `${field}: ${field.model ? `${field.model}InputSort` : 'SortOrderEnum'}`)}
+            ${fields.map(field => `${field}: ${field.model ? `${inputModelOf(field.model)}InputSort` : 'SortOrderEnum'}`)}
           }
         `;
       })}
@@ -208,7 +215,7 @@ function generateApi(schema) {
             }
 
             input ${model}SubscriptionInputWhere {
-              ${fields.map(field => `${field}: ${field.model ? `${field.model}InputWhere` : 'AutoGraphMixed'}`)}
+              ${fields.map(field => `${field}: ${field.model ? `${inputModelOf(field.model)}InputWhere` : 'AutoGraphMixed'}`)}
             }
 
             type ${model}SubscriptionPayload {
