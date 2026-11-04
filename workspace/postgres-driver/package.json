@@ -2,6 +2,8 @@
   "name": "@coderich/autograph-postgres",
   "main": "src/PostgresDriver.js",
   "version": "8.21.0",
+  "license": "MIT",
+  "author": "Richard Livolsi (coderich)",
   "publishConfig": {
     "access": "public"
   },

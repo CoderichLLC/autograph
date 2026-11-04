@@ -2,6 +2,8 @@
   "name": "@coderich/autograph",
   "main": "index.js",
   "version": "0.16.9",
+  "license": "MIT",
+  "author": "Richard Livolsi (coderich)",
   "publishConfig": {
     "access": "public",
     "provenance": false

@@ -2,6 +2,8 @@
   "name": "@coderich/autograph-redis",
   "main": "src/RedisDriver.js",
   "version": "5.11.1",
+  "license": "MIT",
+  "author": "Richard Livolsi (coderich)",
   "publishConfig": {
     "access": "public"
   },

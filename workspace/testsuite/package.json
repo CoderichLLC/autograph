@@ -1,6 +1,8 @@
 {
   "name": "@coderich/autograph-db-tests",
   "version": "0.15.0",
+  "license": "MIT",
+  "author": "Richard Livolsi (coderich)",
   "publishConfig": {
     "access": "public"
   },

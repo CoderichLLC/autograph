@@ -2,6 +2,8 @@
   "name": "@coderich/autograph-mongodb",
   "main": "src/MongoDriver.js",
   "version": "6.16.7",
+  "license": "MIT",
+  "author": "Richard Livolsi (coderich)",
   "publishConfig": {
     "access": "public",
     "provenance": false

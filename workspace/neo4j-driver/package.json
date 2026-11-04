@@ -2,6 +2,8 @@
   "name": "@coderich/autograph-neo4j",
   "main": "src/Neo4jDriver.js",
   "version": "0.1.0",
+  "license": "MIT",
+  "author": "Richard Livolsi (coderich)",
   "publishConfig": { "access": "public" },
   "files": ["src", "!__mocks__"],
   "scripts": {
