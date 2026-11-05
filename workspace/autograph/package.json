@@ -23,7 +23,7 @@
   },
   "dependencies": {
     "@coderich/util": "2.2.3",
-    "@graphql-tools/merge": "9.0.0",
+    "@graphql-tools/merge": "^9.2.7",
     "@hapi/boom": "10.0.1",
     "bson-objectid": "2.0.4",
     "dataloader": "2.2.2",
