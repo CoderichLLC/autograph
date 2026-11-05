@@ -131,6 +131,15 @@ describe('cursor pagination', () => {
       expect(ids(next)).toEqual(ids(people.slice(2, 4)));
     });
 
+    test('a cursor key that is not in the sort is ignored', async () => {
+      // Forged: the driver compares a key that is not in the sort with `$lte`, and `email_address <= 'zzzz'`
+      // matches every record, so the extra key would widen the page back to the start. The forged
+      // string is not a record's own cursor, so no bookend is taken off.
+      const forged = Buffer.from(JSON.stringify({ my_age: 54, email_address: 'zzzz' })).toString('base64');
+      const next = await scope().sort({ age: 'asc' }).after(forged).first(2);
+      expect(next.map(doc => doc.age)).toEqual([54, 65]);
+    });
+
     test('`after` pages forward on `id` descending', async () => {
       const page = await scope().sort({ id: 'desc' }).first(2);
       expect(ids(page)).toEqual(ids(people.slice(3).reverse()));
