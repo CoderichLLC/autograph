@@ -78,7 +78,9 @@ module.exports = class Loader {
     return Promise.all(work).then((results) => {
       return results.flat().sort((a, b) => a.i - b.i).map(({ query, $query, data }) => {
         if (data == null) return null; // Explicit return null;
-        if ($query.isCursorPaging && Array.isArray(data)) data = Loader.#paginateResults(data, query.toObject());
+        // The cursor uses the driver sort (stored keys): `data` holds raw driver documents, and the
+        // driver reads the decoded `after`/`before` by stored key.
+        if ($query.isCursorPaging && Array.isArray(data)) data = Loader.#paginateResults(data, { ...query.toObject(), sort: $query.sort });
         // Cache the RAW driver rows (cursor slicing is query-keyed, so it is cache-safe here).
         // Transformation deliberately does NOT happen in this batch fn — the dataloader package
         // memoizes this return value, and caching transformed docs (a past regression) meant

@@ -82,4 +82,60 @@ describe('cursor pagination', () => {
       expect(page.$pageInfo.hasNextPage).toBe(false);
     });
   });
+
+  // The documents being paged are raw driver documents (stored keys), and the driver reads the
+  // decoded cursor by stored key. A sort on a field whose stored key differs from its name
+  // (`age` → `my_age`, `id` → `_id`) must still produce a cursor that pages.
+  describe('a sort on a field with a different stored key', () => {
+    const AGES = [21, 32, 43, 54, 65];
+    const decode = cursor => JSON.parse(Buffer.from(cursor, 'base64').toString('ascii'));
+    let people;
+
+    beforeAll(async () => {
+      people = [];
+      for (const [i, age] of AGES.entries()) {
+        // Serial saves so that the ObjectIds (and so the `id` sort) follow AGES order.
+        // eslint-disable-next-line no-await-in-loop
+        people.push(await resolver.match('Person').save({ name: `paging-${i}`, emailAddress: `paging${i}@gmail.com`, age }));
+      }
+    });
+
+    const scope = () => resolver.match('Person').where({ name: 'paging-*' });
+    const ids = rs => rs.map(doc => `${doc.id}`);
+
+    test('`endCursor` carries the sort value', async () => {
+      const page = await scope().sort({ age: 'asc' }).first(2);
+      expect(page.map(doc => doc.age)).toEqual([21, 32]);
+      expect(Object.values(decode(page.$pageInfo.endCursor))).toEqual([32]);
+    });
+
+    test('`after` pages forward on a renamed field', async () => {
+      const page = await scope().sort({ age: 'asc' }).first(2);
+      const next = await scope().sort({ age: 'asc' }).after(page.$pageInfo.endCursor).first(2);
+      expect(next.map(doc => doc.age)).toEqual([43, 54]);
+      expect(next.$pageInfo.hasPreviousPage).toBe(true);
+    });
+
+    test('`before` pages backward on a renamed field', async () => {
+      const page = await scope().sort({ age: 'asc' }).last(2);
+      expect(page.map(doc => doc.age)).toEqual([54, 65]);
+      const prev = await scope().sort({ age: 'asc' }).before(page.$pageInfo.startCursor).last(2);
+      expect(prev.map(doc => doc.age)).toEqual([32, 43]);
+      expect(prev.$pageInfo.hasNextPage).toBe(true);
+    });
+
+    test('`after` pages forward on `id`', async () => {
+      const page = await scope().sort({ id: 'asc' }).first(2);
+      expect(ids(page)).toEqual(ids(people.slice(0, 2)));
+      const next = await scope().sort({ id: 'asc' }).after(page.$pageInfo.endCursor).first(2);
+      expect(ids(next)).toEqual(ids(people.slice(2, 4)));
+    });
+
+    test('`after` pages forward on `id` descending', async () => {
+      const page = await scope().sort({ id: 'desc' }).first(2);
+      expect(ids(page)).toEqual(ids(people.slice(3).reverse()));
+      const next = await scope().sort({ id: 'desc' }).after(page.$pageInfo.endCursor).first(2);
+      expect(ids(next)).toEqual(ids(people.slice(1, 3).reverse()));
+    });
+  });
 });

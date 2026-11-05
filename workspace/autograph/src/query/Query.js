@@ -381,14 +381,31 @@ module.exports = class Query {
       input: $input,
       where: isWhereNative ? where : this.#walkWhere(where),
       sort: isSortNative ? sort : this.#model.walk(sort, node => Object.assign(node, { key: node.field.key })),
-      before: (!isCursorPaging || !before) ? undefined : JSONParse(Buffer.from(before, 'base64').toString('ascii')),
-      after: (!isCursorPaging || !after) ? undefined : JSONParse(Buffer.from(after, 'base64').toString('ascii')),
+      before: (!isCursorPaging || !before) ? undefined : this.#decodeCursor(before),
+      after: (!isCursorPaging || !after) ? undefined : this.#decodeCursor(after),
       $schema: this.#schema.resolvePath,
     });
 
     if (!isWhereNative) this.#finalize(query.toObject());
 
     return query;
+  }
+
+  /**
+   * A cursor holds raw driver values keyed by stored key, and JSON turns driver types (an ObjectId,
+   * a Date) into strings. Cast each value back the same way a sort/where value is cast.
+   */
+  #decodeCursor(cursor) {
+    const $cursor = JSONParse(Buffer.from(cursor, 'base64').toString('ascii'));
+    if (!Util.isPlainObject($cursor)) return $cursor;
+    const args = { query: this.#query, resolver: this.#resolver, context: this.#context };
+
+    return Object.entries($cursor).reduce((prev, [key, value]) => {
+      const byName = this.#model.walk(Util.unflatten({ [key]: value }, { safe: true }), node => Object.assign(node, { key: node.field.name }), { key: 'key' });
+      if (!Object.keys(byName).length) return Object.assign(prev, { [key]: value }); // Not a model path (eg. a join key)
+      const byKey = this.#model.walk(this.#model.transformers.sort.transform(byName, args), node => Object.assign(node, { key: node.field.key }));
+      return Object.assign(prev, Util.flatten(byKey, { safe: true }));
+    }, {});
   }
 
   /**
