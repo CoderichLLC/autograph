@@ -67,7 +67,9 @@ module.exports = class Loader {
     return Promise.all(work).then((results) => {
       return results.flat().sort((a, b) => a.i - b.i).map(({ query, $query, data }) => {
         if (data == null) return null; // Explicit return null;
-        if ($query.isCursorPaging && Array.isArray(data)) data = Loader.#paginateResults(data, query.toObject());
+        // The cursor uses the driver sort (stored keys): `data` holds raw driver documents, and the
+        // driver reads the decoded `after`/`before` by stored key.
+        if ($query.isCursorPaging && Array.isArray(data)) data = Loader.#paginateResults(data, { ...query.toObject(), sort: $query.sort });
         // Pass this batch's GraphQL info so toResultSet can drive selection-aware
         // eager/lazy. Different batches may carry different infos; each is handled per-batch.
         return this.#resolver.toResultSet(this.#model, data, $query.info);
