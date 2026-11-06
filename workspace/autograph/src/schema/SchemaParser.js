@@ -726,6 +726,16 @@ function parseSchema(config, typeDefs) {
     // shape that was frozen pre-aggregation.
     iface.buildDerived($schema);
 
+    // An implementer that shares a persisted interface's collection must see only its own documents,
+    // so Query.toDriver adds this type-field match (by stored key) to each of its queries and joins.
+    const typeKey = iface.fields[iface.typeField]?.key;
+    if (typeKey && iface.isMarkedModel && !iface.isEmbedded) {
+      Object.values($schema.models).forEach((impl) => {
+        if (impl.isInterface || !impl.interfaces?.includes(iface.name) || impl.key !== iface.key) return;
+        impl.typeScope = { [typeKey]: impl.directives?.model?.typeValue ?? impl.name };
+      });
+    }
+
     // oneOf interfaces receive a polymorphic wrapper input ({ <typeValue>: {...} }) rather than the
     // fat field shape. Override create/update with a dispatcher: unwrap the single key, route the
     // inner value through the CONCRETE model's transformer, and stamp the typeField (= typeValue)

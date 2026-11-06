@@ -14,6 +14,13 @@ const convertGlobs = (value) => {
 // the note there for why a generic Util.flatten on a where clause is always wrong).
 const { flattenWhere } = Vocabulary;
 
+// Add a type-field match (see SchemaParser typeScope) to a driver where. When the where already
+// matches on the type field, both must hold, so the scope can only narrow the result.
+const scopeWhere = (where, typeScope) => Object.entries(typeScope).reduce((prev, [key, value]) => {
+  if (prev[key] === undefined) return Object.assign(prev, { [key]: value });
+  return Object.assign(prev, { $and: [...(prev.$and ?? []), { [key]: value }] });
+}, { ...where });
+
 // Deep "merged" view: input first, falls through to doc — recursively for plain objects.
 // READ-ONLY. Writes/deletes throw with a hint pointing at `query.input` as the correct
 // mutation target. Without this, the default proxy `set` writes through to the target
@@ -387,6 +394,10 @@ module.exports = class Query {
     });
 
     if (!isWhereNative) this.#finalize(query.toObject());
+    if (this.#model.typeScope && crud !== 'create') {
+      const $query = query.toObject();
+      $query.where = scopeWhere($query.where, this.#model.typeScope);
+    }
 
     // Decode after #finalize, so that the cursor keys are checked against the final driver sort.
     if (isCursorPaging && (before || after)) {
@@ -477,6 +488,7 @@ module.exports = class Query {
 
     // Construct joins
     const joinsByPath = {};
+    const scopedJoins = [];
     query.joins = [];
 
     // Recursively search a join tree for the first join matching a target model key
@@ -495,6 +507,7 @@ module.exports = class Query {
       if (field.join) {
         let isArray;
         const join = { ...field.join, where: {}, children: [] };
+        if (field.model.typeScope) scopedJoins.push([join, field.model.typeScope]);
 
         if (run.length > 1) {
           join.from = path.reduce((prev, curr, i) => {
@@ -530,5 +543,8 @@ module.exports = class Query {
 
       return node;
     }, { key: 'key' });
+
+    // Scope after the leaves are set, so that a where on the type field cannot replace the scope.
+    scopedJoins.forEach(([join, typeScope]) => { join.where = scopeWhere(join.where, typeScope); });
   }
 };
